@@ -86,12 +86,12 @@
 53	socketpair	U2	not-started	Create a connected pair of sockets.	provisional
 54	setsockopt	U3	not-started	Set a socket option.	provisional
 55	getsockopt	U3	not-started	Query a socket option.	provisional
-56	clone	U4	not-started	Create a thread or process (x86-64 struct layout).	provisional
-57	fork	U3	not-started	Duplicate the calling process.	provisional
-58	vfork	E3	not-started	Create a child sharing the address space (legacy).	provisional
-59	execve	U4	not-started	Replace the process image.	trace:17
+56	clone	U4	implemented	Create a process. Process-creating subset only; CLONE_VM/THREAD/FILES/FS/SIGHAND and namespace flags return -ENOSYS.	provisional
+57	fork	U3	implemented	Duplicate the calling guest process; the child runs a private copy of the guest state.	provisional
+58	vfork	E3	implemented	Create a child and suspend the parent until it execs or exits. Address space is not shared.	provisional
+59	execve	U4	implemented	Replace the guest image; non-destructive on every error path.	trace:17
 60	exit	U4	implemented	Terminate the calling thread.	provisional
-61	wait4	U3	not-started	Wait for a child process.	trace:4
+61	wait4	U3	implemented	Wait for a child process; WNOHANG/WUNTRACED/WCONTINUED and struct rusage are honoured.	trace:4
 62	kill	U3	not-started	Send a signal to a process.	provisional
 63	uname	U4	implemented	Query the kernel name and version.	trace:4
 64	semget	E2	not-started	System V semaphore set.	provisional

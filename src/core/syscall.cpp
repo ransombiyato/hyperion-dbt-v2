@@ -5,6 +5,8 @@
 // the error convention.
 #include "hyperion/syscall.hpp"
 
+#include "hyperion/process.hpp"
+
 #include <array>
 #include <cerrno>
 #include <cstdio>
@@ -838,7 +840,8 @@ std::int64_t do_statx(GuestState& s, Memory& memory, const std::vector<GuestDesc
 }
 
 std::int64_t readlink_common(Memory& memory, int host_dirfd, std::uint64_t path_addr,
-                             std::uint64_t buf, std::uint64_t bufsiz, const std::string& sysroot) {
+                             std::uint64_t buf, std::uint64_t bufsiz, const std::string& sysroot,
+                             const std::string& self_exe_override = {}) {
     if (bufsiz == 0) {
         return -kEinval;
     }
@@ -846,6 +849,19 @@ std::int64_t readlink_common(Memory& memory, int host_dirfd, std::uint64_t path_
     const std::int64_t rc = read_guest_cstr(memory, path_addr, path);
     if (rc != 0) {
         return rc;
+    }
+    // /proc/self/exe names the translator, not the guest. When the caller has
+    // told us which image the guest came from, report that instead, so a guest
+    // inspecting its own executable path learns something true about itself.
+    if (!self_exe_override.empty() &&
+        (path == "/proc/self/exe" || path == "/proc/thread-self/exe")) {
+        const std::size_t n = self_exe_override.size() < bufsiz ? self_exe_override.size()
+                                                                : static_cast<std::size_t>(bufsiz);
+        if (!memory.write(buf, reinterpret_cast<const std::uint8_t*>(self_exe_override.data()),
+                          n)) {
+            return -kEfault;
+        }
+        return static_cast<std::int64_t>(n);
     }
     path = resolve_guest_path(path, sysroot);
     constexpr std::size_t kMaxTarget = 4096;
@@ -863,12 +879,14 @@ std::int64_t readlink_common(Memory& memory, int host_dirfd, std::uint64_t path_
     return static_cast<std::int64_t>(got);
 }
 
-std::int64_t do_readlink(GuestState& s, Memory& memory, const std::string& sysroot = {}) {
-    return readlink_common(memory, AT_FDCWD, arg(s, 0), arg(s, 1), arg(s, 2), sysroot);
+std::int64_t do_readlink(GuestState& s, Memory& memory, const std::string& sysroot = {},
+                         const std::string& self_exe = {}) {
+    return readlink_common(memory, AT_FDCWD, arg(s, 0), arg(s, 1), arg(s, 2), sysroot, self_exe);
 }
 
 std::int64_t do_readlinkat(GuestState& s, Memory& memory, const std::vector<GuestDescriptor>& files,
-                           bool compat = false, const std::string& sysroot = {}) {
+                           bool compat = false, const std::string& sysroot = {},
+                           const std::string& self_exe = {}) {
     const std::int32_t dirfd = arg_i32(s, 0);
     int host_dirfd = AT_FDCWD;
     if (!resolve_host_dirfd(files, dirfd, compat, host_dirfd)) {
@@ -877,7 +895,7 @@ std::int64_t do_readlinkat(GuestState& s, Memory& memory, const std::vector<Gues
     if (host_dirfd < 0 && host_dirfd != AT_FDCWD) {
         return -kEbadf;
     }
-    return readlink_common(memory, host_dirfd, arg(s, 1), arg(s, 2), arg(s, 3), sysroot);
+    return readlink_common(memory, host_dirfd, arg(s, 1), arg(s, 2), arg(s, 3), sysroot, self_exe);
 }
 
 std::int64_t do_access(GuestState& s, Memory& memory, const std::string& sysroot = {}) {
@@ -1401,7 +1419,53 @@ std::int64_t do_prlimit64(GuestState& s, Memory& memory) {
 
 } // namespace
 
+namespace {
+
+// HYPERION_TRACE_SYSCALLS=1 logs every guest system call with its result to the
+// host's stderr. This exists because an unimplemented call is otherwise only
+// visible as a count: when a guest misbehaves, the difference between "asked for
+// something we do not implement" and "asked for something we implement wrongly"
+// is the whole diagnosis. Written with write(2) rather than stdio so it cannot
+// be swallowed by, or corrupt, the guest's own buffered output.
+bool syscall_trace_enabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("HYPERION_TRACE_SYSCALLS");
+        return v != nullptr && v[0] != '0' && v[0] != '\0';
+    }();
+    return enabled;
+}
+
+void trace_syscall(std::uint64_t number, const SyscallResult& result, const GuestState& state) {
+    if (!syscall_trace_enabled()) {
+        return;
+    }
+    char buf[160];
+    const int n =
+        std::snprintf(buf, sizeof(buf), "hyperion[pid %ld]: syscall %llu -> %s, rax=%lld\n",
+                      static_cast<long>(::getpid()), static_cast<unsigned long long>(number),
+                      to_string(result.status), static_cast<long long>(state.reg(Gpr::kRax)));
+    if (n > 0) {
+        const auto len = (static_cast<std::size_t>(n) < sizeof(buf)) ? static_cast<std::size_t>(n)
+                                                                     : sizeof(buf) - 1;
+        ssize_t unused = ::write(STDERR_FILENO, buf, len);
+        (void)unused;
+    }
+}
+
+} // namespace
+
 SyscallResult MinimalSyscallHandler::handle(GuestState& state, Memory& memory) {
+    SyscallResult result;
+    result.number = state.reg(Gpr::kRax);
+    if (syscall_trace_enabled()) {
+        const SyscallResult traced = handle_unguarded(state, memory);
+        trace_syscall(result.number, traced, state);
+        return traced;
+    }
+    return handle_unguarded(state, memory);
+}
+
+SyscallResult MinimalSyscallHandler::handle_unguarded(GuestState& state, Memory& memory) {
     SyscallResult result;
     result.number = state.reg(Gpr::kRax);
 
@@ -1547,13 +1611,14 @@ SyscallResult MinimalSyscallHandler::handle(GuestState& state, Memory& memory) {
         return result;
     }
     case sysno::kReadlink: {
-        const std::int64_t r = do_readlink(state, memory, sysroot_);
+        const std::int64_t r = do_readlink(state, memory, sysroot_, guest_image_path_);
         state.reg(Gpr::kRax) = static_cast<std::uint64_t>(r);
         result.status = SyscallStatus::kHandled;
         return result;
     }
     case sysno::kReadlinkat: {
-        const std::int64_t r = do_readlinkat(state, memory, files_, linux_compat_, sysroot_);
+        const std::int64_t r =
+            do_readlinkat(state, memory, files_, linux_compat_, sysroot_, guest_image_path_);
         state.reg(Gpr::kRax) = static_cast<std::uint64_t>(r);
         result.status = (r == -kEnosys) ? SyscallStatus::kUnimplemented : SyscallStatus::kHandled;
         return result;
@@ -1606,6 +1671,41 @@ SyscallResult MinimalSyscallHandler::handle(GuestState& state, Memory& memory) {
     }
     case sysno::kGetrandom: {
         const std::int64_t r = do_getrandom(state, memory);
+        state.reg(Gpr::kRax) = static_cast<std::uint64_t>(r);
+        result.status = SyscallStatus::kHandled;
+        return result;
+    }
+    // --- process creation (src/core/process.cpp) -----------------------------
+    // The child of a fork is a real host process that runs a private copy of the
+    // guest and terminates with the guest's exit status, so the child never
+    // returns from here; only the parent reaches the `state.reg(kRax) = r` line
+    // below, where r is the child's pid.
+    case sysno::kFork: {
+        const std::int64_t r = process::do_fork(*this, state, memory);
+        state.reg(Gpr::kRax) = static_cast<std::uint64_t>(r);
+        result.status = SyscallStatus::kHandled;
+        return result;
+    }
+    case sysno::kVfork: {
+        const std::int64_t r = process::do_vfork(*this, state, memory);
+        state.reg(Gpr::kRax) = static_cast<std::uint64_t>(r);
+        result.status = SyscallStatus::kHandled;
+        return result;
+    }
+    case sysno::kClone: {
+        const std::int64_t r = process::do_clone(*this, state, memory);
+        state.reg(Gpr::kRax) = static_cast<std::uint64_t>(r);
+        result.status = SyscallStatus::kHandled;
+        return result;
+    }
+    case sysno::kExecve: {
+        const std::int64_t r = process::do_execve(*this, state, memory);
+        state.reg(Gpr::kRax) = static_cast<std::uint64_t>(r);
+        result.status = SyscallStatus::kHandled;
+        return result;
+    }
+    case sysno::kWait4: {
+        const std::int64_t r = process::do_wait4(*this, state, memory);
         state.reg(Gpr::kRax) = static_cast<std::uint64_t>(r);
         result.status = SyscallStatus::kHandled;
         return result;
@@ -2032,7 +2132,9 @@ bool is_minimal_syscall(std::uint64_t number) {
            number == sysno::kGeteuid || number == sysno::kGetgid || number == sysno::kGetegid ||
            number == sysno::kGetppid || number == sysno::kGetcwd || number == sysno::kGetrandom ||
            number == sysno::kReadlink || number == sysno::kAccess || number == sysno::kReadlinkat ||
-           number == sysno::kGetdents64 || number == sysno::kStatx;
+           number == sysno::kGetdents64 || number == sysno::kStatx || number == sysno::kFork ||
+           number == sysno::kVfork || number == sysno::kClone || number == sysno::kExecve ||
+           number == sysno::kWait4;
 }
 
 } // namespace hyperion

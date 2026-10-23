@@ -56,6 +56,8 @@ Presets are also provided: `cmake --preset debug`, `release`, `sanitize`,
 | `tests/differential/` | interpreter vs. real x86-64 hardware |
 | `tests/cli/` | end-to-end CLI tests (`cli_smoke.sh` for the blob path, `elf_test.sh` for the ELF path, `wrapper_test.sh` for the installed `hyperion` command) |
 | `tests/fixtures/` | small committed test inputs (`tiny-static.elf`) |
+| `tests/guest/fixtures/` | **C sources** for real x86-64 guest programs, compiled by the test itself |
+| `tests/guest/process_test.sh` | guest process regression tests (fork/exec/fd/pipe/vfork/clone errors + BusyBox pipelines) |
 | `tests/run_cross_tests.cmake` | cross-arch configure/build/run driver |
 | `benchmarks/` | harness smoke tests (`bench.smoke`, `tier_bench.smoke`) |
 
@@ -70,6 +72,8 @@ Registered CTest tests:
 | `bench.smoke` | the benchmark harness runs and emits valid output |
 | `tier_bench.smoke` | the Tier 0 vs Tier 1 benchmark runs and both tiers are correct (on x86-64 only Tier 0 executes; Tier 1 is reported unavailable) |
 | `cross.aarch64_tests` | the suite passes when compiled for AArch64 and run under `qemu-user` |
+| `guest.process` | real x86-64 guests create subprocesses correctly: exit status propagates, `execve` runs a second program, descriptors and pipes survive `fork`, `vfork` suspends the parent, unsupported `clone` flags return `ENOSYS`, and a static x86-64 BusyBox runs a shell pipeline |
+| `guest.process.tier1` | the same suite on the Tier 1 JIT; registered only with `-DHYPERION_ENABLE_GUEST_TIER1_TESTS=ON` (meaningful on an AArch64 host) |
 
 `tests/cli/cli_smoke.sh` writes a small x86-64 blob, runs it through tier 0 and
 tier 1, and requires the same status and step count. On a host that cannot
@@ -90,6 +94,59 @@ The ELF parser handles untrusted input, so `tests/unit/test_elf.cpp` includes
 (2000 random buffers plus byte-mutations of a valid image through parse and map).
 It is reproducible from its seed, and under ASan/UBSan any out-of-bounds access
 becomes a test failure. A real libFuzzer target can replace it later.
+
+### Guest process tests
+
+`guest.process` is the only suite that executes **real compiled x86-64 guest
+programs**. Its fixtures are C sources under `tests/guest/fixtures/`, compiled by
+`tests/guest/process_test.sh` with `cc -O2 -static` — the same mechanism
+`tests/cli/cli_smoke.sh` and `scripts/run_real_benchmarks.sh` already use for
+guest binaries. The script verifies each fixture really is an `EM_X86_64` ELF
+before running it, so a host-architecture binary can never be mistaken for a
+guest test.
+
+The suite is **only registered when a compiler that can produce a static x86-64
+ELF was found**: the host `cc` on x86-64, otherwise `x86_64-linux-gnu-gcc`, or
+whatever `HYPERION_GUEST_CC` names. Registering it unconditionally would let a
+missing toolchain look like a passing suite.
+
+Every case asserts the guest's **stdout and exit status**, never the translator's
+own report. That distinction is the point: a guest printing
+`sh: can't fork: Function not implemented` is a failure even when the outer run
+reports `status: ok`.
+
+```sh
+# Run just the guest tests, with the BusyBox pipeline cases enabled:
+cmake -S . -B build -G Ninja -DHYPERION_BUSYBOX=/path/to/busybox-x86_64
+cmake --build build
+ctest --test-dir build -R guest.process --output-on-failure
+
+# On an AArch64 host (or under qemu), also cover the Tier 1 JIT:
+cmake -S . -B build -G Ninja \
+  -DHYPERION_BUSYBOX=/path/to/busybox-x86_64 \
+  -DHYPERION_ENABLE_GUEST_TIER1_TESTS=ON
+
+# Cross-compiling the fixtures on a non-x86-64 host:
+cmake -S . -B build -G Ninja -DHYPERION_GUEST_CC=x86_64-linux-gnu-gcc
+```
+
+`HYPERION_BUSYBOX` is optional; when unset the two shell-pipeline cases report
+`skip` rather than failing, and the remaining seven still run. A suitable fixture
+is Debian's `busybox-static` (`/bin/busybox` from that package is a statically
+linked x86-64 ELF).
+
+### Diagnosing a guest that misbehaves
+
+`HYPERION_TRACE_SYSCALLS=1` logs every guest system call with its result, tagged
+with the host pid so parent and child are distinguishable:
+
+```sh
+HYPERION_TRACE_SYSCALLS=1 ./build/hyperion run busybox-x86_64 sh -c 'true' 2>trace.txt
+grep ' -> unimplemented' trace.txt     # what the guest asked for that we lack
+```
+
+The trace is written with `write(2)` rather than stdio so it cannot be swallowed
+by, or corrupt, the guest's own buffered output.
 
 ### Writing a test
 

@@ -1,5 +1,15 @@
 # BENCHMARKS
 
+> **Scope of these numbers (2026-10-23).** Everything below measures the two
+> execution tiers on **single-threaded, non-forking** workloads: the five
+> `benchmarks/workloads/*.c` programs are straight-line compute, and
+> `hyperion_tier_bench` is a synthetic loop. None of them create a subprocess.
+> The process-creation syscalls added since (`fork`/`vfork`/`clone` subset/
+> `execve`/`wait4`) are therefore **not represented in any figure here**, and a
+> real shell pipeline costs a host `fork` plus a deep copy of the guest address
+> space per child — a cost these numbers do not include and do not claim to.
+> `hyperion_bench` measures the *host* machine, not emulation.
+
 Reproducible methodology and measured results.
 
 > **Honesty rule (D-009):** a benchmark report may never contain a fabricated

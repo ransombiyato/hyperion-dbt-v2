@@ -94,17 +94,26 @@ LoadedElf load_linux_elf_process(const std::uint8_t* bytes, std::size_t size,
                                  const std::vector<std::string>& argv,
                                  const std::vector<std::string>& envp = {},
                                  const std::string& sysroot = {},
-                                 std::size_t stack_bytes = 8ULL << 20);
+                                 std::size_t stack_bytes = 8ULL << 20,
+                                 const std::string& image_path = {});
 
 // Map a read/write guest stack and lay out the System V AMD64 initial process
 // stack frame (`argc`, `argv[]`, `NULL`, `envp[]`, `NULL`, `auxv[]`), returning
 // the 16-byte-aligned initial `%rsp` value (or 0 on failure).
+//
+// `image_path` becomes the `AT_EXECFN` auxiliary vector entry. The kernel fills
+// AT_EXECFN with the *absolute* path of the file it executed, not with argv[0],
+// and glibc relies on that: `_dl_get_origin()` compares it against
+// readlink("/proc/self/exe") and aborts on a mismatch in shape. Passing argv[0]
+// here -- which for `hyperion run ./prog` is relative -- makes a statically
+// linked glibc guest abort during startup, before its main() runs.
 std::uint64_t setup_linux_x86_64_stack(GuestAddressSpace& address_space,
                                        const std::vector<std::string>& argv,
                                        const LoadedElf* loaded_elf = nullptr,
                                        std::uint64_t stack_top = 0x7fffffffe000ULL,
                                        std::size_t stack_bytes = 64ULL * 1024ULL,
-                                       const std::vector<std::string>& envp = {});
+                                       const std::vector<std::string>& envp = {},
+                                       const std::string& image_path = {});
 
 } // namespace hyperion
 

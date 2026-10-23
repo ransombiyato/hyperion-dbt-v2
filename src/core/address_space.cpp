@@ -35,6 +35,24 @@ std::optional<std::uint64_t> GuestAddressSpace::page_align_up(std::uint64_t valu
     return (value + (kAlign - 1)) & ~GuestAddressSpace::kPageMask;
 }
 
+void GuestAddressSpace::reset() {
+    // Free the backing storage before re-arming the cursor: a program image can
+    // be hundreds of MiB, and holding it while the new image is mapped would
+    // double the transient host footprint on a small device.
+    regions_.clear();
+    regions_.shrink_to_fit();
+    brk_ = heap_base_;
+    mru_index_ = 0;
+    // The mmap cursor is deliberately NOT rewound to the original mmap base.
+    // execve() replaces the image but the address space object persists, so
+    // rewinding would hand the new image addresses the outgoing image just
+    // vacated; anything still holding a stale pointer to those addresses (a
+    // SoftTlb entry the flush missed, a dangling guest pointer) would then alias
+    // live data instead of faulting. Moving forward keeps the old addresses
+    // unmapped and therefore faulting, which is the safe failure.
+    ++code_epoch_;
+}
+
 GuestAddressSpace::GuestAddressSpace(std::uint64_t mmap_base, std::uint64_t heap_base,
                                      std::uint64_t heap_capacity, std::size_t max_map_bytes)
     : max_map_bytes_(max_map_bytes == 0 ? kDefaultMaxMapBytes : max_map_bytes) {

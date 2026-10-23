@@ -75,6 +75,32 @@ public:
                                std::uint64_t heap_capacity = 1ULL << 20,
                                std::size_t max_map_bytes = kDefaultMaxMapBytes);
 
+    // Deep copy. fork(2) uses this to give a guest child a private address
+    // space: the guest's pages are backed by host heap storage owned here, so a
+    // host fork alone would leave parent and child sharing the *same* vectors
+    // until either one mmap/munmaps and reallocates them, invalidating the
+    // other's cached host page pointers. Copying is what makes the two address
+    // spaces genuinely independent. The copy reserves up front so the region
+    // vectors are not re-grown page group by page group.
+    GuestAddressSpace(const GuestAddressSpace& other)
+        : regions_(other.regions_), mmap_cursor_(other.mmap_cursor_), heap_base_(other.heap_base_),
+          heap_end_(other.heap_end_), brk_(other.brk_), max_map_bytes_(other.max_map_bytes_),
+          code_epoch_(other.code_epoch_) {
+        regions_.reserve(other.regions_.size());
+    }
+    GuestAddressSpace& operator=(const GuestAddressSpace&) = delete;
+    GuestAddressSpace(GuestAddressSpace&&) = delete;
+    GuestAddressSpace& operator=(GuestAddressSpace&&) = delete;
+
+    // Discard every mapping and return the space to the state its constructor
+    // produced, preserving the geometry (mmap base, heap area, per-mapping
+    // bound). execve(2) uses this to drop the outgoing image: the executor holds
+    // a reference to *this* object, so replacing it is not an option, and
+    // clearing it in place is what lets a new image be loaded at the same
+    // address. Bumps code_epoch() so both execution tiers invalidate their
+    // translations of the image that no longer exists.
+    void reset();
+
     // Map the program image at `base` (page-aligned) with the given
     // permissions and copy `size` bytes of `data` into it. Returns false if the
     // range is invalid, misaligned, or overlaps an existing mapping.
@@ -135,6 +161,13 @@ public:
     bool write(std::uint64_t address, const std::uint8_t* in, std::size_t count) override;
     bool fetch(std::uint64_t address, std::uint8_t* out, std::size_t count) override;
     std::uint64_t code_epoch() const noexcept override { return code_epoch_; }
+
+    // Invalidate translated code without changing the address-space layout.
+    // The mutating operations above bump the epoch as a side effect; this is
+    // for the cases where the *host* context changed rather than the guest
+    // mapping -- after fork(2) the parent must not keep executing code whose
+    // translation was produced before the process split.
+    void bump_code_epoch() noexcept { ++code_epoch_; }
     PageAccess translate_page(std::uint64_t page_addr) noexcept override;
 
     // Diagnostics/tests.

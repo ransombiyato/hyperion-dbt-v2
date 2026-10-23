@@ -12,22 +12,27 @@
 #
 # What it does:
 #   1. checks for a C++20 toolchain, CMake and Ninja
-#   2. fetches this repository (git clone if available, else a tarball)
+#   2. fetches this repository (git clone if available, else a tarball), or
+#      builds the checkout this script was run from
 #   3. configures and builds it
 #   4. runs the test suite, and ABORTS rather than install a broken build
-#   5. installs a `hyperion` command into <prefix>/bin
+#   5. installs `hyperion` and `hypy` commands into <prefix>/bin
 #
 # What it does NOT do:
 #   - it never uses sudo and never needs root
 #   - it never touches anything outside the prefix (default ~/.local)
 #   - it does not modify your shell rc files
+#   - it never reports success when the build or the tests failed
 #
-# Supports executing both raw x86-64 blobs and static x86-64 Linux ELF64
-# binaries (`hyperion run [--tier=0|1] <file> [-- args...]`) across Tier 0
-# (fast interpreter) and Tier 1 (AArch64 + ARMv8 NEON dynamic binary translator).
+# Primary target is unrooted Android under Termux (AArch64, Android 10/API 29,
+# kernel 4.14); x86-64 Linux is supported for development. Both raw x86-64 blobs
+# and Linux x86-64 ELF64 binaries run across Tier 0 (interpreter) and Tier 1
+# (AArch64 + ARMv8 NEON JIT):
+#   hyperion run [--tier=0|1] <file> [guest-args...]
+#   hypy run <file> [guest-args...]          # shorter launcher for the same
 set -euo pipefail
 
-REPO_SLUG="${HYPERION_REPO_SLUG:-ransombiyato/hyperion-dbt}"
+REPO_SLUG="${HYPERION_REPO_SLUG:-ransombiyato/hyperion-dbt-v2}"
 DEFAULT_REF="main"
 
 PREFIX="${HYPERION_PREFIX:-$HOME/.local}"
@@ -36,6 +41,13 @@ SRC_DIR="${HYPERION_SRC:-}"
 DO_BUILD=1
 DO_UNINSTALL=0
 ASSUME_YES=0
+DO_HYPY=1
+
+# Resolve the directory this script lives in. When it is being run from a
+# checkout, that checkout is built -- re-downloading the repository the user is
+# already standing in would be surprising, and on a device with no network it
+# would simply fail.
+SCRIPT_DIR="$(cd -- "$(dirname -- "$0")" && pwd -P)"
 
 say()  { printf '%s\n' "$*"; }
 info() { printf '  %s\n' "$*"; }
@@ -51,14 +63,18 @@ options:
   --ref REF       git ref to build (default: $HYPERION_REF or main)
   --src DIR       use an existing checkout instead of fetching one
   --no-build      install the command only; do not configure or build
+  --no-hypy       do not install the `hypy` launcher
   --yes           do not prompt for confirmation
-  --uninstall     remove the installed command and this install's metadata
+  --uninstall     remove the installed commands and this install's metadata
   -h, --help      show this help
 
 environment:
   HYPERION_PREFIX  install root
   HYPERION_REF     git ref to build
   HYPERION_SRC     existing source checkout to build from
+
+Run from inside a HYPERION checkout, this builds that checkout. Otherwise it
+fetches the repository into <prefix>/share/hyperion/src.
 EOF
 }
 
@@ -71,6 +87,7 @@ while [ $# -gt 0 ]; do
         --src)       [ $# -ge 2 ] || die "--src needs a directory"; SRC_DIR="$2"; shift 2 ;;
         --src=*)     SRC_DIR="${1#*=}"; shift ;;
         --no-build)  DO_BUILD=0; shift ;;
+        --no-hypy)   DO_HYPY=0; shift ;;
         --yes|-y)    ASSUME_YES=1; shift ;;
         --uninstall) DO_UNINSTALL=1; shift ;;
         -h|--help)   usage; exit 0 ;;
@@ -87,11 +104,13 @@ CONF_FILE="${LIB_DIR}/install.conf"
 if [ "$DO_UNINSTALL" -eq 1 ]; then
     say "Uninstalling hyperion from ${PREFIX}"
     removed=0
-    if [ -f "${BIN_DIR}/hyperion" ]; then
-        rm -f "${BIN_DIR}/hyperion"
-        info "removed ${BIN_DIR}/hyperion"
-        removed=1
-    fi
+    for cmd in hyperion hypy; do
+        if [ -f "${BIN_DIR}/${cmd}" ]; then
+            rm -f "${BIN_DIR}/${cmd}"
+            info "removed ${BIN_DIR}/${cmd}"
+            removed=1
+        fi
+    done
     if [ -f "${CONF_FILE}" ]; then
         # Only remove the source tree if this install created it under LIB_DIR.
         src="$(sed -n 's/^HYPERION_SRC=//p' "${CONF_FILE}" | head -1)"
@@ -143,6 +162,22 @@ fi
 
 [ "$(uname -s)" = "Linux" ] || die "this installer targets Linux (found $(uname -s))"
 
+# Termux on Android sets PREFIX to its own package root and has no /etc/os-release.
+# Detect it explicitly: the dependency names, the writable locations and the
+# seccomp restrictions all differ from a desktop distribution, and the messages
+# below have to say the right thing for the device actually being used.
+IS_TERMUX=0
+if [ -n "${TERMUX_VERSION:-}" ] || [ -n "${TERMUX_APP__PACKAGE_NAME:-}" ] || \
+   [ -d "${TERMUX_PREFIX:-/data/data/com.termux/files/usr}" ]; then
+    IS_TERMUX=1
+fi
+if [ "$IS_TERMUX" -eq 1 ]; then
+    say "  environment: Termux on Android $(uname -m), kernel $(uname -r)"
+    # ~/.local/bin is the conventional user prefix and is on PATH in recent
+    # Termux; the Termux package root itself is not user-writable in the same way.
+    info "installing to ${PREFIX} (no root required)"
+fi
+
 case "$(uname -m)" in
     x86_64|aarch64|arm64) ;;
     *) warn "untested architecture '$(uname -m)'; continuing anyway" ;;
@@ -177,8 +212,12 @@ fi
 
 # --- fetch ------------------------------------------------------------------
 
+if [ -z "$SRC_DIR" ] && [ -f "${SCRIPT_DIR}/CMakeLists.txt" ]; then
+    SRC_DIR="${SCRIPT_DIR}"
+fi
+
 if [ -n "$SRC_DIR" ]; then
-    [ -f "${SRC_DIR}/CMakeLists.txt" ] || die "--src '${SRC_DIR}' is not a HYPERION checkout"
+    [ -f "${SRC_DIR}/CMakeLists.txt" ] || die "'${SRC_DIR}' is not a HYPERION checkout (no CMakeLists.txt)"
     say "Using existing checkout: ${SRC_DIR}"
 else
     SRC_DIR="${LIB_DIR}/src"
@@ -254,6 +293,19 @@ CLI_SRC="${SRC_DIR}/scripts/hyperion"
 
 install -m 0755 "${CLI_SRC}" "${BIN_DIR}/hyperion"
 
+# `hypy` is the short launcher. An existing one is replaced, because it is
+# generated by this installer; it is never a file the user edits. Anything the
+# user wrote themselves under a different name is not touched.
+if [ "$DO_HYPY" -eq 1 ]; then
+    HYPY_SRC="${SRC_DIR}/scripts/hypy"
+    if [ -f "${HYPY_SRC}" ]; then
+        install -m 0755 "${HYPY_SRC}" "${BIN_DIR}/hypy"
+        info "installed ${BIN_DIR}/hypy"
+    else
+        warn "scripts/hypy not found in the checkout; skipping the hypy launcher"
+    fi
+fi
+
 # The CLI reads this to find the checkout and build tree. Quoted because the
 # paths may contain spaces.
 {
@@ -267,10 +319,15 @@ chmod 0644 "${CONF_FILE}"
 say ""
 say "Installed."
 say ""
-say "  hyperion doctor    check the host and toolchain"
-say "  hyperion test      run the test suite"
-say "  hyperion bench     run the benchmark harness"
-say "  hyperion help      list every command"
+say "  hypy <elf> [args...]   run a program (exit status = the guest's)"
+say "  hyperion run <elf> ... the same thing, explicitly"
+say "  hyperion probe         report host capabilities"
+say "  hyperion doctor        check the host, toolchain and install"
+say "  hyperion test          run the test suite"
+say "  hyperion help          list every command"
+say ""
+say "Example:"
+say "  hypy \"\$HOME/hyperion-test/busybox-x86_64\" sh -c 'echo benchmark | wc -c'"
 say ""
 
 case ":${PATH}:" in

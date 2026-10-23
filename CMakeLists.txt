@@ -7,7 +7,7 @@ cmake_minimum_required(VERSION 3.20)
 project(hyperion
     VERSION 0.2.0
     DESCRIPTION "x86-64 to AArch64 user-mode dynamic binary translator for Linux ELF64 binaries"
-    HOMEPAGE_URL "https://github.com/ransombiyato/hyperion-dbt"
+    HOMEPAGE_URL "https://github.com/ransombiyato/hyperion-dbt-v2"
     LANGUAGES CXX)
 
 # --- Global language settings ----------------------------------------------
@@ -59,6 +59,7 @@ add_library(hyperion_core
     src/core/exec_mem.cpp
     src/core/interpreter.cpp
     src/core/syscall.cpp
+    src/core/process.cpp
     src/core/translator.cpp
     src/core/runtime_helpers.cpp
     src/core/address_space.cpp

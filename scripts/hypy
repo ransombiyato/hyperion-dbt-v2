@@ -1,0 +1,91 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Project HYPERION contributors
+#
+# `hypy` - the short launcher for running a guest under HYPERION.
+#
+# `hyperion` is the full front end (status, doctor, build, test, bench, ...).
+# `hypy` is deliberately narrower: it runs a program. It is what a shell alias
+# would be, except that it lives on PATH and finds the build the same way the
+# `hyperion` command does, so the two can never disagree about which binary they
+# are using.
+#
+#   hypy <file> [guest-args...]        run a blob or ELF64 executable
+#   hypy run <file> [guest-args...]    the same, for symmetry with `hyperion run`
+#   hypy --tier=1 <file> [args...]     any `hyperion run` option is accepted
+#   hypy version | probe | info <elf>  delegated to the translator
+#
+# The process exit status is the guest's own exit status, so this is safe to use
+# in scripts and CI.
+set -euo pipefail
+
+SELF="${BASH_SOURCE[0]}"
+while [ -L "${SELF}" ]; do
+    target="$(readlink "${SELF}")"
+    case "${target}" in
+        /*) SELF="${target}" ;;
+        *)  SELF="$(dirname "${SELF}")/${target}" ;;
+    esac
+done
+BIN_DIR="$(cd "$(dirname "${SELF}")" && pwd)"
+PREFIX="$(cd "${BIN_DIR}/.." && pwd)"
+
+CONF="${HYPERION_INSTALL_CONF:-${PREFIX}/share/hyperion/install.conf}"
+
+die() { printf 'error: %s\n' "$*" >&2; exit 1; }
+
+if [ -n "${HYPERION_SRC:-}" ]; then
+    SRC="${HYPERION_SRC}"
+elif [ -f "${CONF}" ]; then
+    SRC="$(sed -n 's/^HYPERION_SRC=//p' "${CONF}" | head -1)"
+else
+    SRC="${BIN_DIR}"
+fi
+
+if [ -n "${HYPERION_BUILD_DIR:-}" ]; then
+    BUILD="${HYPERION_BUILD_DIR}"
+elif [ -f "${CONF}" ]; then
+    BUILD="$(sed -n 's/^HYPERION_BUILD_DIR=//p' "${CONF}" | head -1)"
+else
+    BUILD="${SRC}/build/dev"
+fi
+
+# A `hyperion` installed next to this script wins over the source-tree lookup:
+# that is the normal installed layout, and it keeps `hypy` working even if the
+# source checkout has since been moved or deleted.
+if [ -x "${BIN_DIR}/hyperion" ] && [ ! -L "${BIN_DIR}/hyperion" ]; then
+    HYPERION_BIN="${BIN_DIR}/hyperion"
+elif [ -x "${BUILD}/hyperion" ]; then
+    HYPERION_BIN="${BUILD}/hyperion"
+else
+    die "no hyperion binary found (looked in '${BIN_DIR}' and '${BUILD}'); run install.sh"
+fi
+
+if [ "$#" -eq 0 ]; then
+    cat <<EOF
+hypy - run a program under HYPERION (x86-64 -> AArch64)
+
+usage: hypy [--tier=0|1] [--quiet] <file> [guest-args...]
+       hypy run <file> [guest-args...]
+       hypy version | probe | info <elf>
+
+Examples:
+  hypy ./busybox-x86_64 sh -c 'printf "9\\n2\\n" | sort -n'
+  hypy run --tier=0 ./program arg1 arg2
+  hypy --quiet ./program > out.txt
+
+The exit status is the guest's own exit status.
+EOF
+    exit 0
+fi
+
+# `hypy run ...` and `hypy version` pass straight through; anything else is a
+# program path plus its arguments, so `run` is implied.
+case "${1:-}" in
+    run|version|probe|info|help|--help|-h|--version|-V)
+        exec "${HYPERION_BIN}" "$@"
+        ;;
+    *)
+        exec "${HYPERION_BIN}" run "$@"
+        ;;
+esac

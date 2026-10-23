@@ -204,7 +204,18 @@ Guest `syscall` instructions are intercepted and translated. The layer owns:
 - structure layout differences (e.g. `stat`, `epoll_event`, `iovec` where
   widths differ);
 - memory mapping (`mmap`/`munmap`/`mprotect`) coordination with the code cache;
-- signals, threads (`clone`), futexes, and `rseq`.
+- guest signal *handler invocation*, thread creation (`clone` with `CLONE_VM`/
+  `CLONE_THREAD`), futexes, and `rseq`.
+
+Process creation **is** implemented: `fork`/`vfork`/the process-creating subset of
+`clone`/`execve`/`wait4` live in `src/core/process.cpp`. A guest child is a real
+host process running a deep copy of the `GuestAddressSpace`, because guest pages
+are host heap storage owned by that object — a bare host `fork` would leave parent
+and child sharing the same vectors until either side `mmap`/`munmap`s and
+reallocates them, invalidating the other's cached host page pointers. Thread
+creation is refused with `-ENOSYS` rather than approximated, because a guest that
+asked for a shared address space and quietly received a private copy would corrupt
+its own memory. See COMPATIBILITY.md §5.05.
 
 **Implemented so far.** `SyscallHandler` (`include/hyperion/syscall.hpp`) is the
 interface both tiers call. `MinimalSyscallHandler` implements `read`,

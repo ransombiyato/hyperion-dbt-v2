@@ -1,8 +1,9 @@
 # STATUS
 
-**Last updated:** 2026-10-21
+**Last updated:** 2026-10-23
 **Current phase:** Phase 5 (performance measurement and optimization) — active;
-Phase 6 (Linux ABI, ELF64 loading, and syscall compatibility) — eleventh slice implemented
+Phase 6 (Linux ABI, ELF64 loading, and syscall compatibility) — twelfth slice
+implemented: **guest process creation** (`fork`/`vfork`/`clone` subset/`execve`/`wait4`)
 **Repository state:** buildable, tested, documented, all CI/sanitizer/cross-test/`clang-tidy`
 gates green. **Two execution tiers exist: the reference interpreter with a
 2048-slot epoch-keyed decoded-instruction cache (Tier 0) and a W^X `ExecArena`
@@ -13,14 +14,18 @@ static-PIE `ET_DYN` with a System V AMD64 `argc/argv/envp/auxv` initial stack)
 and raw blobs inspect and execute via `hyperion info <exe>` and
 `hyperion run <exe>`. Phase 6's syscall inventory is validated bidirectionally
 against C++ handler code (`tools/gen_syscall_inventory.py --check`), with
-**42 syscalls across eleven slices implemented** (`read`, `write`, `close`,
+**47 syscalls across twelve slices implemented** (`read`, `write`, `close`,
 `fstat`, `lseek`, `mmap`, `mprotect`, `munmap`, `brk`, `pread64`, `pwrite64`,
 `readv`, `writev`, `access`, `dup`, `dup2`, `getpid`, `exit`, `uname`, `fcntl`,
 `getcwd`, `readlink`, `gettimeofday`, `getuid`, `getgid`, `geteuid`, `getegid`,
 `getppid`, `arch_prctl`, `gettid`, `getdents64`, `set_tid_address`,
 `clock_gettime`, `exit_group`, `openat`, `newfstatat`, `readlinkat`,
-`set_robust_list`, `dup3`, `prlimit64`, `getrandom`, `statx`). Unimplemented
-numbers return `-ENOSYS` explicitly. See `COMPATIBILITY.md` for exact ISA scope.
+`set_robust_list`, `dup3`, `prlimit64`, `getrandom`, `statx`, `fork`, `vfork`,
+`clone`, `execve`, `wait4`). Unimplemented
+numbers return `-ENOSYS` explicitly. See `COMPATIBILITY.md` for exact ISA scope,
+and its §5.05 for exactly which process semantics are honoured and which are
+refused. **Programs that create subprocesses now run**, including shell pipelines
+under a real static x86-64 BusyBox.
 
 This is the first file a returning agent should read. It records exactly what
 works, what was last verified, and what to do next.
@@ -56,6 +61,8 @@ works, what was last verified, and what to do next.
 | 16. `statx`(332) (tenth slice) | **Implemented & tested** — the modern, extensible stat (950 calls). `struct statx` is built only from fixed-width `__u32`/`__u64` fields, so its layout is identical on x86-64 and AArch64 and the host's bytes are copied into the guest verbatim (the `linux_dirent64` reasoning, D-030); `AT_FDCWD` only, `AT_SYMLINK_NOFOLLOW` the sole honoured flag |
 | 17. Static ELF64 loader + SysV AMD64 stack + unbuffered POSIX descriptors | **Implemented & tested** — `elf_loader.{hpp,cpp}` loads `ET_EXEC` and static-PIE `ET_DYN` with W^X `PT_LOAD` mappings, BSS zeroing, and 16-byte aligned `argc`/`argv`/`envp`/`auxv` (`AT_PHDR`/`AT_PHENT`/`AT_PHNUM`/`AT_PAGESZ`/`AT_ENTRY`/`AT_RANDOM`); `OpenFileDescription` replaces buffered `FILE*` fd entries |
 | 18. Startup, TLS, clock, resource, dup/fcntl, and scatter/positional I/O (eleventh slice) | **Implemented & tested** — adds `pread64`(17), `pwrite64`(18), `readv`(19), `writev`(20), `dup`(32), `dup2`(33), `dup3`(292), `fcntl`(72), `uname`(63, always advertising `"x86_64"`), `gettimeofday`(96), `clock_gettime`(228), `arch_prctl`(158, `ARCH_SET_FS`/`ARCH_GET_FS`), `set_tid_address`(218), `set_robust_list`(273), and `prlimit64`(302); **42 implemented syscalls total** |
+| 19. Guest process creation (twelfth slice) | **Implemented & tested** — adds `fork`(57), `vfork`(58), the process-creating subset of `clone`(56), `execve`(59) and `wait4`(61) in `src/core/process.cpp`; **47 implemented syscalls total**. A guest child is a real host process running a *deep copy* of the `GuestAddressSpace` (guest pages are host heap storage, so a bare host `fork` would leave both sides sharing vectors that a later `mmap` reallocates). Thread-creating and namespace-creating `clone` flags return `-ENOSYS` rather than being downgraded to a fork. Verified against a static x86-64 BusyBox: `sh -c 'printf "9\\n2\\n5\\n1\\n" \| sort -n'` → `1 2 5 9`, and `sh -c 'echo benchmark \| wc -c'` → `10`, both matching native output exactly on x86-64 and on AArch64 under qemu at Tier 0 and Tier 1 |
+| 20. Two CLI/loader correctness fixes found by the new guest tests | **Fixed** — (a) `hyperion run` returned 0 even when the guest exited non-zero unless `--quiet` was given, so an exit-status gate was told a failing guest had succeeded; the guest's status is now always the process status. (b) `AT_EXECFN` was filled from `argv[0]` instead of the executable's absolute path, which made a statically linked glibc guest abort inside `_dl_get_origin()` before its `main` ran; it now carries the real path, and the initial `%rsp` is explicitly re-aligned to 16 bytes rather than relying on the string pushes leaving it aligned |
 
 **Implemented-syscall status (verified automatically by `tools/gen_syscall_inventory.py --check`).**
 Forty-two numbers are implemented today: `read`(0), `write`(1), `close`(3),

@@ -10,7 +10,7 @@ on other Linux hosts, so target-device compatibility is *measured, not
 assumed* — see [`docs/target-environment.md`](docs/target-environment.md).
 
 > **Status: Phases 0–7 complete on single-threaded static x86-64 Linux ELF64
-> binaries.** The repository builds clean with **zero warnings** across GCC and
+> binaries, including programs that create subprocesses.** The repository builds clean with **zero warnings** across GCC and
 > Clang (`-Wall -Wextra -Wpedantic -Wshadow -Wconversion -Wsign-conversion
 > -Werror`), passes ASan + UBSan, `clang-tidy`, `shellcheck`, and full AArch64
 > cross-execution tests, and executes **unmodified `gcc 14.2 -O2 -static`
@@ -27,6 +27,27 @@ assumed* — see [`docs/target-environment.md`](docs/target-environment.md).
 >   20.12× end-to-end speedup (10.43× overall)** across `120,313,691` dynamic
 >   instructions in 5 real `glibc 2.41` C binaries with **zero step discrepancy**
 >   against Tier 0. See [`docs/real-world-evaluation.md`](docs/real-world-evaluation.md).
+>
+> **Process support (2026-10-23).** `fork`, `vfork`, the process-creating subset
+> of `clone`, `execve` and `wait4` are implemented, so shell pipelines and
+> programs that spawn children run. Verified against a real statically linked
+> x86-64 BusyBox on x86-64 and on AArch64 under `qemu-user`, at both tiers:
+>
+> ```sh
+> hyperion run --quiet busybox-x86_64 sh -c 'printf "9\n2\n5\n1\n" | sort -n'   # -> 1 2 5 9
+> hyperion run --quiet busybox-x86_64 sh -c 'echo benchmark | wc -c'              # -> 10
+> ```
+>
+> Both match the native output byte for byte. **Thread creation is deliberately
+> not supported**: `clone` with `CLONE_VM`/`CLONE_THREAD`/`CLONE_FILES`/`CLONE_FS`/
+> `CLONE_SIGHAND` returns `-ENOSYS` rather than being silently downgraded to a
+> fork, because a guest that asked for a shared address space and quietly received
+> a private copy would corrupt its own memory. Multi-threaded guests do not run.
+> Namespace-creating flags also return `-ENOSYS` (they need `CAP_SYS_ADMIN`, which
+> unrooted Android does not grant), and guest-installed signal handlers are
+> recorded but not invoked. See [`COMPATIBILITY.md`](COMPATIBILITY.md) §5.05 for
+> the exact matrix and [`TESTING.md`](TESTING.md) to reproduce it
+> (`ctest -R guest.process`).
 >
 > **Scope note (2026-10-19).** Kernel/system-mode emulation is no longer ruled
 > out. A measured experiment showed a real Linux kernel running unprivileged
@@ -149,34 +170,58 @@ curl -fsSL https://raw.githubusercontent.com/ransombiyato/hyperion-dbt-v2/main/i
 ```
 
 This needs no root, writes nothing outside `~/.local` (override with
-`--prefix`), builds and tests the project, and installs a `hyperion` command:
+`--prefix`), builds and tests the project, and installs two commands:
+`hyperion` (the full front end) and `hypy` (the short launcher for running a
+guest). Run from inside a checkout it builds that checkout instead of
+re-downloading it, which matters on a device with no network.
 
 ```bash
-hyperion doctor    # check the host, toolchain and install
-hyperion status    # what is implemented, and what is not
-hyperion test      # run the test suite
-hyperion bench     # run the benchmark harness
-hyperion help      # every command
+hypy <elf> [args...]   # run a program; exit status = the guest's own
+hyperion probe         # report host capabilities
+hyperion doctor        # check the host, toolchain and install
+hyperion status        # what is implemented, and what is not
+hyperion test          # run the test suite
+hyperion help          # every command
 ```
 
 If you would rather read a script before running it — always reasonable — the
 installer is a plain, commented shell script:
 
 ```bash
-curl -fsSLO https://raw.githubusercontent.com/ransombiyato/hyperion-dbt/main/install.sh
+curl -fsSLO https://raw.githubusercontent.com/ransombiyato/hyperion-dbt-v2/main/install.sh
 less install.sh && bash install.sh
 ```
 
 To remove it again: `bash install.sh --uninstall --prefix ~/.local`.
 
-> **`hyperion run` works, with a small instruction subset.** It loads a
-> flat x86-64 blob (not an ELF executable — there is no ELF loader yet),
-> translates it basic block by basic block into AArch64, and executes it. On an
-> x86-64 host, where generated AArch64 code cannot run, it says so on stderr and
-> falls back to the reference interpreter. `--tier=0` forces the interpreter,
-> `--tier=1` forces generated code. Because there is no ELF loader, no block
-> chaining and no cache invalidation yet, no real Linux program runs end to end.
-> `hyperion bench` measures the host machine, not any emulation.
+### Running a program
+
+```bash
+# A static x86-64 BusyBox running a real shell pipeline, under translation:
+hypy "$HOME/hyperion-test/busybox-x86_64" sh -c 'printf "9\n2\n5\n1\n" | sort -n'
+# 1
+# 2
+# 5
+# 9
+
+hypy --quiet "$HOME/hyperion-test/busybox-x86_64" sh -c 'echo benchmark | wc -c'
+# 10
+```
+
+Everything after the program path is passed to the guest unchanged, so guest
+options that start with `-` need no escaping. `--tier=0` forces the reference
+interpreter and `--tier=1` the AArch64 JIT; on an x86-64 host, where generated
+AArch64 code cannot execute, hyperion says so on stderr and falls back to the
+interpreter. `--quiet` suppresses the banner so only the guest's output and exit
+status remain, which is what you want in a script or CI.
+
+> **Both output and exit status are the guest's.** A guest that prints
+> `sh: can't fork: Function not implemented` and exits 1 is a *failure*, and
+> hyperion now exits 1 too — it used to exit 0 unless `--quiet` was given, which
+> quietly told any exit-status gate that a broken run had succeeded.
+>
+> `hyperion bench` measures the host machine, not emulation; `hyperion_tier_bench`
+> measures Tier 0 vs Tier 1 guest execution. See `BENCHMARKS.md`.
 
 ### Build from source
 

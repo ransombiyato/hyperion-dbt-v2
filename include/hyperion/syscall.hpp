@@ -16,6 +16,14 @@
 //   getgid(2), getegid(2), getppid(2), getcwd(2), and getrandom(2), the
 //   path-metadata call newfstatat(2), and the path queries access(2) and
 //   readlink(2).
+//
+// Process creation (fork(2), vfork(2), the process-creating subset of clone(2),
+// execve(2) and wait4(2)) is implemented in src/core/process.cpp and documented
+// in COMPATIBILITY.md. It is a real subset, not a complete implementation:
+// thread-creating clone flags are rejected with -ENOSYS rather than aliased to
+// fork, because a guest that asked for CLONE_VM would corrupt its own memory if
+// it silently received a private copy.
+//
 // Every other syscall number returns -ENOSYS explicitly. Nothing silently
 // succeeds. openat() is limited to AT_FDCWD and a guest pathname; fstat() and
 // newfstatat() write the *guest's* (x86-64) struct stat layout, not the host's.
@@ -67,7 +75,12 @@ inline constexpr std::uint64_t kAccess = 21;
 inline constexpr std::uint64_t kDup = 32;
 inline constexpr std::uint64_t kDup2 = 33;
 inline constexpr std::uint64_t kGetpid = 39;
+inline constexpr std::uint64_t kFork = 57;
+inline constexpr std::uint64_t kVfork = 58;
+inline constexpr std::uint64_t kClone = 56;
 inline constexpr std::uint64_t kExit = 60;
+inline constexpr std::uint64_t kWait4 = 61;
+inline constexpr std::uint64_t kExecve = 59;
 inline constexpr std::uint64_t kUname = 63;
 inline constexpr std::uint64_t kFcntl = 72;
 inline constexpr std::uint64_t kGetcwd = 79;
@@ -220,11 +233,57 @@ inline constexpr std::uint64_t kCur = 1;
 inline constexpr std::uint64_t kEnd = 2;
 } // namespace seek
 
+// clone(2) flags, x86-64 values. See COMPATIBILITY.md: HYPERION implements the
+// *process-creating* subset only. A flag that asks for shared state the guest
+// model cannot provide (a shared address space, a shared fd table, a thread
+// group) is rejected with -ENOSYS rather than silently downgraded to a fork,
+// because a program that asked for CLONE_VM will corrupt its own memory if it
+// gets a private copy instead.
+namespace clone_flags {
+inline constexpr std::uint64_t kVm = 0x00000100;
+inline constexpr std::uint64_t kFs = 0x00000200;
+inline constexpr std::uint64_t kFiles = 0x00000400;
+inline constexpr std::uint64_t kSighand = 0x00000800;
+inline constexpr std::uint64_t kThread = 0x00010000;
+inline constexpr std::uint64_t kNewns = 0x00020000;
+inline constexpr std::uint64_t kSysvsem = 0x00040000;
+inline constexpr std::uint64_t kSetTid = 0x00080000;
+inline constexpr std::uint64_t kParentSetTid = 0x00100000;
+inline constexpr std::uint64_t kUntraced = 0x00800000;
+inline constexpr std::uint64_t kChildCleartid = 0x00200000;
+inline constexpr std::uint64_t kChildSetTid = 0x01000000;
+inline constexpr std::uint64_t kPtrace = 0x00002000;
+inline constexpr std::uint64_t kVfork = 0x00004000;
+inline constexpr std::uint64_t kStop = 0x00000002;
+inline constexpr std::uint64_t kNewuts = 0x04000000;
+inline constexpr std::uint64_t kNewipc = 0x08000000;
+inline constexpr std::uint64_t kNewuser = 0x10000000;
+inline constexpr std::uint64_t kNewpid = 0x20000000;
+inline constexpr std::uint64_t kNewnet = 0x40000000;
+inline constexpr std::uint64_t kIo = 0x80000000ULL;
+
+// Exit signal occupies the low 8 bits of the clone flags word.
+inline constexpr std::uint64_t kExitSignalMask = 0xFF;
+} // namespace clone_flags
+
+// wait4(2) options.
+namespace wait_options {
+inline constexpr std::int32_t kNoHang = 0x00000001;
+inline constexpr std::int32_t kUntraced = 0x00000002;
+inline constexpr std::int32_t kContinued = 0x00000008;
+} // namespace wait_options
+
+// SIGCHLD, the exit signal glibc/musl pass to clone(2) for a subprocess.
+inline constexpr std::uint64_t kSigchld = 17;
+
 // Negative errno values as the guest observes them (returned in rax).
 inline constexpr std::int64_t kEperm = 1;
 inline constexpr std::int64_t kEnoent = 2;
+inline constexpr std::int64_t kEsrch = 3;
 inline constexpr std::int64_t kEio = 5;
 inline constexpr std::int64_t kEbadf = 9;
+inline constexpr std::int64_t kEchild = 10;
+inline constexpr std::int64_t kEagain = 11;
 inline constexpr std::int64_t kEnomem = 12;
 inline constexpr std::int64_t kEacces = 13;
 inline constexpr std::int64_t kEfault = 14;
@@ -293,6 +352,19 @@ struct GuestDescriptor {
     bool is_open() const noexcept { return desc != nullptr; }
 };
 
+// A child process HYPERION created on the guest's behalf.
+//
+// A guest process is a *real host process* plus its own private copy of the
+// guest execution state. `guest_pid` is the host pid, which is also the pid the
+// guest sees: getpid(2) already forwards to the host, so a guest that compares
+// `fork()`'s return value against its child's `getpid()` gets a consistent
+// answer without a pid translation table.
+struct ChildProcess {
+    int guest_pid = 0;
+    bool reaped = false;
+    int raw_status = 0; // host wait(2) status, already in the guest's encoding
+};
+
 // A handler for the minimum needed to run a self-contained guest program that
 // prints, reads, allocates memory and terminates. `write` goes to a host sink
 // (stdout for fd 1, stderr for fd 2); `read`/`close`/`lseek`/`openat`/`fstat`
@@ -343,7 +415,49 @@ public:
     // `sched_getaffinity`/`sysinfo`/`prctl`, and optional `--sysroot` prefixing).
     void enable_linux_compat(std::string sysroot = {});
 
+    // --- process support -----------------------------------------------------
+    //
+    // fork(2)/vfork(2)/clone(2) create a real host process that runs a *private
+    // copy* of the guest state to completion; wait4(2) reaps it. See
+    // src/core/process.cpp and COMPATIBILITY.md for exactly which semantics are
+    // honoured and which clone flags are rejected.
+
+    // Guest-visible pid of the process the guest is running as. Defaults to the
+    // host pid, which is what getpid(2) already reports, so a guest sees one
+    // coherent pid space. Overridable for tests that need a fixed value.
+    void set_guest_pid(int pid) { guest_pid_ = pid; }
+    int guest_pid() const noexcept { return guest_pid_; }
+
+    // Execution tier used for the guest side of a forked child. Tier 0 (the
+    // reference interpreter) is the default because it is available on every
+    // host and is the tier the differential test validates tier 1 against.
+    void set_child_tier(int tier) { child_tier_ = (tier == 1) ? 1 : 0; }
+    int child_tier() const noexcept { return child_tier_; }
+
+    // Instruction limit for a forked child's guest execution.
+    void set_child_max_steps(std::uint64_t steps) { child_max_steps_ = steps; }
+    std::uint64_t child_max_steps() const noexcept { return child_max_steps_; }
+
+    // Read-only view of the guest descriptor table, for tests.
+    const std::vector<GuestDescriptor>& descriptors() const noexcept { return files_; }
+    const std::vector<ChildProcess>& children() const noexcept { return children_; }
+
+    // The image the guest was loaded from. This is what `/proc/self/exe` has to
+    // report: the guest is running *inside* this host process, so the host's own
+    // /proc/self/exe names the translator, and a guest that re-executes itself
+    // through that path (BusyBox does exactly this to run an applet) would end up
+    // exec'ing the translator instead of itself.
+    void set_guest_image_path(std::string path) { guest_image_path_ = std::move(path); }
+    const std::string& guest_image_path() const noexcept { return guest_image_path_; }
+
 private:
+    // process.cpp implements fork/vfork/clone/execve/wait4 against this state.
+    friend struct ProcessAccess;
+
+    // The real dispatch. handle() wraps it so HYPERION_TRACE_SYSCALLS=1 can log
+    // every call and its result without duplicating the switch.
+    SyscallResult handle_unguarded(GuestState& state, Memory& memory);
+
     OutputSink sink_;
     GuestAddressSpace* address_space_;
     // Guest fd -> descriptor. Indexed by guest fd, so the guest can never index
@@ -354,6 +468,22 @@ private:
     bool linux_compat_ = false;
     std::string sysroot_;
     std::uint64_t sigmask_ = 0;
+
+    // --- process state ------------------------------------------------------
+    std::vector<ChildProcess> children_; // children this guest created
+    int guest_pid_ = 0;                  // 0 = "use the host pid"
+    int child_tier_ = 0;
+    std::uint64_t child_max_steps_ = 1'000'000'000ULL;
+    // argv[0] and the image path of the running guest, so execve can resolve a
+    // relative program name and so a child can rebuild its own command line.
+    std::string guest_argv0_;
+    std::string guest_image_path_;
+    // Set when this handler instance is running inside a forked guest child and
+    // must terminate the host process rather than unwind into the parent's loop.
+    bool in_guest_child_ = false;
+    // vfork(2) suspends the parent until the child execs or exits. The parent
+    // blocks on this pipe; the child signals it from its exec/exit path.
+    int vfork_sync_fd_ = -1;
 };
 
 // True if MinimalSyscallHandler implements this syscall number (as opposed to

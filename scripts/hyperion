@@ -65,6 +65,7 @@ status
   status        what is implemented, and what is not
   doctor        check the host, toolchain and install
   version       print version and build information
+  probe         report host capabilities (arch, kernel, W^X, page size)
 
 build and test
   build         build the project (Release)
@@ -94,6 +95,16 @@ cmd_version() {
     say "build:  ${BUILD}"
 }
 
+# `probe` is implemented by the binary but was missing from this dispatcher, so
+# `hyperion probe` printed "unknown command" even though `hyperion version`
+# worked. Delegate rather than reimplement.
+cmd_probe() {
+    need_build
+    local bin="${BUILD}/hyperion"
+    [ -x "${bin}" ] || die "hyperion binary not found at '${bin}' (run: hyperion build)"
+    exec "${bin}" probe
+}
+
 cmd_status() {
     cat <<'EOF'
 Project HYPERION - status
@@ -105,9 +116,21 @@ IMPLEMENTED
   - static ET_EXEC / static-PIE ET_DYN AND dynamically linked PT_INTERP (ld-linux-x86-64.so.2)
     ELF64 execution with file-backed mmap, MAP_FIXED, and --sysroot support
   - Linux x86-64 user-space syscall translation layer
+  - process creation: fork(2), vfork(2), the process-creating subset of clone(2),
+    execve(2) and wait4(2), with fd inheritance, close-on-exec and pipes, so
+    shell pipelines and programs that spawn subprocesses run
+    (verified against a static x86-64 BusyBox: `sh -c 'printf "9\n2\n" | sort -n'`)
 
 LIMITATIONS
-  - single-threaded user-space execution (no multi-thread clone or AVX2/AVX-512 yet)
+  - no thread creation: CLONE_VM / CLONE_THREAD / CLONE_FILES / CLONE_FS /
+    CLONE_SIGHAND return ENOSYS rather than being silently downgraded to a fork,
+    because a guest that asked for a shared address space would corrupt its own
+    memory if it quietly received a private copy. Multi-threaded guests do not run.
+  - a forked child runs on the Tier 0 interpreter by default; the parent keeps
+    whichever tier it was using
+  - namespace-creating clone flags return ENOSYS (they need CAP_SYS_ADMIN, which
+    unrooted Android does not grant)
+  - no AVX2 / AVX-512 yet
 EOF
 }
 
@@ -188,6 +211,7 @@ case "${1:-}" in
     ""|-h|--help|help)  cmd_help ;;
     status)             cmd_status ;;
     version)            cmd_version ;;
+    probe)              cmd_probe ;;
     doctor)             cmd_doctor ;;
     build)              cmd_build ;;
     test)               cmd_test ;;

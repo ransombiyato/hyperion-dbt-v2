@@ -47,6 +47,58 @@ add_executable(hyperion_differential_tests
 target_link_libraries(hyperion_differential_tests PRIVATE hyperion_test_harness)
 add_test(NAME differential.native_vs_interpreter COMMAND hyperion_differential_tests)
 
+# --- guest process regression tests -----------------------------------------
+#
+# These execute real x86-64 Linux guests, so they need a compiler that can
+# produce a *static x86-64* ELF. That is the host compiler on an x86-64 machine
+# and a cross compiler everywhere else. The test is only registered when such a
+# compiler was found: registering it unconditionally would let a missing
+# toolchain look like a passing suite, which is the opposite of what a
+# regression test is for.
+set(HYPERION_GUEST_CC "" CACHE STRING
+    "Compiler that produces static x86-64 ELF guest fixtures (auto-detected if empty)")
+set(HYPERION_BUSYBOX "" CACHE STRING
+    "Static x86-64 BusyBox used by the guest shell-pipeline test (optional)")
+
+if(NOT HYPERION_GUEST_CC)
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64")
+        set(HYPERION_GUEST_CC "cc")
+    else()
+        find_program(HYPERION_GUEST_CC x86_64-linux-gnu-gcc)
+    endif()
+endif()
+
+if(HYPERION_GUEST_CC)
+    add_test(NAME guest.process
+        COMMAND ${CMAKE_COMMAND} -E env
+                HYPERION_BUSYBOX=${HYPERION_BUSYBOX}
+                HYPERION_GUEST_CC=${HYPERION_GUEST_CC}
+                bash "${CMAKE_CURRENT_SOURCE_DIR}/guest/process_test.sh"
+                $<TARGET_FILE:hyperion>
+                "${CMAKE_CURRENT_SOURCE_DIR}/guest/fixtures")
+    set_tests_properties(guest.process PROPERTIES LABELS "guest")
+else()
+    message(STATUS "HYPERION: no static x86-64 fixture compiler found; "
+                   "guest.process tests not registered (set HYPERION_GUEST_CC)")
+endif()
+
+# The same suite under the Tier 1 JIT, on a host that can execute generated
+# AArch64 code. Off by default: on an x86-64 host Tier 1 falls back to the
+# interpreter, so running it twice would measure nothing new. Enable it with
+# -DHYPERION_ENABLE_GUEST_TIER1_TESTS=ON on an AArch64 host (or under qemu).
+option(HYPERION_ENABLE_GUEST_TIER1_TESTS "Also run the guest tests on Tier 1" OFF)
+if(HYPERION_GUEST_CC AND HYPERION_ENABLE_GUEST_TIER1_TESTS)
+    add_test(NAME guest.process.tier1
+        COMMAND ${CMAKE_COMMAND} -E env
+                HYPERION_BUSYBOX=${HYPERION_BUSYBOX}
+                HYPERION_GUEST_CC=${HYPERION_GUEST_CC}
+                HYPERION_TIER=1
+                bash "${CMAKE_CURRENT_SOURCE_DIR}/guest/process_test.sh"
+                $<TARGET_FILE:hyperion>
+                "${CMAKE_CURRENT_SOURCE_DIR}/guest/fixtures")
+    set_tests_properties(guest.process.tier1 PROPERTIES LABELS "guest")
+endif()
+
 option(HYPERION_ENABLE_CROSS_TESTS "Run AArch64 tests under qemu-user" OFF)
 set(HYPERION_AARCH64_CXX "" CACHE STRING "AArch64 cross compiler")
 set(HYPERION_QEMU_AARCH64 "" CACHE STRING "AArch64 user-mode emulator")

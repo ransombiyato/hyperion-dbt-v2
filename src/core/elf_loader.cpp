@@ -360,7 +360,7 @@ LoadedElf load_linux_elf_process(const std::uint8_t* bytes, std::size_t size,
                                  GuestAddressSpace& address_space, GuestState& state,
                                  const std::vector<std::string>& argv,
                                  const std::vector<std::string>& envp, const std::string& sysroot,
-                                 std::size_t stack_bytes) {
+                                 std::size_t stack_bytes, const std::string& image_path) {
     const ElfInfo exe_info = inspect_elf(bytes, size);
     if (!exe_info.ok()) {
         LoadedElf err;
@@ -402,8 +402,8 @@ LoadedElf load_linux_elf_process(const std::uint8_t* bytes, std::size_t size,
 
     const std::vector<std::string> effective_argv =
         argv.empty() ? std::vector<std::string>{"hyperion-guest"} : argv;
-    const std::uint64_t rsp = setup_linux_x86_64_stack(address_space, effective_argv, &loaded,
-                                                       0x7fffffffe000ULL, stack_bytes, envp);
+    const std::uint64_t rsp = setup_linux_x86_64_stack(
+        address_space, effective_argv, &loaded, 0x7fffffffe000ULL, stack_bytes, envp, image_path);
     if (rsp == 0) {
         loaded.error = ElfLoadError::kMappingFailed;
         return loaded;
@@ -420,7 +420,8 @@ std::uint64_t setup_linux_x86_64_stack(GuestAddressSpace& address_space,
                                        const std::vector<std::string>& argv,
                                        const LoadedElf* loaded_elf, std::uint64_t stack_top,
                                        std::size_t stack_bytes,
-                                       const std::vector<std::string>& envp) {
+                                       const std::vector<std::string>& envp,
+                                       const std::string& image_path) {
     if (stack_bytes < GuestAddressSpace::kPageSize ||
         (stack_top & GuestAddressSpace::kPageMask) != 0 || stack_top <= stack_bytes) {
         return 0;
@@ -512,14 +513,29 @@ std::uint64_t setup_linux_x86_64_stack(GuestAddressSpace& address_space,
     auxv.emplace_back(kAtHwcap, kBaselineX86Hwcap);
     auxv.emplace_back(kAtHwcap2, 0ULL);
     auxv.emplace_back(kAtPlatform, platform_addr);
-    if (!argv_ptrs.empty()) {
-        auxv.emplace_back(kAtExecfn, argv_ptrs[0]);
+    // AT_EXECFN is the path of the file that was executed, which the kernel
+    // records as an absolute path. It is NOT argv[0]: for `hyperion run ./prog`
+    // argv[0] is relative, and glibc's _dl_get_origin() aborts the process when
+    // AT_EXECFN and readlink("/proc/self/exe") disagree in shape. Fall back to
+    // argv[0] only when the caller could not supply a path at all.
+    const std::string& execfn =
+        !image_path.empty() ? image_path : (!argv.empty() ? argv.front() : std::string{});
+    const std::uint64_t execfn_addr = execfn.empty() ? 0 : push_str(execfn);
+    if (execfn_addr != 0) {
+        auxv.emplace_back(kAtExecfn, execfn_addr);
     }
     auxv.emplace_back(kAtRandom, random_addr);
     auxv.emplace_back(kAtNull, 0ULL);
 
     const std::size_t total_qwords =
         1 + argv_ptrs.size() + 1 + env_ptrs.size() + 1 + 2 * auxv.size();
+    // The SysV AMD64 ABI requires %rsp to be 16-byte aligned at process entry.
+    // Re-align here rather than assuming the string pushes above left `cursor`
+    // aligned: they move it by each string's length, so any change to what goes
+    // on the stack (an extra auxiliary string, a longer environment) shifts it.
+    // Aligning down is always safe -- it only moves the stack further from the
+    // strings that were just written.
+    cursor &= ~std::uint64_t{0xF};
     if ((total_qwords & 1u) != 0) {
         cursor -= 8;
     }

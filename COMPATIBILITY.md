@@ -263,8 +263,10 @@ The **process-identity getters** (`getpid`/`gettid`/`getuid`/`geteuid`/`getgid`/
 `getegid`/`getppid`) and `getcwd`/`getrandom` are pure forwards to the host
 process. Hyperion runs the guest in-process rather than as a separate guest
 kernel, so the guest sees the host's ids; for a single-process guest this is
-indistinguishable from the truth. `gettid` assumes single-threaded execution and
-must be revisited when `clone` lands. `getcwd` copies the host working directory
+indistinguishable from the truth. `gettid` forwards to the host, which is exact
+for the single guest thread that exists today; it must be revisited if thread
+support is ever added (`clone` with `CLONE_THREAD` is currently refused, so no
+guest can create a second thread). `getcwd` copies the host working directory
 into a bounded guest buffer (`-ERANGE` when the path plus NUL does not fit,
 `-EFAULT` on a bad pointer, `-EINVAL` for size 0). `getrandom` fills a bounded
 guest buffer from the host in 4 KiB chunks, accepting only the two defined
@@ -298,10 +300,126 @@ guest buffer from the host in 4 KiB chunks, accepting only the two defined
 | `mmap` file-backed, `MAP_SHARED` | ⬜ | 6 | — |
 | `arch_prctl` (FS/GS base, TLS) | ⬜ | 6 | — |
 | `set_tid_address`, `rseq`, `prlimit64` | ⬜ | 6 | — |
-| `clone`, `futex`, threading | ⬜ | 6 | — |
-| Signals | ⬜ | 6 | — |
+| `fork`(57) | ✅ | 6 | `guest.process` (`fork + waitpid exit status`) |
+| `vfork`(58) | ✅ (parent suspends; address space **not** shared) | 6 | `guest.process` (`vfork`) |
+| `clone`(56) — process-creating subset | ✅ (partial) | 6 | `guest.process` (`raw clone: unsupported flags refused with ENOSYS`) |
+| `clone`(56) — `CLONE_VM`/`CLONE_THREAD`/`CLONE_FILES`/`CLONE_FS`/`CLONE_SIGHAND` | ❌ `-ENOSYS` by design | 6 | `guest.process` (same test) |
+| `clone`(56) — namespace flags (`CLONE_NEWNS`/`NEWPID`/`NEWUSER`/…) | ❌ `-ENOSYS` (needs `CAP_SYS_ADMIN`) | 6 | `guest.process` (same test) |
+| `execve`(59) | ✅ | 6 | `guest.process` (`execve of a second program`) |
+| `wait4`(61) | ✅ (`WNOHANG`/`WUNTRACED`/`WCONTINUED`, `struct rusage`) | 6 | `guest.process` (`fork + waitpid exit status`) |
+| `waitid`(247) | ⬜ (`siginfo_t` layout differs per arch; BusyBox and glibc use `wait4`) | 6 | — |
+| `pipe`(22)/`pipe2`(293) + inheritance across `fork` | ✅ | 6 | `guest.process` (`pipe + fork IPC`, `file descriptor inheritance`) |
+| `futex`, threading (multi-threaded guests) | ⬜ | 6 | — |
+| Signals: `rt_sigaction`/`rt_sigprocmask` recorded; guest handlers **not** invoked | ⚠️ partial | 6 | — |
 | `epoll`, `poll`, `select` | ⬜ | 6 | — |
 | `io_uring`, `rseq`, `vDSO` | ⬜ | 6/7 | — |
+
+---
+
+## 5.05 Process creation — what is actually supported
+
+A guest process is a **real host process** plus its own private copy of the guest
+execution state. `fork(2)` performs a real host `fork()`; the child runs the guest
+from the instruction after the `syscall` and terminates its host process with the
+guest's exit status; the parent records the child and reaps it with `wait4(2)`.
+
+Three implementation facts make this safe, and all three are load-bearing:
+
+1. **Both execution tiers advance `rip` past the `syscall` instruction before
+   invoking the handler** (`interpreter.cpp` `Opcode::kSyscall`,
+   `translation_cache.cpp` `BlockResult::kSyscall`), so a child resumes at the
+   right place with no program-counter fixup.
+2. **Guest pages are backed by host heap storage owned by `GuestAddressSpace`.**
+   A host `fork()` alone would leave parent and child sharing those same vectors
+   until either side `mmap`/`munmap`s and reallocates them, invalidating the
+   other's cached host page pointers. The child therefore receives a *deep copy*
+   (`GuestAddressSpace`'s copy constructor).
+3. **The parent discards its translated code before resuming after a fork**
+   (`process.cpp` `do_fork_common` bumps `code_epoch()`, which makes
+   `TranslationCache` drop every block and re-translate). Every block in the
+   cache was produced before the process split; returning to it afterwards
+   faulted intermittently on an AArch64 host — about one run in ten for a
+   forking guest, with a different case failing each time. The fault also
+   discarded the guest's buffered stdout, so the symptom was an empty result
+   with exit status 139 rather than an error message. Native x86-64 never
+   showed it (0 failures in 200 runs), so it is invisible in the host test
+   runs and only appears on the AArch64 target.
+
+| Behaviour | Status |
+| --- | --- |
+| `fork()` returns 0 in the child, child pid in the parent | ✅ |
+| Child exit status reaches the parent through `wait4`/`waitpid` | ✅ |
+| Descriptor inheritance across `fork`, with a **shared file offset** | ✅ |
+| `FD_CLOEXEC` honoured on `execve` (per-descriptor, not per-OFD) | ✅ |
+| `pipe`/`pipe2` + `fork` inter-process communication | ✅ |
+| `execve` of another x86-64 ELF64, with `PATH` search for bare names | ✅ |
+| `execve` leaves the process untouched on every error path | ✅ |
+| `vfork` suspends the parent until the child execs or exits | ✅ |
+| `vfork` shares the address space | ❌ **not** — the child gets a private copy (see below) |
+| `CLONE_CHILD_SETTID` / `CLONE_CHILD_CLEARTID` / `CLONE_PARENT_SETTID` | ✅ |
+| `CLONE_SETTLS` (child `%fs` base) | ✅ |
+| Thread creation (`CLONE_VM`, `CLONE_THREAD`, `CLONE_FILES`, `CLONE_FS`, `CLONE_SIGHAND`) | ❌ `-ENOSYS` |
+| Namespace creation (`CLONE_NEWNS`/`NEWUTS`/`NEWIPC`/`NEWUSER`/`NEWPID`/`NEWNET`) | ❌ `-ENOSYS` |
+| `waitid`(247) | ❌ not implemented (`-ENOSYS`) |
+| Guest-installed signal handlers invoked on `SIGCHLD` | ❌ not invoked |
+
+### Deliberate divergences from Linux
+
+These are choices, not gaps, and each is pinned by a test so it cannot silently
+regress into a fake success.
+
+* **`CLONE_VM` and friends return `-ENOSYS` even though a real kernel honours
+  them.** HYPERION cannot provide a shared *guest* address space: guest pages
+  live in `std::vector` storage inside `GuestAddressSpace`. Silently forking
+  instead would hand the guest a private copy it believes is shared, and it would
+  corrupt its own memory in a way it cannot detect. A clean `ENOSYS` is the
+  honest answer. Consequence: **multi-threaded guests do not run.**
+* **`vfork` does not share the address space.** The parent *is* suspended until
+  the child execs or exits, which is the part callers depend on; the child
+  nevertheless gets a private memory copy. This is strictly safer than the
+  kernel's behaviour, since a `vfork` child that writes to the parent's memory is
+  undefined behaviour anyway.
+* **Namespace flags return `-ENOSYS`** because creating a namespace requires
+  `CAP_SYS_ADMIN`. Unrooted Android/Termux does not have it, so these could never
+  work on the primary target and are not attempted.
+* **A forked child runs on Tier 0 by default.** The parent keeps whichever tier it
+  was using. Tier 0 is the reference interpreter that the differential test
+  validates Tier 1 against, so child execution is the better-understood path.
+* **Guest signal handlers are not invoked.** `rt_sigaction`/`rt_sigprocmask` are
+  accepted and recorded, and children are real host children so `SIGCHLD` does
+  not block or kill the parent, but a handler the guest installed will not run.
+  Guests that poll with `wait4` — BusyBox and glibc's `system()`/`posix_spawn`
+  both do — work; guests that rely purely on a `SIGCHLD` handler do not.
+
+### Verified end-to-end
+
+Against a real statically linked x86-64 BusyBox (Debian `busybox-static`
+1:1.37.0), whose `sh` uses `clone(CLONE_CHILD_CLEARTID|CLONE_CHILD_SETTID|SIGCHLD)`,
+`wait4`, `dup2`, `pipe2`, `execve` and installs a `SIGCHLD` handler:
+
+```
+$ hyperion run --quiet busybox-x86_64 sh -c 'printf "9\n2\n5\n1\n" | sort -n'
+1
+2
+5
+9
+$ hyperion run --quiet busybox-x86_64 sh -c 'echo benchmark | wc -c'
+10
+```
+
+Both match the native output byte for byte, with exit status 0. Reproduce with
+`ctest -R guest.process`; see TESTING.md.
+
+### Why `/proc/self/exe` is intercepted
+
+A guest runs *inside* the translator's host process, so the host's
+`/proc/self/exe` names **hyperion**, not the guest image. BusyBox re-executes
+itself through exactly that path to run an applet, so without redirection it
+would `execve` the translator and its own arguments would be reinterpreted as
+translator commands. `readlink("/proc/self/exe")` and `execve("/proc/self/exe")`
+are therefore redirected to the guest's own image, and `AT_EXECFN` is filled with
+that same absolute path — which also matters because glibc's `_dl_get_origin()`
+aborts the process when `AT_EXECFN` and `readlink("/proc/self/exe")` disagree.
 
 ---
 

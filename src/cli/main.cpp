@@ -14,6 +14,8 @@
 #include <string>
 #include <vector>
 
+#include <unistd.h>
+
 #include "hyperion/address_space.hpp"
 #include "hyperion/elf.hpp"
 #include "hyperion/elf_loader.hpp"
@@ -38,7 +40,7 @@ void print_usage(const char* argv0) {
     std::printf(
         "hyperion - x86-64 to AArch64 user-mode dynamic binary translator\n"
         "\n"
-        "usage: %s <command> [options] <file> [-- guest-args...]\n"
+        "usage: %s <command> [options] <file> [guest-args...]\n"
         "\n"
         "commands:\n"
         "  version      print version and build identity\n"
@@ -47,13 +49,23 @@ void print_usage(const char* argv0) {
         "  run <file>   execute a raw x86-64 blob or Linux ELF64 executable\n"
         "  help         show this message\n"
         "\n"
-        "run options:\n"
+        "run options (must appear before the program path):\n"
         "  --tier=0|1       0 = reference interpreter, 1 = AArch64+NEON JIT (default 1)\n"
         "  --max-steps=N    guest instruction limit\n"
         "  --sysroot=DIR    x86-64 rootfs prefix for PT_INTERP / shared libraries\n"
         "  --quiet          suppress translator banner/summary (pure guest stdout + exit code)\n"
-        "  --dump           print final guest register state\n",
-        argv0);
+        "  --dump           print final guest register state\n"
+        "\n"
+        "Everything after the program path is passed to the guest unchanged, so\n"
+        "guest options that start with '-' work without escaping:\n"
+        "  %s run busybox-x86_64 sh -c 'printf \"9\\n2\\n\" | sort -n'\n"
+        "\n"
+        "The process exit status is the guest's own exit status.\n"
+        "\n"
+        "environment:\n"
+        "  HYPERION_SYSROOT          default for --sysroot\n"
+        "  HYPERION_TRACE_SYSCALLS=1 log every guest syscall and its result to stderr\n",
+        argv0, argv0);
 }
 
 int cmd_probe() {
@@ -155,7 +167,8 @@ int run_blob(const std::vector<std::uint8_t>& code, int tier, std::uint64_t max_
 }
 
 int run_elf(const std::vector<std::uint8_t>& file, const std::vector<std::string>& guest_argv,
-            const std::string& sysroot, int tier, std::uint64_t max_steps, bool quiet, bool dump) {
+            const std::string& guest_image_path, const std::string& sysroot, int tier,
+            std::uint64_t max_steps, bool quiet, bool dump) {
     // Disjoint 256 MiB heap at 0x20000000 and 1 GiB per-mapping ceiling at 0x7f0000000000.
     hyperion::GuestAddressSpace space(0x7f0000000000ULL, 0x20000000ULL, 256ULL << 20);
     hyperion::GuestState state;
@@ -172,8 +185,21 @@ int run_elf(const std::vector<std::uint8_t>& file, const std::vector<std::string
     }
     envp.emplace_back("LC_ALL=C");
 
-    const hyperion::LoadedElf loaded = hyperion::load_linux_elf_process(
-        file.data(), file.size(), space, state, guest_argv, envp, sysroot);
+    // AT_EXECFN and /proc/self/exe both have to name the executable by an
+    // absolute path, the way the kernel records it. The user may have passed a
+    // relative one, so resolve it here rather than letting a relative argv[0]
+    // reach the guest's auxiliary vector.
+    std::string absolute_image = guest_image_path;
+    if (!absolute_image.empty() && absolute_image.front() != '/') {
+        std::vector<char> cwd(4096);
+        if (::getcwd(cwd.data(), cwd.size()) != nullptr) {
+            absolute_image = std::string(cwd.data()) + "/" + absolute_image;
+        }
+    }
+
+    const hyperion::LoadedElf loaded =
+        hyperion::load_linux_elf_process(file.data(), file.size(), space, state, guest_argv, envp,
+                                         sysroot, 8ULL << 20, absolute_image);
     if (!loaded.ok()) {
         std::fprintf(stderr, "hyperion: cannot load image: %s\n",
                      hyperion::to_string(loaded.error));
@@ -193,6 +219,11 @@ int run_elf(const std::vector<std::uint8_t>& file, const std::vector<std::string
 
     hyperion::MinimalSyscallHandler syscalls({}, &space);
     syscalls.enable_linux_compat(sysroot);
+    // Tell the handler which image the guest came from. A guest is running
+    // inside this host process, so the host's /proc/self/exe names hyperion
+    // itself; without this, a guest that re-executes through that path (BusyBox
+    // does, to run an applet) would exec the translator instead of itself.
+    syscalls.set_guest_image_path(absolute_image);
 
     hyperion::RunResult result;
     if (tier == 0) {
@@ -222,7 +253,11 @@ int run_elf(const std::vector<std::uint8_t>& file, const std::vector<std::string
     if (result.status != hyperion::RunStatus::kOk) {
         return 1;
     }
-    if (quiet && result.exited_via_syscall) {
+    // The guest's own exit status is the process status, whether or not the
+    // banner was suppressed. This used to be honoured only under --quiet, which
+    // made `hyperion run` exit 0 for a guest that had failed -- a CI gate built
+    // on the exit status would then have been told a broken run succeeded.
+    if (result.exited_via_syscall) {
         return static_cast<int>(result.exit_code & 0xFF);
     }
     return 0;
@@ -249,24 +284,40 @@ int cmd_run(int argc, char** argv) {
             }
             break;
         }
-        if (arg.rfind("--tier=", 0) == 0) {
-            tier = std::atoi(arg.c_str() + 7);
-        } else if (arg.rfind("--max-steps=", 0) == 0) {
-            max_steps = std::strtoull(arg.c_str() + 12, nullptr, 10);
-            explicit_steps = true;
-        } else if (arg.rfind("--sysroot=", 0) == 0) {
-            sysroot = arg.substr(10);
-        } else if (arg == "--quiet" || arg == "-q") {
-            quiet = true;
-        } else if (arg == "--dump") {
-            dump = true;
-        } else if (arg.rfind('-', 0) == 0 && path == nullptr) {
+        // Hyperion's own options are recognised in any position, so
+        // `run prog --dump` keeps working. Any *other* argument that starts with
+        // a dash is a guest argument once the program path has been seen --
+        // without that rule `run busybox sh -c "a | b"` fails, because hyperion
+        // would eat the guest's `-c` as an unknown option of its own. Before the
+        // path, an unrecognised dash is still an error, which catches typos.
+        // `--` ends option parsing entirely for callers who want to pass a
+        // literal `--dump` to a guest.
+        const bool is_hyperion_option =
+            arg.rfind("--tier=", 0) == 0 || arg.rfind("--max-steps=", 0) == 0 ||
+            arg.rfind("--sysroot=", 0) == 0 || arg == "--quiet" || arg == "-q" || arg == "--dump";
+
+        if (is_hyperion_option) {
+            if (arg.rfind("--tier=", 0) == 0) {
+                tier = std::atoi(arg.c_str() + 7);
+            } else if (arg.rfind("--max-steps=", 0) == 0) {
+                max_steps = std::strtoull(arg.c_str() + 12, nullptr, 10);
+                explicit_steps = true;
+            } else if (arg.rfind("--sysroot=", 0) == 0) {
+                sysroot = arg.substr(10);
+            } else if (arg == "--quiet" || arg == "-q") {
+                quiet = true;
+            } else {
+                dump = true;
+            }
+            continue;
+        }
+        if (path != nullptr) {
+            guest_argv.emplace_back(arg);
+        } else if (arg.rfind('-', 0) == 0) {
             std::fprintf(stderr, "hyperion: unknown run option '%s'\n", arg.c_str());
             return 2;
-        } else if (path == nullptr) {
-            path = argv[i];
         } else {
-            guest_argv.emplace_back(arg);
+            path = argv[i];
         }
     }
 
@@ -289,7 +340,7 @@ int cmd_run(int argc, char** argv) {
         std::vector<std::string> full_argv;
         full_argv.emplace_back(path);
         full_argv.insert(full_argv.end(), guest_argv.begin(), guest_argv.end());
-        return run_elf(code, full_argv, sysroot, tier,
+        return run_elf(code, full_argv, path, sysroot, tier,
                        explicit_steps ? max_steps : kDefaultElfMaxSteps, quiet, dump);
     }
     return run_blob(code, tier, max_steps, quiet, dump);

@@ -18,7 +18,7 @@ dynamic instructions).**
 | 3 | First native code generation | ✅ complete |
 | 4 | Basic dynamic binary translator | ✅ complete |
 | 5 | Performance measurement and optimization | ✅ complete |
-| 6 | Linux ABI and syscall compatibility | 🟡 static ELF64 + 42 syscalls complete (threads/dynamic ELF remaining) |
+| 6 | Linux ABI and syscall compatibility | 🟡 static + dynamic ELF64, process creation, 47 syscalls complete (threads/futex remaining) |
 | 7 | Advanced CPU compatibility (baseline psABI + 128-bit SSE2) | ✅ baseline x86-64 + SSE2 complete |
 | 8 | AI optimization laboratory | ⬜ not started |
 | 9 | Real application compatibility | 🟡 5/5 static `glibc 2.41` C workloads verified |
@@ -284,7 +284,7 @@ optimization decisions.
 
 ---
 
-## Phase 6 — Linux ABI and syscall compatibility 🟡 (ten slices implemented)
+## Phase 6 — Linux ABI and syscall compatibility 🟡 (twelve slices implemented)
 
 **Objective.** Run real Linux guest programs.
 
@@ -363,7 +363,22 @@ file descriptors, signals, threading, futexes. Feature matrix + integration test
   the sole honoured flag.
 - ⬜ The remaining U4 syscalls a program needs to start (`arch_prctl`,
   `set_tid_address`, `set_robust_list`, …) — **next**.
-- ⬜ Signals, threads, futexes.
+- ✅ **Guest process creation (twelfth slice).** `fork`(57), `vfork`(58), the
+  process-creating subset of `clone`(56), `execve`(59) and `wait4`(61), in
+  `src/core/process.cpp`. A guest child is a real host process running a deep
+  copy of the `GuestAddressSpace`. Descriptor inheritance with a shared file
+  offset, `FD_CLOEXEC` on `execve`, `pipe`/`pipe2` IPC, `PATH` search, and
+  `CLONE_CHILD_SETTID`/`CLEARTID`/`PARENT_SETTID`/`SETTLS` are honoured.
+  Verified end-to-end against a static x86-64 BusyBox shell pipeline on x86-64
+  and on AArch64 under qemu, at both tiers.
+- ⬜ Thread creation (`clone` with `CLONE_VM`/`CLONE_THREAD`), `futex`. Currently
+  **refused with `-ENOSYS` on purpose**, not merely missing: guest pages are host
+  heap storage inside `GuestAddressSpace`, so a shared guest address space would
+  need that model to change first. Downgrading to a fork would hand the guest a
+  private copy it believes is shared.
+- ⬜ Guest signal *handler invocation* (`rt_sigaction` dispositions are recorded
+  but not called), `waitid`(247).
+- ⬜ Signals beyond `SIGCHLD` bookkeeping.
 
 **Exit criteria.** A clearly defined set of real Linux guest programs works
 correctly. No claim of general compatibility.
