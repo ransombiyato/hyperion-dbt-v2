@@ -17,6 +17,7 @@ namespace hyperion::process {
 // spec, since neither takes clone flags.
 struct ChildCloneSpec {
     std::uint64_t flags = 0;
+    std::uint64_t child_stack = 0;  // clone(2)'s second argument; zero inherits the caller stack
     std::uint64_t child_tidptr = 0; // CLONE_CHILD_SETTID / CLONE_CHILD_CLEARTID
     std::uint64_t tls = 0;          // CLONE_SETTLS
 };
@@ -26,11 +27,11 @@ struct ChildCloneSpec {
 // status. Does not return. Called from the child branch of the fork inside
 // do_clone()/do_fork(), because these flags must take effect before the guest's
 // first instruction in the child executes.
-[[noreturn]] void run_child_prologue(const GuestState& child_state,
-                                     const GuestAddressSpace& parent_space,
-                                     const std::vector<GuestDescriptor>& parent_files,
-                                     const std::string& sysroot, int tier, std::uint64_t max_steps,
-                                     const ChildCloneSpec& spec, int vfork_write_fd);
+[[noreturn]] void
+run_child_prologue(const GuestState& child_state, const GuestAddressSpace& parent_space,
+                   const std::vector<GuestDescriptor>& parent_files, const std::string& sysroot,
+                   const std::string& guest_argv0, const std::string& guest_image_path, int tier,
+                   std::uint64_t max_steps, const ChildCloneSpec& spec, int vfork_write_fd);
 
 // fork(2): duplicate the calling guest process. Returns the child's pid in the
 // parent and 0 in the child, or a negative errno.

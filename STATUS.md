@@ -4,9 +4,11 @@
 **Current phase:** Phase 5 (performance measurement and optimization) — active;
 Phase 6 (Linux ABI, ELF64 loading, and syscall compatibility) — twelfth slice
 implemented: **guest process creation** (`fork`/`vfork`/`clone` subset/`execve`/`wait4`)
-**Repository state:** buildable, tested, documented, all CI/sanitizer/cross-test/`clang-tidy`
-gates green. **Two execution tiers exist: the reference interpreter with a
-2048-slot epoch-keyed decoded-instruction cache (Tier 0) and a W^X `ExecArena`
+**Repository state:** buildable, tested, and documented; native GCC/Clang,
+ASan/UBSan, AArch64 cross-tests, syscall inventory, shellcheck, and pinned
+clang-format 19.1.7 checks pass. **Two execution tiers exist:** the reference
+interpreter with a 2048-slot epoch-keyed decoded-instruction cache (Tier 0) and
+a W^X `ExecArena`
 translation cache with hardware `NZCV` condition fusion, native self-loop
 superblocks, 2-way inline block chaining, and `Memory::code_epoch()` cache
 invalidation (Tier 1).** Static x86-64 Linux ELF64 executables (`ET_EXEC` and
@@ -33,8 +35,8 @@ works, what was last verified, and what to do next.
 > **Environment recovery (read this first after a container reset).** `/usr`
 > does not persist. Run `scripts/toolcache.sh install-host` (cmake/ninja/
 > shellcheck from committed debs, works offline from a fresh clone), then
-> `scripts/toolcache.sh restore` (cross toolchain + qemu from `tools/cache/`),
-> then rebuild and rerun the tests. Do **not** trust a surviving `build/`
+> `scripts/toolcache.sh restore` (cross toolchain + host binutils libraries
+> from `tools/cache/`), then rebuild and rerun the tests. Do **not** trust a surviving `build/`
 > directory. Full details in `docs/agent-handoff.md` §2 and §7.
 
 ---
@@ -61,19 +63,20 @@ works, what was last verified, and what to do next.
 | 16. `statx`(332) (tenth slice) | **Implemented & tested** — the modern, extensible stat (950 calls). `struct statx` is built only from fixed-width `__u32`/`__u64` fields, so its layout is identical on x86-64 and AArch64 and the host's bytes are copied into the guest verbatim (the `linux_dirent64` reasoning, D-030); `AT_FDCWD` only, `AT_SYMLINK_NOFOLLOW` the sole honoured flag |
 | 17. Static ELF64 loader + SysV AMD64 stack + unbuffered POSIX descriptors | **Implemented & tested** — `elf_loader.{hpp,cpp}` loads `ET_EXEC` and static-PIE `ET_DYN` with W^X `PT_LOAD` mappings, BSS zeroing, and 16-byte aligned `argc`/`argv`/`envp`/`auxv` (`AT_PHDR`/`AT_PHENT`/`AT_PHNUM`/`AT_PAGESZ`/`AT_ENTRY`/`AT_RANDOM`); `OpenFileDescription` replaces buffered `FILE*` fd entries |
 | 18. Startup, TLS, clock, resource, dup/fcntl, and scatter/positional I/O (eleventh slice) | **Implemented & tested** — adds `pread64`(17), `pwrite64`(18), `readv`(19), `writev`(20), `dup`(32), `dup2`(33), `dup3`(292), `fcntl`(72), `uname`(63, always advertising `"x86_64"`), `gettimeofday`(96), `clock_gettime`(228), `arch_prctl`(158, `ARCH_SET_FS`/`ARCH_GET_FS`), `set_tid_address`(218), `set_robust_list`(273), and `prlimit64`(302); **42 implemented syscalls total** |
-| 19. Guest process creation (twelfth slice) | **Implemented & tested** — adds `fork`(57), `vfork`(58), the process-creating subset of `clone`(56), `execve`(59) and `wait4`(61) in `src/core/process.cpp`; **47 implemented syscalls total**. A guest child is a real host process running a *deep copy* of the `GuestAddressSpace` (guest pages are host heap storage, so a bare host `fork` would leave both sides sharing vectors that a later `mmap` reallocates). Thread-creating and namespace-creating `clone` flags return `-ENOSYS` rather than being downgraded to a fork. Verified against a static x86-64 BusyBox: `sh -c 'printf "9\\n2\\n5\\n1\\n" \| sort -n'` → `1 2 5 9`, and `sh -c 'echo benchmark \| wc -c'` → `10`, both matching native output exactly on x86-64 and on AArch64 under qemu at Tier 0 and Tier 1 |
+| 19. Guest process creation (twelfth slice) | **Implemented & tested** — adds `fork`(57), `vfork`(58), the process-creating subset of `clone`(56), `execve`(59) and `wait4`(61) in `src/core/process.cpp`; **47 implemented syscalls total**. A guest child is a real host process running a *deep copy* of the `GuestAddressSpace` (guest pages are host heap storage, so a bare host `fork` would leave both sides sharing vectors that a later `mmap` reallocates). Process clone now honors `child_stack`; thread-creating and namespace-creating flags return `-ENOSYS` rather than being downgraded. A vfork child releases its parent on successful guest exec (not merely host exec), and a forked child can re-exec its image through `/proc/self/exe`. Verified against static x86-64 BusyBox: `sh -c 'printf "9\\n2\\n5\\n1\\n" \| sort -n'` → `1 2 5 9`, and `sh -c 'echo benchmark \| wc -c'` → `10`, matching native output on x86-64 and under AArch64 QEMU at both tiers |
 | 20. Two CLI/loader correctness fixes found by the new guest tests | **Fixed** — (a) `hyperion run` returned 0 even when the guest exited non-zero unless `--quiet` was given, so an exit-status gate was told a failing guest had succeeded; the guest's status is now always the process status. (b) `AT_EXECFN` was filled from `argv[0]` instead of the executable's absolute path, which made a statically linked glibc guest abort inside `_dl_get_origin()` before its `main` ran; it now carries the real path, and the initial `%rsp` is explicitly re-aligned to 16 bytes rather than relying on the string pushes leaving it aligned |
 
 **Implemented-syscall status (verified automatically by `tools/gen_syscall_inventory.py --check`).**
-Forty-two numbers are implemented today: `read`(0), `write`(1), `close`(3),
+Forty-seven numbers are implemented today: `read`(0), `write`(1), `close`(3),
 `fstat`(5), `lseek`(8), `mmap`(9), `mprotect`(10), `munmap`(11), `brk`(12),
 `pread64`(17), `pwrite64`(18), `readv`(19), `writev`(20), `access`(21),
-`dup`(32), `dup2`(33), `getpid`(39), `exit`(60), `uname`(63), `fcntl`(72),
-`getcwd`(79), `readlink`(89), `gettimeofday`(96), `getuid`(102), `getgid`(104),
-`geteuid`(107), `getegid`(108), `getppid`(110), `arch_prctl`(158), `gettid`(186),
-`getdents64`(217), `set_tid_address`(218), `clock_gettime`(228), `exit_group`(231),
-`openat`(257), `newfstatat`(262), `readlinkat`(267), `set_robust_list`(273),
-`dup3`(292), `prlimit64`(302), `getrandom`(318), `statx`(332). Everything else
+`dup`(32), `dup2`(33), `getpid`(39), `clone`(56), `fork`(57), `vfork`(58),
+`execve`(59), `exit`(60), `wait4`(61), `uname`(63), `fcntl`(72), `getcwd`(79), `readlink`(89),
+`gettimeofday`(96), `getuid`(102), `getgid`(104), `geteuid`(107), `getegid`(108),
+`getppid`(110), `arch_prctl`(158), `gettid`(186), `getdents64`(217),
+`set_tid_address`(218), `clock_gettime`(228), `exit_group`(231), `openat`(257),
+`newfstatat`(262), `readlinkat`(267), `set_robust_list`(273), `dup3`(292),
+`prlimit64`(302), `getrandom`(318), `statx`(332). Everything else
 returns `-ENOSYS` explicitly and is enforced bidirectionally between
 `src/core/syscall.cpp`, `docs/syscalls/inventory.tsv`, and the generated tier
 Markdown files by `ctest` (`syscall.inventory_valid`).

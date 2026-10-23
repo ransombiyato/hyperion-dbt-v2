@@ -29,8 +29,10 @@ assumed* — see [`docs/target-environment.md`](docs/target-environment.md).
 >   against Tier 0. See [`docs/real-world-evaluation.md`](docs/real-world-evaluation.md).
 >
 > **Process support (2026-10-23).** `fork`, `vfork`, the process-creating subset
-> of `clone`, `execve` and `wait4` are implemented, so shell pipelines and
-> programs that spawn children run. Verified against a real statically linked
+> of `clone` (including `child_stack`), `execve` and `wait4` are implemented, so
+> shell pipelines and programs that spawn children run. Regression coverage
+> includes a vfork child that re-execs `/proc/self/exe` and must unblock its
+> parent before the new image exits. Verified against a real statically linked
 > x86-64 BusyBox on x86-64 and on AArch64 under `qemu-user`, at both tiers:
 >
 > ```sh
@@ -259,8 +261,9 @@ under `qemu-user` and compares every register and flag against the interpreter.
 
 The development container does not persist `/usr` between sessions, but the
 repository does, so the emulator and cross toolchain are cached under
-`tools/cache/`; the two restore artefacts (the cross toolchain tarball and the
-static `qemu-aarch64`) are **committed**, so a fresh clone restores offline with:
+`tools/cache/`; the restore artefacts (the cross toolchain, its host-side
+binutils runtime libraries, and static `qemu-aarch64`) are **committed**, so a
+fresh clone restores offline with:
 
 ```bash
 scripts/toolcache.sh restore

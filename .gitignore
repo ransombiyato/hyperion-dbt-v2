@@ -37,11 +37,10 @@ dist/
 
 # Repo-local tool cache (scripts/toolcache.sh).
 #
-# The two restore artefacts — the AArch64 cross toolchain tarball and the static
-# qemu-aarch64 — are COMMITTED so a fresh clone can restore a full, working
-# toolchain offline (the toolchain must live in the repo, not only on one
-# machine). Everything else the cache may hold is large and machine-specific and
-# is ignored.
+# The restore artefacts — the AArch64 cross toolchain tarball, its host-side
+# binutils runtime libraries, and static qemu-aarch64 — are COMMITTED so a fresh
+# clone can restore a full, working toolchain offline. Everything else the cache
+# may hold is large and machine-specific and is ignored.
 tools/cache/*
 !tools/cache/toolchain/
 !tools/cache/bin/

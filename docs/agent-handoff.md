@@ -105,7 +105,8 @@ usually broken, and this project requires evidence, not plausible numbers.
 
 ```bash
 scripts/toolcache.sh install-host # fresh clone: cmake/ninja/shellcheck from committed debs
-scripts/toolcache.sh restore # after a container reset: cached cross toolchain + qemu (offline)
+# after a container reset: cached cross toolchain + host binutils runtimes (offline)
+scripts/toolcache.sh restore
 scripts/bootstrap.sh        # full toolchain (sudo); skip if already installed
 scripts/dev.sh bootstrap
 scripts/dev.sh build

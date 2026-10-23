@@ -85,6 +85,7 @@ struct ProcessAccess {
     static const std::string& sysroot(MinimalSyscallHandler& h) { return h.sysroot_; }
     static std::string& guest_argv0(MinimalSyscallHandler& h) { return h.guest_argv0_; }
     static std::string& guest_image_path(MinimalSyscallHandler& h) { return h.guest_image_path_; }
+    static int& vfork_sync_fd(MinimalSyscallHandler& h) { return h.vfork_sync_fd_; }
 };
 
 namespace {
@@ -150,6 +151,16 @@ std::int64_t read_guest_string(Memory& memory, std::uint64_t address, std::strin
         out.push_back(static_cast<char>(byte));
     }
     return -kEnametoolong;
+}
+
+bool probe_guest_write(Memory& memory, std::uint64_t address, std::size_t size) {
+    std::array<std::uint8_t, 8> original{};
+    if (size > original.size() || !memory.read(address, original.data(), size)) {
+        return false;
+    }
+    // Write the bytes back unchanged: this checks write permission without
+    // leaving a visible zero in the guest if clone later fails.
+    return memory.write(address, original.data(), size);
 }
 
 // Read a NULL-terminated array of guest strings (argv/envp). A NULL array
@@ -381,16 +392,19 @@ namespace process {
 
 // --- child side --------------------------------------------------------------
 
-[[noreturn]] void run_child_prologue(const GuestState& child_state,
-                                     const GuestAddressSpace& parent_space,
-                                     const std::vector<GuestDescriptor>& parent_files,
-                                     const std::string& sysroot, int tier, std::uint64_t max_steps,
-                                     const ChildCloneSpec& spec, int vfork_write_fd) {
+[[noreturn]] void
+run_child_prologue(const GuestState& child_state, const GuestAddressSpace& parent_space,
+                   const std::vector<GuestDescriptor>& parent_files, const std::string& sysroot,
+                   const std::string& guest_argv0, const std::string& guest_image_path, int tier,
+                   std::uint64_t max_steps, const ChildCloneSpec& spec, int vfork_write_fd) {
     // Deep copy: the child gets guest memory that is genuinely its own, so a
     // later mmap/munmap on either side cannot invalidate the other's cached host
     // page pointers.
     GuestAddressSpace space(parent_space);
     GuestState state = child_state;
+    if (spec.child_stack != 0) {
+        state.gpr[static_cast<std::size_t>(Gpr::kRsp)] = spec.child_stack;
+    }
 
     // CLONE_CHILD_SETTID writes the child's tid into the child's own memory, and
     // CLONE_SETTLS sets its %fs base. Both must land before the guest's first
@@ -407,6 +421,9 @@ namespace process {
     MinimalSyscallHandler handler({}, &space);
     ProcessAccess::files(handler) = parent_files;
     handler.enable_linux_compat(sysroot);
+    ProcessAccess::guest_argv0(handler) = guest_argv0;
+    ProcessAccess::guest_image_path(handler) = guest_image_path;
+    ProcessAccess::vfork_sync_fd(handler) = vfork_write_fd;
 
     const RunResult result = (tier == 1) ? TranslationCache().run(space, state, max_steps, &handler)
                                          : run_program(space, state, max_steps, &handler);
@@ -434,10 +451,13 @@ namespace process {
     // _exit() does not run atexit handlers.
     std::fflush(stdout);
     std::fflush(stderr);
-    // Closing the write end is what releases a parent blocked in vfork. On the
-    // exec path this descriptor is O_CLOEXEC, so the exec closes it instead.
-    if (vfork_write_fd >= 0) {
-        ::close(vfork_write_fd);
+    // A guest execve is emulated in-process, so the host's O_CLOEXEC flag does
+    // not close this descriptor. do_execve closes it on successful image
+    // replacement; if the child exits without execing, close it here.
+    int& sync_fd = ProcessAccess::vfork_sync_fd(handler);
+    if (sync_fd >= 0) {
+        ::close(sync_fd);
+        sync_fd = -1;
     }
     ::_exit(status);
 }
@@ -467,6 +487,8 @@ std::int64_t do_fork_common(MinimalSyscallHandler& self, const GuestState& state
     const std::vector<GuestDescriptor> child_files =
         fork_descriptor_table(ProcessAccess::files(self));
     const std::string sysroot = ProcessAccess::sysroot(self);
+    const std::string guest_argv0 = ProcessAccess::guest_argv0(self);
+    const std::string guest_image_path = ProcessAccess::guest_image_path(self);
     const int tier = self.child_tier();
     const std::uint64_t max_steps = self.child_max_steps();
 
@@ -495,6 +517,15 @@ std::int64_t do_fork_common(MinimalSyscallHandler& self, const GuestState& state
         if (sync_fds[0] >= 0) {
             ::close(sync_fds[0]); // the read end belongs to the parent alone
         }
+        // This new process must not keep an inherited vfork synchronization
+        // pipe alive: only the direct vfork child may release its parent. The
+        // direct child gets its own new write end below when this syscall is
+        // itself vfork; ordinary fork children get no synchronization fd.
+        int& inherited_sync_fd = ProcessAccess::vfork_sync_fd(self);
+        if (inherited_sync_fd >= 0) {
+            ::close(inherited_sync_fd);
+            inherited_sync_fd = -1;
+        }
         // fork() returns 0 in the child. This has to be set here rather than by
         // the caller's `rax = r` assignment: the child never returns from the
         // syscall dispatch, it jumps straight into guest execution. Without it
@@ -503,7 +534,8 @@ std::int64_t do_fork_common(MinimalSyscallHandler& self, const GuestState& state
         // child. This was found by test, not by inspection.
         GuestState child = child_state;
         child.gpr[static_cast<std::size_t>(Gpr::kRax)] = 0;
-        run_child_prologue(child, *space, child_files, sysroot, tier, max_steps, spec, sync_fds[1]);
+        run_child_prologue(child, *space, child_files, sysroot, guest_argv0, guest_image_path, tier,
+                           max_steps, spec, sync_fds[1]);
     }
 
     // Parent. Discard the parent's translated code before it resumes: every
@@ -519,11 +551,12 @@ std::int64_t do_fork_common(MinimalSyscallHandler& self, const GuestState& state
         ::close(sync_fds[1]);
     }
     if (vfork_semantics && sync_fds[0] >= 0) {
-        // Real vfork suspends the parent until the child execs or exits. The
-        // child's write end is O_CLOEXEC so an execve closes it, and the child's
-        // exit path closes it explicitly; either way the read returns EOF and the
-        // parent resumes. Unlike the kernel this does not also share the address
-        // space, which is a deliberate divergence documented in COMPATIBILITY.md.
+        // Real vfork suspends the parent until the child execs or exits. A
+        // successful emulated execve explicitly closes the child's tracked write
+        // end; the child exit path does the same if it never execs. O_CLOEXEC is
+        // retained as a defense for any host exec path. Either event yields EOF
+        // here and resumes the parent. Unlike the kernel this does not also share
+        // the address space, a deliberate divergence documented in COMPATIBILITY.md.
         std::uint8_t drained[16];
         while (::read(sync_fds[0], drained, sizeof(drained)) > 0) {
         }
@@ -551,6 +584,7 @@ std::int64_t do_clone(MinimalSyscallHandler& self, GuestState& state, Memory& me
     // x86-64 clone argument order is (flags, child_stack, parent_tidptr,
     // child_tidptr, tls). AArch64 swaps the two tidptr arguments; this is the
     // *guest* ABI, so the x86-64 order is the only correct one here.
+    const std::uint64_t child_stack = proc_arg(state, 1);
     const std::uint64_t parent_tidptr = proc_arg(state, 2);
     const std::uint64_t child_tidptr = proc_arg(state, 3);
     const std::uint64_t tls = proc_arg(state, 4);
@@ -576,17 +610,21 @@ std::int64_t do_clone(MinimalSyscallHandler& self, GuestState& state, Memory& me
     if ((named_flags & clone_flags::kSetTid) != 0 && tls == 0) {
         return -kEinval; // the kernel rejects CLONE_SETTLS with a null tls
     }
-    // CLONE_PARENT_SETTID writes into the parent's memory before clone returns,
-    // so a bad pointer must be caught before the child exists.
-    if ((named_flags & clone_flags::kParentSetTid) != 0 && parent_tidptr != 0) {
-        const std::array<std::uint8_t, 4> probe{};
-        if (!memory.write(parent_tidptr, probe.data(), probe.size())) {
-            return -kEfault;
-        }
+    // Validate tid pointers before creating a host child. A read/write-back
+    // probe preserves guest bytes if fork fails; writing a zero-filled probe
+    // would have corrupted the caller's memory on that error path.
+    if ((named_flags & clone_flags::kParentSetTid) != 0 && parent_tidptr != 0 &&
+        !probe_guest_write(memory, parent_tidptr, 4)) {
+        return -kEfault;
+    }
+    if ((named_flags & (clone_flags::kChildSetTid | clone_flags::kChildCleartid)) != 0 &&
+        child_tidptr != 0 && !probe_guest_write(memory, child_tidptr, 4)) {
+        return -kEfault;
     }
 
     ChildCloneSpec spec;
     spec.flags = named_flags;
+    spec.child_stack = child_stack;
     spec.child_tidptr = child_tidptr;
     spec.tls = tls;
 
@@ -762,6 +800,14 @@ std::int64_t do_execve(MinimalSyscallHandler& self, GuestState& state, Memory& m
     }
     ProcessAccess::guest_image_path(self) = resolved;
     ProcessAccess::guest_argv0(self) = argv.empty() ? resolved : argv.front();
+    // execve is implemented by replacing guest state inside the existing host
+    // process, not by calling host execve. Explicitly release a vfork parent now;
+    // host O_CLOEXEC alone cannot observe this guest-image replacement.
+    int& sync_fd = ProcessAccess::vfork_sync_fd(self);
+    if (sync_fd >= 0) {
+        ::close(sync_fd);
+        sync_fd = -1;
+    }
     // reset() and the image mapping already bumped the address space's epoch, so
     // both execution tiers invalidate their translations of the outgoing image
     // before executing the first instruction of the new one.

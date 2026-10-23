@@ -17,12 +17,13 @@ which installs on Debian/Ubuntu: `build-essential cmake ninja-build clang
 clang-format clang-tidy llvm gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
 binutils-aarch64-linux-gnu qemu-user qemu-user-static gdb-multiarch`.
 
-It also caches the emulator and cross toolchain under `tools/cache/`
-(git-ignored), because the development container does not persist `/usr` between
-sessions but the repository does. After a reset, `scripts/toolcache.sh restore`
-reinstates the cached toolchain offline; `scripts/toolcache.sh status` shows what
-is cached. The benchmark and cross-test scripts use the cached
-`qemu-aarch64-static` automatically.
+It also caches the emulator and cross toolchain under `tools/cache/` (the
+restore archives are committed), because the development container does not
+persist `/usr` between sessions but the repository does. After a reset,
+`scripts/toolcache.sh restore` reinstates the compiler and its host-side binutils
+runtime libraries offline; `scripts/toolcache.sh status` shows what is cached.
+The benchmark and cross-test scripts use the cached `qemu-aarch64-static`
+automatically.
 
 ---
 
@@ -57,7 +58,7 @@ Presets are also provided: `cmake --preset debug`, `release`, `sanitize`,
 | `tests/cli/` | end-to-end CLI tests (`cli_smoke.sh` for the blob path, `elf_test.sh` for the ELF path, `wrapper_test.sh` for the installed `hyperion` command) |
 | `tests/fixtures/` | small committed test inputs (`tiny-static.elf`) |
 | `tests/guest/fixtures/` | **C sources** for real x86-64 guest programs, compiled by the test itself |
-| `tests/guest/process_test.sh` | guest process regression tests (fork/exec/fd/pipe/vfork/clone errors + BusyBox pipelines) |
+| `tests/guest/process_test.sh` | guest process regression tests (fork/exec/fd/pipe/vfork exec release/clone child stack + BusyBox pipelines) |
 | `tests/run_cross_tests.cmake` | cross-arch configure/build/run driver |
 | `benchmarks/` | harness smoke tests (`bench.smoke`, `tier_bench.smoke`) |
 
@@ -72,7 +73,7 @@ Registered CTest tests:
 | `bench.smoke` | the benchmark harness runs and emits valid output |
 | `tier_bench.smoke` | the Tier 0 vs Tier 1 benchmark runs and both tiers are correct (on x86-64 only Tier 0 executes; Tier 1 is reported unavailable) |
 | `cross.aarch64_tests` | the suite passes when compiled for AArch64 and run under `qemu-user` |
-| `guest.process` | real x86-64 guests create subprocesses correctly: exit status propagates, `execve` runs a second program, descriptors and pipes survive `fork`, `vfork` suspends the parent, unsupported `clone` flags return `ENOSYS`, and a static x86-64 BusyBox runs a shell pipeline |
+| `guest.process` | real x86-64 guests create subprocesses correctly: exit status propagates, clone honors `child_stack`, `execve` runs another image and re-execs `/proc/self/exe`, descriptors/pipes survive `fork`, `vfork` unblocks on exec, unsupported clone flags return `ENOSYS`, and an optional static BusyBox runs shell pipelines |
 | `guest.process.tier1` | the same suite on the Tier 1 JIT; registered only with `-DHYPERION_ENABLE_GUEST_TIER1_TESTS=ON` (meaningful on an AArch64 host) |
 
 `tests/cli/cli_smoke.sh` writes a small x86-64 blob, runs it through tier 0 and
@@ -131,9 +132,11 @@ cmake -S . -B build -G Ninja -DHYPERION_GUEST_CC=x86_64-linux-gnu-gcc
 ```
 
 `HYPERION_BUSYBOX` is optional; when unset the two shell-pipeline cases report
-`skip` rather than failing, and the remaining seven still run. A suitable fixture
-is Debian's `busybox-static` (`/bin/busybox` from that package is a statically
-linked x86-64 ELF).
+`skip` rather than failing, and the remaining nine process cases still run. A
+suitable fixture is Debian's `busybox-static` (`/bin/busybox` from that package
+is a statically linked x86-64 ELF). To include the BusyBox pipelines in the
+AArch64-under-QEMU cross pipeline, set `HYPERION_BUSYBOX` in the environment
+before running `scripts/dev.sh cross-test`.
 
 ### Diagnosing a guest that misbehaves
 
@@ -174,7 +177,10 @@ scripts/dev.sh cross-test
 
 This configures `build/cross-test/cross-aarch64` with
 `cmake/toolchains/aarch64-linux-gnu.cmake` (static linking), builds the test
-suite, runs it under `qemu-aarch64`, and fails the CTest run if it does not pass.
+suite, and runs the unit, differential, CLI, and real x86-64 guest-process tests
+under `qemu-aarch64`. The guest-process suite runs at both Tier 0 and Tier 1;
+`HYPERION_BUSYBOX` optionally enables the two shell-pipeline cases. Any failure
+fails the CTest run.
 
 **Limits.** `qemu-user` validates *correctness*, never performance, and it is
 not a cycle-accurate model. Performance claims require real AArch64 hardware.

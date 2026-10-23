@@ -76,7 +76,7 @@ if(HYPERION_GUEST_CC)
                 bash "${CMAKE_CURRENT_SOURCE_DIR}/guest/process_test.sh"
                 $<TARGET_FILE:hyperion>
                 "${CMAKE_CURRENT_SOURCE_DIR}/guest/fixtures")
-    set_tests_properties(guest.process PROPERTIES LABELS "guest")
+    set_tests_properties(guest.process PROPERTIES LABELS "guest" TIMEOUT 120)
 else()
     message(STATUS "HYPERION: no static x86-64 fixture compiler found; "
                    "guest.process tests not registered (set HYPERION_GUEST_CC)")
@@ -96,7 +96,7 @@ if(HYPERION_GUEST_CC AND HYPERION_ENABLE_GUEST_TIER1_TESTS)
                 bash "${CMAKE_CURRENT_SOURCE_DIR}/guest/process_test.sh"
                 $<TARGET_FILE:hyperion>
                 "${CMAKE_CURRENT_SOURCE_DIR}/guest/fixtures")
-    set_tests_properties(guest.process.tier1 PROPERTIES LABELS "guest")
+    set_tests_properties(guest.process.tier1 PROPERTIES LABELS "guest" TIMEOUT 120)
 endif()
 
 option(HYPERION_ENABLE_CROSS_TESTS "Run AArch64 tests under qemu-user" OFF)

@@ -1121,6 +1121,9 @@ std::shared_ptr<OpenFileDescription> make_stdio_desc(std::FILE* stream, int sink
 
 MinimalSyscallHandler::MinimalSyscallHandler(OutputSink sink, GuestAddressSpace* address_space)
     : sink_(sink ? std::move(sink) : OutputSink(default_sink)), address_space_(address_space) {
+    // The guest shares this process's pid namespace, so the host pid is the
+    // guest-visible pid and also lets /proc/<pid>/exe resolve to this image.
+    guest_pid_ = static_cast<int>(::getpid());
     files_ = {
         GuestDescriptor{make_stdio_desc(stdin, -1), false},
         GuestDescriptor{make_stdio_desc(stdout, 1), false},

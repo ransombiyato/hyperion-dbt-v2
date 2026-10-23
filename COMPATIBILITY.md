@@ -302,7 +302,7 @@ guest buffer from the host in 4 KiB chunks, accepting only the two defined
 | `set_tid_address`, `rseq`, `prlimit64` | ⬜ | 6 | — |
 | `fork`(57) | ✅ | 6 | `guest.process` (`fork + waitpid exit status`) |
 | `vfork`(58) | ✅ (parent suspends; address space **not** shared) | 6 | `guest.process` (`vfork`) |
-| `clone`(56) — process-creating subset | ✅ (partial) | 6 | `guest.process` (`raw clone: unsupported flags refused with ENOSYS`) |
+| `clone`(56) — process-creating subset | ✅ (partial; `SIGCHLD`, `child_stack`, tid/TLS flags) | 6 | `guest.process` (`process clone honors child_stack`, raw unsupported-flag check) |
 | `clone`(56) — `CLONE_VM`/`CLONE_THREAD`/`CLONE_FILES`/`CLONE_FS`/`CLONE_SIGHAND` | ❌ `-ENOSYS` by design | 6 | `guest.process` (same test) |
 | `clone`(56) — namespace flags (`CLONE_NEWNS`/`NEWPID`/`NEWUSER`/…) | ❌ `-ENOSYS` (needs `CAP_SYS_ADMIN`) | 6 | `guest.process` (same test) |
 | `execve`(59) | ✅ | 6 | `guest.process` (`execve of a second program`) |
@@ -352,8 +352,10 @@ Three implementation facts make this safe, and all three are load-bearing:
 | Descriptor inheritance across `fork`, with a **shared file offset** | ✅ |
 | `FD_CLOEXEC` honoured on `execve` (per-descriptor, not per-OFD) | ✅ |
 | `pipe`/`pipe2` + `fork` inter-process communication | ✅ |
+| Process-creating `clone` honors a non-null `child_stack` | ✅ |
 | `execve` of another x86-64 ELF64, with `PATH` search for bare names | ✅ |
 | `execve` leaves the process untouched on every error path | ✅ |
+| A forked child re-execes its guest image through `/proc/self/exe` | ✅ |
 | `vfork` suspends the parent until the child execs or exits | ✅ |
 | `vfork` shares the address space | ❌ **not** — the child gets a private copy (see below) |
 | `CLONE_CHILD_SETTID` / `CLONE_CHILD_CLEARTID` / `CLONE_PARENT_SETTID` | ✅ |

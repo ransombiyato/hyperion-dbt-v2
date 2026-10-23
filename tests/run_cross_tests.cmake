@@ -31,6 +31,7 @@ execute_process(
         -DCMAKE_TOOLCHAIN_FILE=${toolchain}
         -DCMAKE_BUILD_TYPE=RelWithDebInfo
         -DCMAKE_CXX_COMPILER=${HYPERION_AARCH64_CXX}
+        -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON
         -DHYPERION_BUILD_BENCHMARKS=OFF
     RESULT_VARIABLE cfg_result
     OUTPUT_VARIABLE cfg_output
@@ -108,5 +109,40 @@ message(STATUS "AArch64 CLI smoke output:\n${cli_output}${cli_error}")
 if(NOT cli_result EQUAL 0)
     message(FATAL_ERROR "AArch64 CLI smoke failed (exit ${cli_result})")
 endif()
+
+# Process tests use real static x86-64 guest fixtures. Run the AArch64 Hyperion
+# binary through qemu at both execution tiers; Tier 1 must execute the generated
+# AArch64 code, not silently fall back to the interpreter.
+execute_process(COMMAND uname -m OUTPUT_VARIABLE host_machine OUTPUT_STRIP_TRAILING_WHITESPACE)
+if(host_machine STREQUAL "x86_64")
+    set(guest_cc "cc")
+else()
+    find_program(guest_cc NAMES x86_64-linux-gnu-gcc)
+    if(NOT guest_cc)
+        message(FATAL_ERROR "cross tests: x86_64-linux-gnu-gcc is required to build x86-64 guests")
+    endif()
+endif()
+set(process_script "${HYPERION_SOURCE_DIR}/tests/guest/process_test.sh")
+set(process_fixtures "${HYPERION_SOURCE_DIR}/tests/guest/fixtures")
+set(busybox_path "$ENV{HYPERION_BUSYBOX}")
+foreach(tier IN ITEMS 0 1)
+    set(process_test_env
+        "HYPERION_GUEST_CC=${guest_cc}"
+        "HYPERION_TIER=${tier}"
+        "HYPERION_EMULATOR=${HYPERION_QEMU}")
+    if(NOT busybox_path STREQUAL "" AND EXISTS "${busybox_path}")
+        list(APPEND process_test_env "HYPERION_BUSYBOX=${busybox_path}")
+    endif()
+    execute_process(
+        COMMAND ${CMAKE_COMMAND} -E env ${process_test_env}
+            bash "${process_script}" "${cli_binary}" "${process_fixtures}" "${HYPERION_QEMU}"
+        RESULT_VARIABLE process_result
+        OUTPUT_VARIABLE process_output
+        ERROR_VARIABLE process_error)
+    message(STATUS "AArch64 guest process tests (tier ${tier}):\n${process_output}${process_error}")
+    if(NOT process_result EQUAL 0)
+        message(FATAL_ERROR "AArch64 guest process tests failed at tier ${tier} (exit ${process_result})")
+    endif()
+endforeach()
 
 message(STATUS "cross-architecture validation pipeline OK")

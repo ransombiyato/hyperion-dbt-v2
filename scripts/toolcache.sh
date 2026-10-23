@@ -111,6 +111,27 @@ cache_toolchain() {
     echo "  cached ${tarball}  ($(du -h "${tarball}" | cut -f1))"
 }
 
+# The cross-binutils executables are dynamically linked against host-side
+# libopcodes/libbfd libraries whose Debian package names end in `-arm64.so`.
+# They are not part of the compiler sysroot, so archiving only /usr/bin and the
+# cross GCC directories leaves `aarch64-linux-gnu-as` unusable after restore.
+# Keep these small runtime libraries in their own archive rather than rewriting
+# the ~50 MB compiler tarball every time a host binutils dependency changes.
+cache_binutils_libs() {
+    mkdir -p "${tc_dir}"
+    local tarball="${tc_dir}/aarch64-binutils-libs.tar.gz"
+    local libs=()
+    local lib
+    for lib in /usr/lib/x86_64-linux-gnu/lib*-arm64.so*; do
+        [ -e "${lib}" ] && libs+=("${lib}")
+    done
+    [ ${#libs[@]} -gt 0 ] || die "no cached host binutils libraries found; install the AArch64 cross toolchain first"
+
+    tar -czf "${tarball}.tmp" -C / "${libs[@]#/}"
+    mv -f "${tarball}.tmp" "${tarball}"
+    echo "  cached ${tarball}  ($(du -h "${tarball}" | cut -f1))"
+}
+
 populate() {
     local with_toolchain=0
     while [[ $# -gt 0 ]]; do
@@ -122,19 +143,29 @@ populate() {
     done
     echo "==> populating tool cache at ${cache}"
     cache_qemu
-    [ "${with_toolchain}" -eq 1 ] && cache_toolchain
+    if [ "${with_toolchain}" -eq 1 ]; then
+        cache_toolchain
+        cache_binutils_libs
+    fi
     echo "==> done"
 }
 
 restore() {
     local tarball="${tc_dir}/aarch64-toolchain.tar.gz"
+    local libs_tarball="${tc_dir}/aarch64-binutils-libs.tar.gz"
     if [ ! -f "${tarball}" ]; then
         echo "toolcache: no cached toolchain at ${tarball}; run 'populate --with-toolchain' first" >&2
         return 1
     fi
-    echo "==> restoring AArch64 cross toolchain from ${tarball} (needs root)"
+    if [ ! -f "${libs_tarball}" ]; then
+        echo "toolcache: no cached AArch64 binutils libraries at ${libs_tarball};" >&2
+        echo "           run 'populate --with-toolchain' and commit the generated archive" >&2
+        return 1
+    fi
+    echo "==> restoring AArch64 cross toolchain and binutils runtime libraries (needs root)"
     ${SUDO} tar -xzf "${tarball}" -C /
-    echo "==> restored; verify with: aarch64-linux-gnu-g++ --version"
+    ${SUDO} tar -xzf "${libs_tarball}" -C /
+    echo "==> restored; verify with: aarch64-linux-gnu-g++ --version && aarch64-linux-gnu-as --version"
 }
 
 # Host build tools (cmake/ninja/shellcheck) are not in the base image, so a
@@ -187,6 +218,12 @@ status() {
         echo "  toolchain : ${tarball} ($(du -h "${tarball}" | cut -f1))"
     else
         echo "  toolchain : not cached"
+    fi
+    local libs_tarball="${tc_dir}/aarch64-binutils-libs.tar.gz"
+    if [ -f "${libs_tarball}" ]; then
+        echo "  binutils  : ${libs_tarball} ($(du -h "${libs_tarball}" | cut -f1))"
+    else
+        echo "  binutils  : runtime libraries not cached"
     fi
     if [ -d "${vendor_dir}" ]; then
         echo "  host debs : ${vendor_dir} ($(du -sh "${vendor_dir}" 2>/dev/null | cut -f1), committed)"

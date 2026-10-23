@@ -32,8 +32,16 @@ EMULATOR="${3:-${HYPERION_EMULATOR:-}}"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
-# shellcheck disable=SC2086
-run_hyperion() { $EMULATOR "$BIN" "$@"; }
+# Every guest run has a bound: a process regression must fail loudly rather than
+# hanging CTest forever (vfork/exec regressions used to trigger exactly that).
+GUEST_TIMEOUT="${HYPERION_GUEST_TIMEOUT:-20s}"
+run_hyperion() {
+    if [ -n "$EMULATOR" ]; then
+        timeout "$GUEST_TIMEOUT" "$EMULATOR" "$BIN" "$@"
+    else
+        timeout "$GUEST_TIMEOUT" "$BIN" "$@"
+    fi
+}
 
 FAILED=0
 SKIPPED=0
@@ -44,7 +52,7 @@ run_case() {
     local label="$1" prog="$2" expected="$3"
     shift 3
     local out rc
-    out="$($EMULATOR "$BIN" run --quiet --tier="${HYPERION_TIER:-0}" "$prog" "$@" 2>"$WORK/err")" && rc=0 || rc=$?
+    out="$(run_hyperion run --quiet --tier="${HYPERION_TIER:-0}" "$prog" "$@" 2>"$WORK/err")" && rc=0 || rc=$?
     if [ "$out" != "$expected" ]; then
         echo "FAIL ${label}: stdout mismatch" >&2
         echo "  expected: $(printf '%s' "$expected" | tr '\n' '|')" >&2
@@ -106,6 +114,9 @@ done
 run_case "fork + waitpid exit status" "${WORK}/fork_exit_status" \
     "$(printf 'child running\nPASS fork status=7 pid_match=1')"
 
+run_case "process clone honors child_stack" "${WORK}/clone_child_stack" \
+    "PASS clone child_stack"
+
 run_case "execve of a second program" "${WORK}/execve_child" \
     "$(printf 'target argv1=hello\nPASS execve status=3')"
 
@@ -118,9 +129,13 @@ run_case "pipe + fork IPC" "${WORK}/pipe_ipc" \
 run_case "vfork" "${WORK}/vfork_basic" \
     "PASS vfork status=9"
 
+run_case "vfork + exec releases parent and resolves /proc/self/exe" \
+    "${WORK}/vfork_exec" \
+    "$(printf 'child received X\nPASS vfork exec resumed')"
+
 # bad_args prints one line per case; only the final PASS line is pinned, because
 # the intermediate lines are diagnostics whose exact wording is not contract.
-out="$($EMULATOR "$BIN" run --quiet --tier="${HYPERION_TIER:-0}" "${WORK}/bad_args" 2>"$WORK/err")" \
+out="$(run_hyperion run --quiet --tier="${HYPERION_TIER:-0}" "${WORK}/bad_args" 2>"$WORK/err")" \
     && rc=0 || rc=$?
 if ! printf '%s\n' "$out" | tail -1 | grep -q '^PASS bad_args$'; then
     echo "FAIL unsupported clone flags / invalid arguments" >&2
@@ -137,7 +152,7 @@ fi
 # Linux: it refuses CLONE_VM and friends with ENOSYS rather than silently
 # forking a guest that asked for a shared address space. This one is expected to
 # FAIL on native Linux, so it is deliberately not compared against a native run.
-out="$($EMULATOR "$BIN" run --quiet --tier="${HYPERION_TIER:-0}" "${WORK}/raw_clone_flags" 2>"$WORK/err")" \
+out="$(run_hyperion run --quiet --tier="${HYPERION_TIER:-0}" "${WORK}/raw_clone_flags" 2>"$WORK/err")" \
     && rc=0 || rc=$?
 if ! printf '%s\n' "$out" | tail -1 | grep -q '^PASS raw_clone_flags$'; then
     echo "FAIL raw clone flags must be refused with ENOSYS" >&2
