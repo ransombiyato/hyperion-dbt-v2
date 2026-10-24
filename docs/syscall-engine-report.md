@@ -1,6 +1,6 @@
 # Dynamic Syscall Translation and Compatibility Engine — final report
 
-Project HYPERION · branch `main` · HEAD `9d3bdcc`
+Project HYPERION · branch `main` · HEAD `9bfd09f`
 Host used for every measurement below: **x86-64**, Debian 13, kernel 6.1.158,
 GCC 14.2.0, CMake 4.4.4, Ninja 1.13.2, clang-format 19.1.7.
 
@@ -10,6 +10,12 @@ GCC 14.2.0, CMake 4.4.4, Ninja 1.13.2, clang-format 19.1.7.
 > exercised and passes** — see §6a. What is *not* covered: real AArch64 hardware
 > timings (qemu-user is a correctness tool, never a performance one) and the
 > reference Android device. Performance numbers in §7 are host-CPU only.
+>
+> **Latest corrections:** `futex` no longer reports wake-ups that never happened
+> (`stubbed`); `rt_sigaction`/`sigaltstack` record and report the guest's real
+> signal state instead of fabricating `SIG_DFL`; `clock_getres`/`fadvise64` are
+> translated rather than stubbed; `madvise`/`prctl` stay stubs with the reason in
+> the source. Inventory: **125 implemented + 3 stubbed = 128 answered of 375**.
 
 ---
 
@@ -208,6 +214,65 @@ Modified (docs): `README.md`, `ARCHITECTURE.md`, `COMPATIBILITY.md`, `STATUS.md`
 `docs/syscalls/README.md`, `docs/syscalls/inventory.tsv`,
 `docs/syscalls/U1..U4.md` (regenerated).
 
+## 6. Build, test and measurement results (actual)
+
+```sh
+cmake -B build/dev -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
+cmake --build build/dev -j8            # clean, no warnings
+ctest --test-dir build/dev             # 16/16 passed
+./build/dev/tests/hyperion_unit_tests  # 323 passed, 0 failed, 24 skipped (of 347)
+python3 tools/gen_syscall_inventory.py --check   # 0 errors, 0 warnings
+```
+
+| Suite | Command | Result |
+| --- | --- | --- |
+| Native unit | `./build/dev/tests/hyperion_unit_tests` | **323 passed, 0 failed, 24 skipped** (of 347) |
+| Full CTest tree | `ctest --test-dir build/dev` | **16/16 passed** |
+| ASan + UBSan | `cmake -B build/asan -DHYPERION_ENABLE_SANITIZERS=ON` + build + `ctest` | **16/16 passed**, no report |
+| Guest compatibility | `ctest -R guest.syscall_compat` | 11 checks, 37 guest-side assertions |
+| Registry CLI contract | `ctest -R cli.syscall_registry` | 11 checks |
+| Formatting | clang-format 19.1.7 `--dry-run --Werror` | clean |
+| Lint | `shellcheck` on all touched scripts | clean |
+| Inventory gate | `gen_syscall_inventory.py --check` | OK |
+
+End-to-end, a real static x86-64 guest using the adapted syscalls:
+
+```
+$ HYPERION_SYSCALL_STATS=1 hyperion run --tier=0 compat_syscalls
+… failures 0
+status: ok
+steps:  170659
+syscall dispatch: adapter=20 alias=0 existing=37 unsupported=0 translation_failures=0
+registry: /tmp/final/registry.json (40 adapter rule(s), 2 alias rule(s))
+```
+
+## 6a. AArch64 / Tier 1 verification (measured)
+
+```
+sudo apt-get install -y --no-install-recommends g++-aarch64-linux-gnu
+scripts/dev.sh cross-test        # 10/10 passed
+```
+
+| Run | Result |
+| --- | --- |
+| AArch64 unit suite (`qemu-aarch64-static`) | **349 passed, 0 failed, 2 skipped** (of 351 registered) |
+| AArch64 differential suite | 0 passed — correct: no x86-64 oracle on AArch64, so every case SKIPs |
+| `cross.aarch64_tests` (whole pipeline) | passed, 18–61 s |
+| AArch64 guest **process** tests, tier 0 / tier 1 | passed / passed |
+| AArch64 **syscall compat** suite, tier 0 / tier 1 | 11/11 checks, 37 guest assertions each |
+| AArch64 registry CLI | 11/11 checks |
+| Tier 1 JIT evidence | `tier 1: 1412 basic block(s) translated`, `failures 0`, **170 308 guest steps — identical to tier 0** |
+
+The step-count identity matters: the JIT and the interpreter agree instruction
+for instruction on a guest that exercises 20 adapter-handled syscalls, `poll`,
+`epoll`, `select`, `timerfd`, `nanosleep`, `getrusage` and friends.
+
+The cross driver did **not** cover this layer before; `tests/run_cross_tests.cmake`
+now runs the compat suite at both tiers, runs the registry CLI under qemu, and
+**fails the build if tier 1 falls back to the interpreter** (`tier 1: N basic
+block(s) translated`, `N > 0`, plus a "must not print a fallback warning" check).
+Without that assertion a silent fallback would pass every behavioural check.
+
 ## 6b. Signal-state fidelity: `rt_sigaction` and `sigaltstack`
 
 Both numbers used to be listed as stubs that answered success and did nothing.
@@ -263,65 +328,6 @@ not read back as zero — the observable half of the call would be a lie; and
 execution model. Refusing is better than faking, but the inventory still says
 `stubbed` for both rather than claiming them.
 
-## 6a. AArch64 / Tier 1 verification (measured)
-
-```
-sudo apt-get install -y --no-install-recommends g++-aarch64-linux-gnu
-scripts/dev.sh cross-test        # 10/10 passed
-```
-
-| Run | Result |
-| --- | --- |
-| AArch64 unit suite (`qemu-aarch64-static`) | **349 passed, 0 failed, 2 skipped** (of 351 registered) |
-| AArch64 differential suite | 0 passed — correct: no x86-64 oracle on AArch64, so every case SKIPs |
-| `cross.aarch64_tests` (whole pipeline) | passed, 18–61 s |
-| AArch64 guest **process** tests, tier 0 / tier 1 | passed / passed |
-| AArch64 **syscall compat** suite, tier 0 / tier 1 | 11/11 checks, 37 guest assertions each |
-| AArch64 registry CLI | 11/11 checks |
-| Tier 1 JIT evidence | `tier 1: 1412 basic block(s) translated`, `failures 0`, **170 308 guest steps — identical to tier 0** |
-
-The step-count identity matters: the JIT and the interpreter agree instruction
-for instruction on a guest that exercises 20 adapter-handled syscalls, `poll`,
-`epoll`, `select`, `timerfd`, `nanosleep`, `getrusage` and friends.
-
-The cross driver did **not** cover this layer before; `tests/run_cross_tests.cmake`
-now runs the compat suite at both tiers, runs the registry CLI under qemu, and
-**fails the build if tier 1 falls back to the interpreter** (`tier 1: N basic
-block(s) translated`, `N > 0`, plus a "must not print a fallback warning" check).
-Without that assertion a silent fallback would pass every behavioural check.
-
-## 6. Build, test and measurement results (actual)
-
-```sh
-cmake -B build/dev -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
-cmake --build build/dev -j8            # clean, no warnings
-ctest --test-dir build/dev             # 16/16 passed
-./build/dev/tests/hyperion_unit_tests  # 323 passed, 0 failed, 24 skipped (of 347)
-python3 tools/gen_syscall_inventory.py --check   # 0 errors, 0 warnings
-```
-
-| Suite | Command | Result |
-| --- | --- | --- |
-| Native unit | `./build/dev/tests/hyperion_unit_tests` | **323 passed, 0 failed, 24 skipped** (of 347) |
-| Full CTest tree | `ctest --test-dir build/dev` | **16/16 passed** |
-| ASan + UBSan | `cmake -B build/asan -DHYPERION_ENABLE_SANITIZERS=ON` + build + `ctest` | **16/16 passed**, no report |
-| Guest compatibility | `ctest -R guest.syscall_compat` | 11 checks, 37 guest-side assertions |
-| Registry CLI contract | `ctest -R cli.syscall_registry` | 11 checks |
-| Formatting | clang-format 19.1.7 `--dry-run --Werror` | clean |
-| Lint | `shellcheck` on all touched scripts | clean |
-| Inventory gate | `gen_syscall_inventory.py --check` | OK |
-
-End-to-end, a real static x86-64 guest using the adapted syscalls:
-
-```
-$ HYPERION_SYSCALL_STATS=1 hyperion run --tier=0 compat_syscalls
-… failures 0
-status: ok
-steps:  170659
-syscall dispatch: adapter=20 alias=0 existing=37 unsupported=0 translation_failures=0
-registry: /tmp/final/registry.json (40 adapter rule(s), 2 alias rule(s))
-```
-
 ## 7. Performance measurements
 
 `benchmarks/hyperion_syscall_bench.cpp` (target `hyperion_syscall_bench`,
@@ -371,7 +377,8 @@ device. They must not be quoted as end-to-end performance.
 | --- | --- | --- |
 | Threads (`clone` with `CLONE_VM`/`CLONE_THREAD`) | refused with `-ENOSYS` by design | correct, but any threaded guest does not run |
 | `futex`(202) | **stub by design**: value comparison real, blocking refused | cannot be fixed before thread creation exists; a guest that contends will get a clean `-ENOSYS` rather than a false wake-up |
-| `prctl`, `madvise`, `fadvise64`, `clock_getres` | stubs that report success | **worst category**: a guest that depends on the effect misbehaves later, looks like an unrelated bug. Rust's stack-overflow guard checks that `sigaltstack` took effect |
+| `madvise`(28), `prctl`(157) | **stubs by design**, reason in the source | a guest that depends on `MADV_DONTNEED` zeroing pages, or on a `prctl` query, gets a success it cannot rely on. Guest memory is host heap storage, not `mmap`, so the observable half of the call cannot be honoured |
+| Signal **delivery** | dispositions recorded and reported; nothing is delivered (`LIM-022`) | a guest that installs a handler and waits to be signalled still will not be. Needs guest signal frames and an arch-specific return trampoline |
 | Sockets | not started | blocks an editor that spawns a language server |
 | `signalfd`, `inotify_*` | not started | blocks file-watching |
 | File-backed `mmap`, `waitid`, `openat2` | not started | |
