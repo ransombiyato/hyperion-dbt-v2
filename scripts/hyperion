@@ -128,10 +128,10 @@ IMPLEMENTED
   - static ET_EXEC / static-PIE ET_DYN AND dynamically linked PT_INTERP (ld-linux-x86-64.so.2)
     ELF64 execution with file-backed mmap, MAP_FIXED, and --sysroot support
   - Linux x86-64 user-space syscall translation layer: 128 of 375 syscall numbers
-    answered (122 implemented, 6 stubbed), counted from docs/syscalls/inventory.tsv
+    answered (127 implemented, 1 stubbed), counted from docs/syscalls/inventory.tsv
     by tools/gen_syscall_inventory.py --check so the number cannot drift
   - multi-layer syscall dispatch (compiled rule table -> static switch -> legacy
-    compat switch -> ENOSYS), 39 ABI adapters translating x86-64/AArch64
+    compat switch -> ENOSYS), 40 ABI adapters translating x86-64/AArch64
     structure-layout differences (packed epoll_event, pollfd, fd_set, rusage,
     timespec, ...), and a persistent validated JSON registry outside the install
     directory ('hyperion syscall-registry --list')
@@ -152,11 +152,15 @@ LIMITATIONS
   - no sockets, no inotify/signalfd, no file-backed mmap, no waitid
   - ioctl covers TCGETS/TCSETS/TCSETSW/TCSETSF, TIOCGWINSZ/TIOCSWINSZ and
     FIONREAD (enough for terminal raw mode); other device requests are ENOTTY
-  - rt_sigaction, sigaltstack, prctl, madvise, fadvise64 and clock_getres are
-    stubs: they report success without doing the work, and are listed as
-    'stubbed' (not 'implemented') in the inventory
-  - futex compares the value and refuses to block (ENOSYS): a guest thread
-    cannot exist, so no waiter could ever be woken; it is listed as 'stubbed'
+  - rt_sigaction/sigaltstack record and report the guest's dispositions and
+    alternate stack, but no signal is ever delivered to a guest handler
+  - madvise implements MADV_DONTNEED (really zeroes) and the pure hints;
+    fork-affecting advice returns ENOSYS. prctl covers name/pdeathsig/dumpable
+    (recorded), timerslack and no_new_privs (forwarded), and refuses seccomp/MM/
+    capabilities with ENOSYS
+  - futex compares the value, honours a relative timeout (ETIMEDOUT) and refuses
+    to block without one (ENOSYS): a guest thread cannot exist, so no waiter
+    could ever be woken; it is the one entry still listed as 'stubbed'
   - no AVX2 / AVX-512 yet
 EOF
 }

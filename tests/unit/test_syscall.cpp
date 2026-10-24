@@ -18,6 +18,7 @@
 #include <fcntl.h>
 #include <string>
 #include <sys/ioctl.h>
+#include <sys/prctl.h>
 #include <unistd.h>
 #include <vector>
 
@@ -2392,4 +2393,178 @@ HYPERION_TEST("syscall", "linux_compat_fadvise64_translates_the_hint") {
     handler.handle(s, memory);
     const auto stdout_rc = static_cast<std::int64_t>(s.reg(Gpr::kRax));
     HYPERION_CHECK(stdout_rc == 0 || stdout_rc == -hyperion::kEspipe);
+}
+
+// --- linux-compat layer: madvise, prctl, futex timeouts ---------------------
+//
+// The three that were left after the earlier corrections, now as far as this
+// execution model allows each to be done honestly.
+
+HYPERION_TEST("syscall", "linux_compat_madvise_zeroes_on_dontneed") {
+    GuestAddressSpace as;
+    MinimalSyscallHandler handler({}, &as);
+    handler.enable_linux_compat();
+    FlatMemory memory(kBase, kMemSize);
+
+    // A block of non-zero data to give up. The harness memory is one page, so the
+    // ranges used here stay inside it (page-aligned, as madvise requires).
+    constexpr std::uint64_t kBlock = kBase; // page-aligned: madvise requires it
+    constexpr std::uint64_t kBlockLen = 0x400;
+    std::array<std::uint8_t, kBlockLen> block{};
+    block.fill(0xA5);
+    HYPERION_CHECK(memory.write(kBlock, block.data(), block.size()));
+
+    // MADV_DONTNEED(4) on anonymous private memory: the contents are gone and
+    // later reads see zeros. This is the whole documented effect, so it is
+    // implemented rather than approximated.
+    GuestState s = syscall_state(28, {kBlock, kBlockLen, 4});
+    handler.handle(s, memory);
+    HYPERION_CHECK_EQ(s.reg(Gpr::kRax), std::uint64_t{0});
+    HYPERION_CHECK(memory.read(kBlock, block.data(), block.size()));
+    for (std::uint8_t byte : block) {
+        HYPERION_CHECK_EQ(byte, std::uint8_t{0});
+    }
+
+    // Pure hints succeed and change nothing.
+    block.fill(0x5A);
+    HYPERION_CHECK(memory.write(kBlock, block.data(), block.size()));
+    for (std::uint64_t advice : {std::uint64_t{0}, std::uint64_t{1}, std::uint64_t{2},
+                                 std::uint64_t{3}, std::uint64_t{14}, std::uint64_t{15}}) {
+        s = syscall_state(28, {kBlock, kBlockLen, advice});
+        handler.handle(s, memory);
+        HYPERION_CHECK_EQ(s.reg(Gpr::kRax), std::uint64_t{0});
+    }
+    std::array<std::uint8_t, kBlockLen> after{};
+    HYPERION_CHECK(memory.read(kBlock, after.data(), after.size()));
+    HYPERION_CHECK_EQ(after[0], std::uint8_t{0x5A}); // a hint is not a discard
+
+    // A zero length is success without doing anything, as in the kernel.
+    s = syscall_state(28, {kBlock, 0, 4});
+    handler.handle(s, memory);
+    HYPERION_CHECK_EQ(s.reg(Gpr::kRax), std::uint64_t{0});
+
+    // MADV_REMOVE(9) is EINVAL for a private anonymous mapping - the kernel's own
+    // answer, not this layer's excuse.
+    s = syscall_state(28, {kBlock, kBlockLen, 9});
+    handler.handle(s, memory);
+    HYPERION_CHECK_EQ(s.reg(Gpr::kRax), static_cast<std::uint64_t>(-hyperion::kEinval));
+
+    // An advice whose effect is per-mapping kernel state this model does not
+    // carry is refused rather than silently ignored.
+    s = syscall_state(28, {kBlock, kBlockLen, 10 /*MADV_DONTFORK*/});
+    handler.handle(s, memory);
+    HYPERION_CHECK_EQ(s.reg(Gpr::kRax), static_cast<std::uint64_t>(-hyperion::kEnosys));
+
+    // Unknown advice is EINVAL; an unmapped range is ENOMEM; a misaligned
+    // address is EINVAL.
+    s = syscall_state(28, {kBlock, kBlockLen, 999});
+    handler.handle(s, memory);
+    HYPERION_CHECK_EQ(s.reg(Gpr::kRax), static_cast<std::uint64_t>(-hyperion::kEinval));
+    s = syscall_state(28, {0x700000000000ULL, kBlockLen, 0});
+    handler.handle(s, memory);
+    HYPERION_CHECK_EQ(s.reg(Gpr::kRax), static_cast<std::uint64_t>(-hyperion::kEnomem));
+    s = syscall_state(28, {kBlock + 1, kBlockLen, 0});
+    handler.handle(s, memory);
+    HYPERION_CHECK_EQ(s.reg(Gpr::kRax), static_cast<std::uint64_t>(-hyperion::kEinval));
+}
+
+HYPERION_TEST("syscall", "linux_compat_prctl_answers_what_it_can_and_refuses_the_rest") {
+    GuestAddressSpace as;
+    MinimalSyscallHandler handler({}, &as);
+    handler.enable_linux_compat();
+    FlatMemory memory(kBase, kMemSize);
+
+    auto call = [&](std::int64_t option, std::uint64_t a2 = 0, std::uint64_t a3 = 0) {
+        GuestState s = syscall_state(157, {static_cast<std::uint64_t>(option), a2, a3, 0, 0});
+        handler.handle(s, memory);
+        return static_cast<std::int64_t>(s.reg(Gpr::kRax));
+    };
+
+    // PR_SET_NAME(15) / PR_GET_NAME(16): the name round-trips, truncated to 15
+    // bytes plus NUL exactly like the kernel.
+    const char name[] = "hyperion guest worker";
+    HYPERION_CHECK(
+        memory.write(kBase + 0x100, reinterpret_cast<const std::uint8_t*>(name), sizeof name));
+    HYPERION_CHECK_EQ(call(15, kBase + 0x100), 0);
+    std::array<std::uint8_t, 16> got{};
+    HYPERION_CHECK(memory.write(kBase + 0x200, got.data(), got.size()));
+    HYPERION_CHECK_EQ(call(16, kBase + 0x200), 0);
+    HYPERION_CHECK(memory.read(kBase + 0x200, got.data(), got.size()));
+    HYPERION_CHECK_EQ(std::memcmp(got.data(), "hyperion guest ", 15), 0);
+    HYPERION_CHECK_EQ(got[15], std::uint8_t{0});
+
+    // PR_SET_PDEATHSIG(1) / PR_GET_PDEATHSIG(2).
+    HYPERION_CHECK_EQ(call(1, 9 /*SIGKILL*/), 0);
+    std::array<std::uint8_t, 4> sigb{};
+    HYPERION_CHECK(memory.write(kBase + 0x300, sigb.data(), sigb.size()));
+    HYPERION_CHECK_EQ(call(2, kBase + 0x300), 0);
+    HYPERION_CHECK(memory.read(kBase + 0x300, sigb.data(), sigb.size()));
+    HYPERION_CHECK_EQ(hyperion::syscall_detail::get_u32_le(sigb.data()), std::uint32_t{9});
+    HYPERION_CHECK_EQ(call(1, 65), -hyperion::kEinval);
+
+    // PR_SET_DUMPABLE(4) / PR_GET_DUMPABLE(3): default 1, settable to 0.
+    HYPERION_CHECK_EQ(call(3), 1);
+    HYPERION_CHECK_EQ(call(4, 0), 0);
+    HYPERION_CHECK_EQ(call(3), 0);
+    HYPERION_CHECK_EQ(call(4, 7), -hyperion::kEinval);
+
+    // PR_GET_TIMERSLACK(30) asks the host, so it answers with the host's value.
+    errno = 0;
+    const long host_slack = ::prctl(PR_GET_TIMERSLACK, 0UL, 0UL, 0UL, 0UL);
+    HYPERION_CHECK(host_slack >= 0);
+    HYPERION_CHECK_EQ(call(30), static_cast<std::int64_t>(host_slack));
+
+    // Options that would need to change this process's privileges or install a
+    // filter over the guest are refused, not faked.
+    HYPERION_CHECK_EQ(call(22 /*PR_SET_SECCOMP*/, 2, 0), -hyperion::kEnosys);
+    HYPERION_CHECK_EQ(call(35 /*PR_SET_MM*/, 1, 0), -hyperion::kEnosys);
+    // Unknown options are EINVAL, as the kernel says.
+    HYPERION_CHECK_EQ(call(9999), -hyperion::kEinval);
+
+    // Bad pointers are EFAULT.
+    HYPERION_CHECK_EQ(call(16, 0xDEAD0000ULL), -hyperion::kEfault);
+    HYPERION_CHECK_EQ(call(15, 0xDEAD0000ULL), -hyperion::kEfault);
+}
+
+HYPERION_TEST("syscall", "linux_compat_futex_wait_with_a_timeout_times_out") {
+    GuestAddressSpace as;
+    MinimalSyscallHandler handler({}, &as);
+    handler.enable_linux_compat();
+    FlatMemory memory(kBase, kMemSize);
+
+    // A locked futex word plus a 1 ms relative timeout: nothing can ever wake the
+    // waiter in this model, so the kernel-correct answer is ETIMEDOUT after the
+    // timeout elapses - which bounded waits rely on.
+    std::array<std::uint8_t, 4> word{1, 0, 0, 0};
+    HYPERION_CHECK(memory.write(kBase + 0x100, word.data(), word.size()));
+    std::array<std::uint8_t, 16> ts{};
+    hyperion::syscall_detail::put_u64(ts.data(), 0, 0);       // tv_sec
+    hyperion::syscall_detail::put_u64(ts.data(), 8, 1000000); // tv_nsec = 1 ms
+    HYPERION_CHECK(memory.write(kBase + 0x200, ts.data(), ts.size()));
+
+    const auto start = std::chrono::steady_clock::now();
+    GuestState s = syscall_state(202, {kBase + 0x100, 0 /*FUTEX_WAIT*/, 1, kBase + 0x200});
+    handler.handle(s, memory);
+    const auto elapsed = std::chrono::steady_clock::now() - start;
+    HYPERION_CHECK_EQ(s.reg(Gpr::kRax), static_cast<std::uint64_t>(-hyperion::kEtimeout));
+    HYPERION_CHECK(elapsed >= std::chrono::milliseconds(1));
+
+    // A changed word still wins over the timeout: EAGAIN, immediately.
+    word[0] = 2;
+    HYPERION_CHECK(memory.write(kBase + 0x100, word.data(), word.size()));
+    s = syscall_state(202, {kBase + 0x100, 0, 1, kBase + 0x200});
+    handler.handle(s, memory);
+    HYPERION_CHECK_EQ(s.reg(Gpr::kRax), static_cast<std::uint64_t>(-hyperion::kEagain));
+
+    // An invalid timeout is EINVAL; without one, the call still refuses rather
+    // than hanging or claiming a wake-up that cannot happen.
+    std::array<std::uint8_t, 16> bad_ts{};
+    hyperion::syscall_detail::put_u64(bad_ts.data(), 8, 2000000000ULL); // tv_nsec > 1e9
+    HYPERION_CHECK(memory.write(kBase + 0x300, bad_ts.data(), bad_ts.size()));
+    s = syscall_state(202, {kBase + 0x100, 0, 2, kBase + 0x300});
+    handler.handle(s, memory);
+    HYPERION_CHECK_EQ(s.reg(Gpr::kRax), static_cast<std::uint64_t>(-hyperion::kEinval));
+    s = syscall_state(202, {kBase + 0x100, 0, 2, 0});
+    handler.handle(s, memory);
+    HYPERION_CHECK_EQ(s.reg(Gpr::kRax), static_cast<std::uint64_t>(-hyperion::kEnosys));
 }

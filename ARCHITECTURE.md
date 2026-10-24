@@ -302,7 +302,7 @@ first-seen order. The summary line is printed by `hyperion run`:
 syscall dispatch: adapter=8 alias=0 existing=18 unsupported=1 translation_failures=0
 unsupported syscalls: 1 unique
   232 (0xe8) <unknown>
-registry: /home/user/.local/share/hyperion/syscalls/registry.json (39 adapter rule(s), 2 alias rule(s))
+registry: /home/user/.local/share/hyperion/syscalls/registry.json (40 adapter rule(s), 2 alias rule(s))
 ```
 
 `unsupported` counts **events**; the unique list below it counts **numbers**.

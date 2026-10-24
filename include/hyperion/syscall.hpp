@@ -302,6 +302,7 @@ inline constexpr std::int64_t kEnametoolong = 36;
 inline constexpr std::int64_t kErange = 34;
 inline constexpr std::int64_t kEintr = 4;
 inline constexpr std::int64_t kEnotty = 25;
+inline constexpr std::int64_t kEtimeout = 110;
 
 // What the handler did with a syscall.
 enum class SyscallStatus : std::uint8_t {
@@ -524,6 +525,16 @@ private:
     std::uint64_t altstack_sp_ = 0;
     std::int32_t altstack_flags_ = 2; // SS_DISABLE
     std::uint64_t altstack_size_ = 0;
+
+    // prctl(2) state this layer can answer from. These are the options whose
+    // observable meaning for the guest is "what does prctl report back":
+    // PR_SET/GET_NAME, PR_SET/GET_PDEATHSIG, PR_SET/GET_DUMPABLE. The two that
+    // can be translated to the *host* for real - PR_SET_NO_NEW_PRIVS and
+    // PR_SET_TIMERSLACK - are forwarded; see the prctl case in
+    // src/core/syscall.cpp for the full table and what is refused.
+    std::array<char, 16> process_name_{}; // PR_SET_NAME, always NUL-terminated
+    std::int32_t pdeathsig_ = 0;
+    std::int32_t dumpable_ = 1; // the kernel's default
 
     // --- process state ------------------------------------------------------
     std::vector<ChildProcess> children_; // children this guest created

@@ -42,6 +42,11 @@ DO_BUILD=1
 DO_UNINSTALL=0
 ASSUME_YES=0
 DO_HYPY=1
+SKIP_SIGSYS="${HYPERION_SKIP_SIGSYS_TEST:-0}"
+# Tests this install deliberately did not run (currently only ever `unit.native`,
+# after SIGSYS). Recorded in install.conf so the state is visible later instead of
+# living only in this script's output.
+SKIPPED_TESTS=""
 
 # Resolve the directory this script lives in. When it is being run from a
 # checkout, that checkout is built -- re-downloading the repository the user is
@@ -64,6 +69,12 @@ options:
   --src DIR       use an existing checkout instead of fetching one
   --no-build      install the command only; do not configure or build
   --no-hypy       do not install the `hypy` launcher
+  --skip-sigsys-test
+                  if `unit.native` is killed by SIGSYS (some Android/Termux
+                  setups' seccomp/SELinux policy), skip that one test and
+                  continue installing instead of asking. Every other test still
+                  has to pass, and the skipped test is reported as skipped, never
+                  as passed. Without this flag you are asked first (default: no).
   --yes           do not prompt for confirmation
   --uninstall     remove the installed commands and this install's metadata
   -h, --help      show this help
@@ -72,6 +83,8 @@ environment:
   HYPERION_PREFIX  install root
   HYPERION_REF     git ref to build
   HYPERION_SRC     existing source checkout to build from
+  HYPERION_SKIP_SIGSYS_TEST=1
+                   same as --skip-sigsys-test
 
 Run from inside a HYPERION checkout, this builds that checkout. Otherwise it
 fetches the repository into <prefix>/share/hyperion/src.
@@ -88,6 +101,7 @@ while [ $# -gt 0 ]; do
         --src=*)     SRC_DIR="${1#*=}"; shift ;;
         --no-build)  DO_BUILD=0; shift ;;
         --no-hypy)   DO_HYPY=0; shift ;;
+        --skip-sigsys-test) SKIP_SIGSYS=1; shift ;;
         --yes|-y)    ASSUME_YES=1; shift ;;
         --uninstall) DO_UNINSTALL=1; shift ;;
         -h|--help)   usage; exit 0 ;;
@@ -265,6 +279,115 @@ else
     fi
 fi
 
+# --- the test suite ---------------------------------------------------------
+#
+# Do not install a command that points at a build that fails its own tests.
+#
+# The one exception is environmental, and it is the user's decision, not this
+# script's: `unit.native` calls host kernel interfaces directly, and some
+# Android/Termux setups (an SELinux policy or a seccomp filter on the app
+# process) answer one of those calls by killing the process with SIGSYS. That is
+# the sandbox refusing a syscall, not a defect in HYPERION, and no amount of
+# retrying changes it.
+#
+# So: when - and only when - the single failing test is `unit.native` and its
+# reported failure reason is exactly SIGSYS, explain the situation and ask. The
+# default answer is no (keep the test, abort the install), because turning off a
+# check silently is how real failures get missed later. If the user says yes, the
+# suite is re-run excluding exactly that one test; every other test still has to
+# pass or the install still aborts, and the skipped test is reported as SKIPPED -
+# never as passed, and never counted as coverage that happened.
+
+# Yes/no question, default "no". Reads from the controlling terminal, not stdin:
+# `curl ... | bash` feeds the *script* through stdin, so a plain `read` would
+# consume the rest of the installer instead of the user's answer. With no
+# terminal at all there is nobody to ask, so the default (no) applies.
+ask_yes_no() {
+    local prompt="$1" reply=""
+    if [ -r /dev/tty ]; then
+        printf '%s [y/N] ' "${prompt}" >/dev/tty
+        IFS= read -r reply </dev/tty || reply=""
+    elif [ -t 0 ]; then
+        printf '%s [y/N] ' "${prompt}"
+        IFS= read -r reply || reply=""
+    else
+        return 1
+    fi
+    case "${reply}" in
+        [yY] | [yY][eE][sS]) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# Names of the tests ctest reported as failed, as ctest lists them at the end of
+# its run: "<n> - <name> (<reason>)".
+failed_test_list() {
+    sed -n '/The following tests FAILED:/,$p' \
+        | sed -n 's/^[[:space:]]*[0-9][0-9]* - \(.*\)$/\1/p'
+}
+
+run_test_suite() {
+    local output status=0 failed
+    # stdin is /dev/null on purpose: a test that reads the terminal would
+    # otherwise swallow the answer to the question asked below.
+    output="$(ctest --test-dir "${BUILD_DIR}" --output-on-failure </dev/null 2>&1)" || status=$?
+    if [ "${status}" -eq 0 ]; then
+        info "all tests passed"
+        return 0
+    fi
+
+    # A real failure: show ctest's own output rather than a summary of it.
+    printf '%s\n' "${output}"
+    failed="$(printf '%s\n' "${output}" | failed_test_list)"
+
+    # Exactly one failure, and it is unit.native killed by SIGSYS. Anything else
+    # - a second failing test, a different reason, a timeout, a crash - is a
+    # genuine failure and aborts right here. This comparison is deliberately
+    # exact so a broken build cannot slip through on a substring match.
+    if [ "${failed}" != "unit.native (SIGSYS)" ]; then
+        die "tests failed; refusing to install a broken build"
+    fi
+
+    if [ "${SKIP_SIGSYS}" -eq 1 ]; then
+        info "--skip-sigsys-test: skipping the SIGSYS-killed test (not asking)"
+    else
+        say ""
+        say "  'unit.native' was killed by SIGSYS before it could finish."
+        if [ "${IS_TERMUX}" -eq 1 ]; then
+            say "  This is a Termux installation, and Termux's own seccomp/SELinux"
+            say "  policy is the likeliest source of that signal."
+        fi
+        say ""
+        say "  SIGSYS is normally raised by a seccomp filter or an SELinux policy"
+        say "  terminating a process that made a disallowed system call. On some"
+        say "  Android/Termux setups that is what happens to this test binary: the"
+        say "  device's sandbox refuses a call the test makes, and the process is"
+        say "  killed. It is a property of this environment, not a bug in the build."
+        say ""
+        say "  If you skip it, this one test is NOT run and NOT reported as"
+        say "  passing: it stays unverified on this device. Every other test still"
+        say "  has to pass, or this installation will abort. You can re-run it once"
+        say "  the sandbox allows the call:"
+        say "    hyperion test            (or: ctest -R '^unit\\.native\$')"
+        say ""
+        if ! ask_yes_no "  Skip 'unit.native' for this installation and continue?"; then
+            say ""
+            say "  Keeping the test enabled; nothing was skipped."
+            die "tests failed; refusing to install a broken build"
+        fi
+    fi
+    SKIPPED_TESTS="unit.native"
+
+    # Re-run everything except that one test. Any other failure - including a
+    # flaky one that only shows up on the second run - still aborts the install.
+    say "Running the remaining tests (excluding unit.native)"
+    if ! ctest --test-dir "${BUILD_DIR}" --output-on-failure -E '^unit\.native$' </dev/null; then
+        die "tests failed with unit.native excluded; refusing to install a broken build"
+    fi
+    info "every test except unit.native passed"
+    info "unit.native: SKIPPED after SIGSYS - not run, not passed, still unverified"
+}
+
 # --- build and test ---------------------------------------------------------
 
 BUILD_DIR="${SRC_DIR}/build/install"
@@ -280,12 +403,8 @@ if [ "$DO_BUILD" -eq 1 ]; then
     cmake --build "${BUILD_DIR}" >/dev/null || die "build failed"
 
     say "Running the test suite"
-    # Do not install a command that points at a build that fails its own tests.
-    if ! ctest --test-dir "${BUILD_DIR}" --output-on-failure >/dev/null 2>&1; then
-        ctest --test-dir "${BUILD_DIR}" --output-on-failure || true
-        die "tests failed; refusing to install a broken build"
-    fi
-    info "all tests passed"
+    run_test_suite
+
 else
     say "Skipping build (--no-build)"
 fi
@@ -320,6 +439,11 @@ fi
     printf 'HYPERION_SRC=%s\n' "${SRC_DIR}"
     printf 'HYPERION_BUILD_DIR=%s\n' "${BUILD_DIR}"
     printf 'HYPERION_REF=%s\n' "${REF}"
+    # Present only when a test was deliberately skipped. Its presence means
+    # exactly that: "not run", never "passed".
+    if [ -n "${SKIPPED_TESTS}" ]; then
+        printf 'HYPERION_SKIPPED_TESTS=%s\n' "${SKIPPED_TESTS}"
+    fi
 } > "${CONF_FILE}"
 chmod 0644 "${CONF_FILE}"
 
@@ -365,6 +489,11 @@ say "  disable:        HYPERION_NO_SYSCALL_REGISTRY=1 or --no-syscall-registry"
 
 say ""
 say "Installed."
+if [ -n "${SKIPPED_TESTS}" ]; then
+    say ""
+    say "Note: the test ${SKIPPED_TESTS} was skipped after being killed by SIGSYS."
+    say "      It did not pass - it was not run. Run it with: hyperion test"
+fi
 say ""
 say "  hypy <elf> [args...]   run a program (exit status = the guest's)"
 say "  hyperion run <elf> ... the same thing, explicitly"

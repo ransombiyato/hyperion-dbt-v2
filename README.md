@@ -100,8 +100,8 @@ Everything needed to continue the project is **in this repository**. In order:
 | W^X executable memory (`ExecMem` + `ExecArena`) | **Implemented** — single-block `ExecMem` plus 16-byte-aligned multi-page W^X `ExecArena` |
 | x86-64 → AArch64 instruction translation | **Implemented** — standalone `translate_block()` plus full-system `translate_cached_block()` covering memory, stack (`PUSH`/`POP`/`CALL`/`RET`/`LEAVE`), full integer ALU, and hardware 128-bit ARMv8 NEON SIMD |
 | Multi-instruction program translation + code cache | **Implemented** — shared trampoline ABI, in-JIT 4096-slot jump table, branchless `CSEL` exits, self-loop superblocks, inline `SoftTlb` fast path (**104.5×** microbench / **5.17×–20.12×** full `glibc` binary speedup) |
-| Linux syscall layer | **Partial** — **128 of 375** numbers answered (125 implemented, 3 stubbed), CI-checked against `docs/syscalls/inventory.tsv`; `-ENOSYS` otherwise. Counts and the full list are in `STATUS.md` |
-| Syscall compatibility engine (adapters + persistent registry) | **Implemented** — 4-layer dispatch (compiled rule table → static switch → legacy compat switch → `-ENOSYS`), 39 ABI adapters, and a validated external JSON registry at `~/.local/share/hyperion/syscalls/registry.json`, created on install and never overwritten by an upgrade. See `ARCHITECTURE.md` §6 |
+| Linux syscall layer | **Partial** — **128 of 375** numbers answered (127 implemented, 1 stubbed), CI-checked against `docs/syscalls/inventory.tsv`; `-ENOSYS` otherwise. Counts and the full list are in `STATUS.md` |
+| Syscall compatibility engine (adapters + persistent registry) | **Implemented** — 4-layer dispatch (compiled rule table → static switch → legacy compat switch → `-ENOSYS`), 40 ABI adapters, and a validated external JSON registry at `~/.local/share/hyperion/syscalls/registry.json`, created on install and never overwritten by an upgrade. See `ARCHITECTURE.md` §6 |
 | Syscall observability | **Implemented** — per-layer counters, unique-vs-total unsupported accounting, `HYPERION_TRACE_SYSCALLS=1`, and `hyperion syscall-registry --list/--validate/--json` |
 | AArch64 / Tier 1 validation of the syscall layer | **Verified** — cross tree 10/10; the compat guest runs on JIT-generated AArch64 code with 1412 translated blocks and the same step count as the interpreter (numeric details in `docs/syscall-engine-report.md` §6a) |
 | Guest address space (mmap/brk/NX) | **Implemented** (Phase 6) — page-granular `split_region_at()` `mprotect`/`munmap`, enforced `MemPerm::kExec` fetch permissions, reserved heap window, per-mapping size cap (D-029) |
@@ -192,6 +192,14 @@ hyperion status        # what is implemented, and what is not
 hyperion test          # run the test suite
 hyperion help          # every command
 ```
+
+On Android/Termux, a seccomp filter or SELinux policy can kill the `unit.native`
+test with `SIGSYS`: the device refusing a system call, not a broken build. The
+installer detects exactly that case (one failing test, reason `SIGSYS`), explains
+it, and asks whether to skip that single test and continue. The default is **no**,
+the skipped test is reported as skipped rather than passed, every other test still
+has to pass, and `--skip-sigsys-test` answers the question in advance for
+unattended installs.
 
 If you would rather read a script before running it — always reasonable — the
 installer is a plain, commented shell script:

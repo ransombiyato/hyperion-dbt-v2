@@ -8,6 +8,22 @@ Meaningful changes by milestone. Format loosely follows
 ## [Unreleased] — Dynamic syscall translation and compatibility engine
 
 ### Added
+- **The installer asks before it skips a test the sandbox killed.** `install.sh`
+  runs the suite before installing anything and aborts on failure. On some
+  Android/Termux setups a seccomp filter or SELinux policy kills `unit.native`
+  with `SIGSYS` - the device refusing a system call, not a defective build. When
+  *and only when* ctest reports exactly one failure, `unit.native (SIGSYS)`, the
+  installer explains that, and asks whether to skip that one test and continue:
+  the default answer is **no**, the question is read from `/dev/tty` so it still
+  works when the script arrives through `curl | bash`, and with no terminal the
+  default applies. If the user says yes, the suite is re-run excluding exactly
+  that test; every other test still has to pass or the install still aborts, and
+  the skipped test is reported as `SKIPPED - not run, not passed` in the output
+  and in `install.conf` (`HYPERION_SKIPPED_TESTS=`). `--skip-sigsys-test` /
+  `HYPERION_SKIP_SIGSYS_TEST=1` skips the *question*, never the checking.
+  `tests/cli/install_sigsys_test.sh` runs real installer invocations through a
+  pseudo-terminal to prove all of that, including that a second failing test and
+  a failure that merely *mentions* SIGSYS both still abort.
 - **Multi-layer syscall dispatch (`include/hyperion/syscall_dispatch.hpp`,
   `src/core/syscall_dispatch.cpp`).** `MinimalSyscallHandler::handle()` now runs
   four layers in a fixed order: a compiled rule table (one bounds check and one
@@ -19,7 +35,7 @@ Meaningful changes by milestone. Format loosely follows
   handlers are unchanged and the static implementation always wins — a rule for a
   number HYPERION already implements is rejected at compile time with a
   diagnostic instead of silently shadowing tested code.
-- **39 ABI adapters (`src/core/syscall_adapters.cpp`).** Each translates a real
+- **40 ABI adapters (`src/core/syscall_adapters.cpp`).** Each translates a real
   cross-architecture difference rather than copying bytes: the x86-64 **packed
   12-byte** `struct epoll_event` versus the host's 16-byte aligned one (converted
   per entry, never `memcpy`'d), `struct pollfd` write-back that restores *guest*
@@ -83,6 +99,27 @@ Meaningful changes by milestone. Format loosely follows
   at work that was already done.
 
 ### Fixed
+- **`madvise` did nothing, including the one mode where doing nothing is wrong.**
+  `MADV_DONTNEED` on anonymous private memory is *defined* as "the pages read as
+  zero afterwards", and guest memory here is always anonymous private host-heap
+  storage, so the range is now really zeroed. Pure hints succeed (the kernel
+  promises nothing testable); `MADV_FREE` keeps the contents, which is permitted;
+  `MADV_REMOVE` returns `EINVAL` exactly as the kernel does for a private mapping;
+  the fork-affecting advice (`MADV_DONTFORK`/`WIPEONFORK` and friends) returns
+  `-ENOSYS` because this layer carries no per-mapping flags - pretending would
+  make a later `fork` behave differently from what the guest asked for.
+- **`prctl` was a stub that accepted everything.** Implemented for the options
+  that can be honoured or truthfully answered: `PR_SET/GET_NAME`,
+  `PR_SET/GET_PDEATHSIG` and `PR_SET/GET_DUMPABLE` are recorded and reported
+  back; `PR_SET/GET_TIMERSLACK` and `PR_SET/GET_NO_NEW_PRIVS` are forwarded to
+  the host. `PR_SET_SECCOMP`, `PR_SET_MM`, `PR_CAPBSET_*` and the child-subreaper
+  options return `-ENOSYS` rather than a false success, and unknown options return
+  `-EINVAL` as the kernel does.
+- **`futex` now honours a relative timeout.** `FUTEX_WAIT` with a timeout sleeps
+  and reports `-ETIMEDOUT`, which is the correct answer when no thread can ever
+  wake the waiter and what `pthread_cond_timedwait` depends on. An invalid
+  `timespec` is `-EINVAL`; a wait with no timeout still refuses with `-ENOSYS`
+  (it remains the one `stubbed` entry in the inventory).
 - **`clock_getres` and `fadvise64` answered success without asking anything.**
   `clock_getres`(229) now returns the host's real clock resolution in the guest's
   16-byte `timespec` (`-EINVAL` for an unknown clock id, `-EFAULT` for an unmapped

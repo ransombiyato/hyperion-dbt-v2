@@ -65,13 +65,13 @@ works, what was last verified, and what to do next.
 | 18. Startup, TLS, clock, resource, dup/fcntl, and scatter/positional I/O (eleventh slice) | **Implemented & tested** — adds `pread64`(17), `pwrite64`(18), `readv`(19), `writev`(20), `dup`(32), `dup2`(33), `dup3`(292), `fcntl`(72), `uname`(63, always advertising `"x86_64"`), `gettimeofday`(96), `clock_gettime`(228), `arch_prctl`(158, `ARCH_SET_FS`/`ARCH_GET_FS`), `set_tid_address`(218), `set_robust_list`(273), and `prlimit64`(302); **42 implemented syscalls total** |
 | 19. Guest process creation (twelfth slice) | **Implemented & tested** — adds `fork`(57), `vfork`(58), the process-creating subset of `clone`(56), `execve`(59) and `wait4`(61) in `src/core/process.cpp`; **47 implemented syscalls total**. A guest child is a real host process running a *deep copy* of the `GuestAddressSpace` (guest pages are host heap storage, so a bare host `fork` would leave both sides sharing vectors that a later `mmap` reallocates). Process clone now honors `child_stack`; thread-creating and namespace-creating flags return `-ENOSYS` rather than being downgraded. A vfork child releases its parent on successful guest exec (not merely host exec), and a forked child can re-exec its image through `/proc/self/exe`. Verified against static x86-64 BusyBox: `sh -c 'printf "9\\n2\\n5\\n1\\n" \| sort -n'` → `1 2 5 9`, and `sh -c 'echo benchmark \| wc -c'` → `10`, matching native output on x86-64 and under AArch64 QEMU at both tiers |
 | 20. Two CLI/loader correctness fixes found by the new guest tests | **Fixed** — (a) `hyperion run` returned 0 even when the guest exited non-zero unless `--quiet` was given, so an exit-status gate was told a failing guest had succeeded; the guest's status is now always the process status. (b) `AT_EXECFN` was filled from `argv[0]` instead of the executable's absolute path, which made a statically linked glibc guest abort inside `_dl_get_origin()` before its `main` ran; it now carries the real path, and the initial `%rsp` is explicitly re-aligned to 16 bytes rather than relying on the string pushes leaving it aligned |
-| 21. Multi-layer syscall dispatch + compatibility adapters | **Implemented & tested** — `include/hyperion/syscall_dispatch.hpp`, `src/core/syscall_dispatch.cpp`, `src/core/syscall_adapters.cpp`. Dispatch order is compiled rule table (`kMaxSyscall = 512`, one bounds check + one index) → static switch → legacy compat switch → `-ENOSYS`. 39 adapters translate ABI differences (packed 12-byte `epoll_event`, `pollfd`, `fd_set`, `rusage`, `tms`, `itimerval`, `timespec`, guest fd → host fd). No JSON parsing, file I/O, lock, allocation or string hashing on the hot path; `reload()` publishes an immutable `shared_ptr<CompiledRules>` snapshot |
+| 21. Multi-layer syscall dispatch + compatibility adapters | **Implemented & tested** — `include/hyperion/syscall_dispatch.hpp`, `src/core/syscall_dispatch.cpp`, `src/core/syscall_adapters.cpp`. Dispatch order is compiled rule table (`kMaxSyscall = 512`, one bounds check + one index) → static switch → legacy compat switch → `-ENOSYS`. 40 adapters translate ABI differences (packed 12-byte `epoll_event`, `pollfd`, `fd_set`, `rusage`, `tms`, `itimerval`, `timespec`, guest fd → host fd). No JSON parsing, file I/O, lock, allocation or string hashing on the hot path; `reload()` publishes an immutable `shared_ptr<CompiledRules>` snapshot |
 | 22. Persistent external JSON registry | **Implemented & tested** — `include/hyperion/syscall_registry.hpp`, `src/core/syscall_registry.cpp`. Schema v2 (v1 migrated on read), resolved as `--syscall-registry` → `$HYPERION_SYSCALL_REGISTRY` → `$XDG_DATA_HOME` → `$HOME/.local/share`; atomic write (temp + fsync + rename + dir fsync) with a `.bak`, `0600` files and `0700` directories; missing/corrupt/newer-schema files never block startup and are never rewritten by a read |
 | 23. Registry CLI, installer integration, observability | **Implemented & tested** — `hyperion syscall-registry --list/--validate/--json/--export-defaults/--write` (`--validate` exits 3 when a rule was rejected rather than reporting success), `scripts/hyperion` gained the subcommand, `install.sh` creates the registry outside the install dir only when absent and preserves user rules on upgrade and uninstall; per-layer counters distinguish handled / unsupported / translation failures and unique numbers from events |
 
 **Implemented-syscall status (verified automatically by
 `tools/gen_syscall_inventory.py --check`).** 128 numbers are answered
-today — 125 implemented and 3 stubbed — of the 375 in the pinned kernel
+today — 127 implemented and 1 stubbed — of the 375 in the pinned kernel
 table. The validator now cross-checks three sources in both directions:
 `MinimalSyscallHandler::handle()`, `is_linux_compat_syscall()` (whose numbers carry
 a `[stub]` or `[unsupported]` annotation that decides the expected status), and the
@@ -79,11 +79,14 @@ compatibility layer's adapter table and alias rules. A syscall cannot be counted
 as implemented in the inventory without a handler somewhere, and a handler cannot
 exist without the inventory saying so.
 
-The 3 stubs are `madvise`(28), `prctl`(157) and `futex`(202). They answer success without performing the
-call, or — for `futex` — perform the value comparison and then refuse to block,
-and are listed as `stubbed` rather than
-`implemented` because claiming them would be a lie a roadmap could be built on. `rseq`(334) is
-recognised only to be refused cleanly and stays `not-started`.
+One syscall is still a stub: `futex`(202). It performs the real value comparison
+(`-EAGAIN`/`-EFAULT`), honours a relative timeout (`-ETIMEDOUT`) and reports
+`WAKE` truthfully as zero woken, but a wait with no timeout refuses with `-ENOSYS`
+because no guest thread can exist here to wake it - blocking would hang and
+claiming success would be the false wake-up this layer was fixed to stop telling.
+It is listed as `stubbed` rather than `implemented` because claiming it would be a
+lie a roadmap could be built on. `rseq`(334) is recognised only to be refused
+cleanly and stays `not-started`.
 
 Anything not listed returns `-ENOSYS` explicitly and is counted. The full list is
 generated into `docs/syscalls/U1..U4.md`; the machine-readable source is
@@ -463,9 +466,9 @@ below, and it is a host limitation, not a passing claim:
 | Suite | Command | Result (measured) |
 | --- | --- | --- |
 | Native unit tests | `./build/dev/tests/hyperion_unit_tests` | **311 passed, 0 failed, 24 skipped** (of 335) |
-| Full CTest tree | `ctest --test-dir build/dev` | **16/16 passed** (unit, differential, 3 CLI, 2 guest, inventory, 7 bench) |
-| ASan + UBSan | `cmake -B build/asan -DHYPERION_ENABLE_SANITIZERS=ON` + `ctest` | **16/16 passed**, no sanitizer report |
-| Guest compat suite | `guest.syscall_compat` | 11/11 checks (37 guest-side ABI assertions) |
+| Full CTest tree | `ctest --test-dir build/dev` | **17/17 passed** (unit, differential, 4 CLI, 2 guest, inventory, 7 bench) |
+| ASan + UBSan | `cmake -B build/asan -DHYPERION_ENABLE_SANITIZERS=ON` + `ctest` | **17/17 passed**, no sanitizer report |
+| Guest compat suite | `guest.syscall_compat` | 11/11 checks (43 guest-side ABI assertions) |
 | Registry CLI suite | `cli.syscall_registry` | 11/11 checks |
 | Syscall inventory | `python3 tools/gen_syscall_inventory.py --check` | OK (0 errors, 0 warnings) |
 | Dispatch microbenchmark | `benchmarks/hyperion_syscall_bench --iterations 300000 --repeats 9` | see `TESTING.md` §6 |

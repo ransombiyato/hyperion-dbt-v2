@@ -16,7 +16,7 @@ GCC 14.2.0, CMake 4.4.4, Ninja 1.13.2, clang-format 19.1.7.
 > (`stubbed`); `rt_sigaction`/`sigaltstack` record and report the guest's real
 > signal state instead of fabricating `SIG_DFL`; `clock_getres`/`fadvise64` are
 > translated rather than stubbed; `madvise`/`prctl` stay stubs with the reason in
-> the source. Inventory: **125 implemented + 3 stubbed = 128 answered of 375**.
+> the source. Inventory: **127 implemented + 1 stubbed = 128 answered of 375**.
 
 ---
 
@@ -145,7 +145,7 @@ deleting it restores `-ENOSYS`:
 Counts are generated from `docs/syscalls/inventory.tsv` and enforced in both
 directions by `tools/gen_syscall_inventory.py --check`.
 
-**128 of 375** numbers are answered: **125 implemented, 3 stubbed**. Before this
+**128 of 375** numbers are answered: **127 implemented, 1 stubbed**. Before this
 work the inventory claimed 47.
 
 Newly `implemented` in this work (42 numbers):
@@ -174,10 +174,11 @@ in the inventory (`open`, `stat`, `lstat`, `rt_sigprocmask`, `ioctl`, `pipe`,
 pointed at work that was already done.
 
 - **Moved from stub to real:** `nanosleep`(35), `clock_nanosleep`(230),
-  `rt_sigaction`(13), `sigaltstack`(131), `clock_getres`(229), `fadvise64`(221).
+  `rt_sigaction`(13), `sigaltstack`(131), `clock_getres`(229), `fadvise64`(221),
+  `madvise`(28), `prctl`(157).
 - **Still stubbed, and labelled `stubbed` rather than `implemented`:**
-  `madvise`(28), `prctl`(157) and `futex`(202) — and each says *why* in the
-  source, instead of the call quietly returning 0.
+  `futex`(202) — and it says *why* in the source. `madvise`(28) and `prctl`(157),
+  which were in this list, are now implemented (§6d).
 - **`futex` was corrected *downwards* in this work.** It had been counted as
   implemented while returning success from `FUTEX_WAIT` without blocking — i.e.
   telling callers they had been woken when nothing had happened. It now does the
@@ -230,7 +231,7 @@ python3 tools/gen_syscall_inventory.py --check   # 0 errors, 0 warnings
 | Native unit | `./build/dev/tests/hyperion_unit_tests` | **323 passed, 0 failed, 24 skipped** (of 347) |
 | Full CTest tree | `ctest --test-dir build/dev` | **16/16 passed** |
 | ASan + UBSan | `cmake -B build/asan -DHYPERION_ENABLE_SANITIZERS=ON` + build + `ctest` | **16/16 passed**, no report |
-| Guest compatibility | `ctest -R guest.syscall_compat` | 11 checks, 37 guest-side assertions |
+| Guest compatibility | `ctest -R guest.syscall_compat` | 11 checks, 43 guest-side assertions |
 | Registry CLI contract | `ctest -R cli.syscall_registry` | 11 checks |
 | Formatting | clang-format 19.1.7 `--dry-run --Werror` | clean |
 | Lint | `shellcheck` on all touched scripts | clean |
@@ -247,6 +248,52 @@ syscall dispatch: adapter=20 alias=0 existing=37 unsupported=0 translation_failu
 registry: /tmp/final/registry.json (40 adapter rule(s), 2 alias rule(s))
 ```
 
+## 6d. `madvise`, `prctl`, and the futex timeout
+
+The last three stubs. Two could be implemented properly once the memory model was
+looked at, and the third turned out to be half-implementable for a reason that is
+worth writing down.
+
+**`madvise`(28).** Guest memory here is always anonymous, private, host-heap
+storage owned by `GuestAddressSpace` — there are no file-backed or shared
+mappings (`COMPATIBILITY.md`). That makes the advice modes split three ways, and
+each third gets the answer it deserves:
+
+| Modes | What is done | Why that is the truth |
+| --- | --- | --- |
+| `MADV_NORMAL`/`RANDOM`/`SEQUENTIAL`/`WILLNEED`/`HUGEPAGE`/`NOHUGEPAGE`/`DONTDUMP`/`DODUMP`/`COLD`/`PAGEOUT` | range probed, return 0 | pure hints; the kernel promises nothing a guest can test |
+| `MADV_DONTNEED` | **the range is zeroed** | for anonymous private memory this *is* the entire documented effect, so it is implemented, not approximated |
+| `MADV_FREE` | 0, contents kept | the kernel may discard only lazily; keeping them is permitted |
+| `MADV_DONTFORK`/`DOFORK`/`KEEPONFORK`/`WIPEONFORK` | `-ENOSYS` | per-mapping state this model does not carry; a guest that asked for `DONTFORK` and then forked would otherwise find the mapping still there |
+| `MADV_REMOVE` | `-EINVAL` | the kernel's own answer for a private anonymous mapping |
+| unknown advice | `-EINVAL` | same as the kernel |
+| unmapped range / misaligned address / zero length | `-ENOMEM` / `-EINVAL` / 0 | same as the kernel |
+
+**`prctl`(157).** A documented subset is honoured, and the rest is refused with a
+real errno rather than a fake success:
+
+| Option | Behaviour |
+| --- | --- |
+| `PR_SET_NAME`/`PR_GET_NAME` | stored (15 bytes + NUL, as the kernel truncates) and reported back |
+| `PR_SET_PDEATHSIG`/`PR_GET_PDEATHSIG` | recorded and reported. The host process is deliberately **not** armed: a guest's parent is not HYPERION's parent, so arming it would fire on the wrong event |
+| `PR_SET_DUMPABLE`/`PR_GET_DUMPABLE` | recorded (default 1) and reported |
+| `PR_SET_TIMERSLACK`/`PR_GET_TIMERSLACK` | **forwarded to the host**, so the answer is the real slack this process uses |
+| `PR_SET_NO_NEW_PRIVS`/`PR_GET_NO_NEW_PRIVS` | **forwarded to the host** - one-way and strictly more restrictive, so it is the conservative direction |
+| `PR_SET_SECCOMP`, `PR_SET_MM`, `PR_SET_MCE_KILL`, child-subreaper, `PR_CAPBSET_*` | `-ENOSYS`: they would need to change this process's privileges or install a filter over guest execution, which is not modelled |
+| anything else | `-EINVAL`, as the kernel does |
+
+**`futex`(202) with a timeout.** Nothing in this execution model can ever wake a
+waiter — `clone(CLONE_VM|CLONE_THREAD)` is refused, so no second thread exists to
+call `FUTEX_WAKE`. But a waiter with a *relative timeout* has a well-defined
+answer even in that world: it sleeps and reports `ETIMEDOUT`, which is exactly
+what `pthread_cond_timedwait` and every bounded retry loop expect. That is now
+implemented with a real `nanosleep`; the value comparison still runs first
+(`-EAGAIN` on a changed word, `-EFAULT` on an unmapped address), an invalid
+`timespec` is `-EINVAL`, and a wait with **no** timeout still returns `-ENOSYS`
+because blocking forever would hang a program that a real kernel would also leave
+blocked, and returning 0 would be the false wake-up this layer was fixed to stop
+telling. The inventory therefore still says `stubbed` — the one remaining entry.
+
 ## 6a. AArch64 / Tier 1 verification (measured)
 
 ```
@@ -260,7 +307,7 @@ scripts/dev.sh cross-test        # 10/10 passed
 | AArch64 differential suite | 0 passed — correct: no x86-64 oracle on AArch64, so every case SKIPs |
 | `cross.aarch64_tests` (whole pipeline) | passed, 18–61 s |
 | AArch64 guest **process** tests, tier 0 / tier 1 | passed / passed |
-| AArch64 **syscall compat** suite, tier 0 / tier 1 | 11/11 checks, 37 guest assertions each |
+| AArch64 **syscall compat** suite, tier 0 / tier 1 | 11/11 checks, 43 guest assertions each |
 | AArch64 registry CLI | 11/11 checks |
 | Tier 1 JIT evidence | `tier 1: 1412 basic block(s) translated`, `failures 0`, **170 308 guest steps — identical to tier 0** |
 
@@ -377,8 +424,9 @@ device. They must not be quoted as end-to-end performance.
 | Area | State | Risk |
 | --- | --- | --- |
 | Threads (`clone` with `CLONE_VM`/`CLONE_THREAD`) | refused with `-ENOSYS` by design | correct, but any threaded guest does not run |
-| `futex`(202) | **stub by design**: value comparison real, blocking refused | cannot be fixed before thread creation exists; a guest that contends will get a clean `-ENOSYS` rather than a false wake-up |
-| `madvise`(28), `prctl`(157) | **stubs by design**, reason in the source | a guest that depends on `MADV_DONTNEED` zeroing pages, or on a `prctl` query, gets a success it cannot rely on. Guest memory is host heap storage, not `mmap`, so the observable half of the call cannot be honoured |
+| `futex`(202) | **stub by design**: value comparison real, relative timeout real (`-ETIMEDOUT`), blocking without a timeout refused | cannot be fully fixed before thread creation exists; a guest that contends gets a clean `-ENOSYS` rather than a false wake-up |
+| `madvise` fork-family advice (`DONTFORK`/`WIPEONFORK`) | `-ENOSYS` | a guest that asked for it and then forked would find the mapping still there. The main modes - `MADV_DONTNEED` zeroing, hints - are implemented (§6d) |
+| `prctl` beyond the documented subset | `-ENOSYS` (seccomp/MM/capabilities) or `-EINVAL` | a guest that installs a seccomp filter is told it could not be installed rather than being told it was |
 | Signal **delivery** | dispositions recorded and reported; nothing is delivered (`LIM-022`) | a guest that installs a handler and waits to be signalled still will not be. Needs guest signal frames and an arch-specific return trampoline |
 | Sockets | not started | blocks an editor that spawns a language server |
 | `signalfd`, `inotify_*` | not started | blocks file-watching |

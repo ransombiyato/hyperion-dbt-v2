@@ -18,7 +18,7 @@ dynamic instructions).**
 | 3 | First native code generation | ✅ complete |
 | 4 | Basic dynamic binary translator | ✅ complete |
 | 5 | Performance measurement and optimization | ✅ complete |
-| 6 | Linux ABI and syscall compatibility | 🟡 static + dynamic ELF64, process creation, **128 of 375** syscalls answered (122 implemented, 6 stubbed), dispatch engine + external JSON registry complete (threads, sockets, signals remaining) |
+| 6 | Linux ABI and syscall compatibility | 🟡 static + dynamic ELF64, process creation, **128 of 375** syscalls answered (127 implemented, 1 stubbed), dispatch engine + external JSON registry complete (threads, sockets, signal delivery remaining) |
 | 7 | Advanced CPU compatibility (baseline psABI + 128-bit SSE2) | ✅ baseline x86-64 + SSE2 complete |
 | 8 | AI optimization laboratory | ⬜ not started |
 | 9 | Real application compatibility | 🟡 5/5 static `glibc 2.41` C workloads verified |
@@ -373,7 +373,7 @@ file descriptors, signals, threading, futexes. Feature matrix + integration test
   and on AArch64 under qemu, at both tiers.
 - ✅ **Syscall compatibility engine (thirteenth–fifteenth slices).** Four-layer
   dispatch (compiled rule table → static switch → legacy compat switch →
-  `-ENOSYS`), 39 ABI adapters (`epoll_*`, `poll`/`ppoll`, `select`/`pselect6`,
+  `-ENOSYS`), 40 ABI adapters (`epoll_*`, `poll`/`ppoll`, `select`/`pselect6`,
   `timerfd_*`, `eventfd2`, `memfd_create`, `getrusage`, `times`, `itimerval`,
   `sched_*`, `membarrier`, filesystem metadata, …, each translating a structure
   whose layout or flag values differ between x86-64 and AArch64), and a
@@ -387,10 +387,10 @@ file descriptors, signals, threading, futexes. Feature matrix + integration test
   need that model to change first. Downgrading to a fork would hand the guest a
   private copy it believes is shared. `futex`(202) itself is implemented but not
   yet validated.
-- ⬜ Guest signal *handler invocation* (`rt_sigaction` is a **stub** that reports
-  success and installs nothing — it must either work or refuse), `sigaltstack`
-  (stub, and Rust's stack-overflow handling checks that it took effect),
-  `waitid`(247).
+- ⬜ Guest signal *handler invocation*. `rt_sigaction`(13) and `sigaltstack`(131)
+  now record and report the guest's real state, but nothing is ever delivered into
+  guest code (`LIM-022`): that needs guest signal-frame construction, an
+  arch-specific return trampoline and `rt_sigreturn`(15). Also open: `waitid`(247).
 - ⬜ Sockets (`socket`/`connect`/`bind`/`listen`): needed by an editor that talks
   to a language server; a large, separable piece.
 - ✅ **Terminal `ioctl` coverage** — `TCGETS`/`TCSETS`/`TCSETSW`/`TCSETSF`,
@@ -407,8 +407,8 @@ file descriptors, signals, threading, futexes. Feature matrix + integration test
 The order is set by what a terminal application (a TUI editor) actually executes,
 not by syscall number:
 
-1. `rt_sigaction` + `sigaltstack` — replace the stubs with either a real
-   implementation or an explicit refusal.
+1. ~~`rt_sigaction` + `sigaltstack`~~ — done: both record and report the guest's
+   state; delivery is the remaining half (`LIM-022`).
 2. **Real `futex` blocking**, which is coupled to thread creation: `futex` now
    performs the value comparison and refuses to block (it used to report a
    wake-up that never happened). Making it block requires a guest wait queue,

@@ -245,10 +245,10 @@ from `tools/cache`):
 
 | Run | Result |
 | --- | --- |
-| AArch64 unit tests | **349 passed, 0 failed, 2 skipped** (of 351 registered) |
+| AArch64 unit tests | **352 passed, 0 failed, 2 skipped** (of 354 registered) |
 | AArch64 differential suite | 0 passed (correct: no x86-64 oracle on AArch64, every case SKIPs) |
 | AArch64 guest process, tier 0 / tier 1 | passed / passed |
-| AArch64 syscall compat, tier 0 / tier 1 | 11/11 checks, 37 guest assertions each |
+| AArch64 syscall compat, tier 0 / tier 1 | 11/11 checks, 43 guest assertions each |
 | AArch64 tier-1 JIT evidence | `tier 1: 1412 basic block(s) translated`, `failures 0`, 170 308 guest steps — identical to tier 0 |
 | AArch64 registry CLI | 11/11 checks |
 
@@ -283,6 +283,24 @@ must cache blocks (not re-translate each visit) and agree with the interpreter.
 
 ---
 
+### The installer's SIGSYS decision
+
+`tests/cli/install_sigsys_test.sh` (CTest target `cli.install_sigsys`) drives real
+`install.sh` runs against a throwaway CMake project whose only tests are
+`unit.native` and `other.ok`, with `unit.native` killed by `SIGSYS`. The prompt is
+exercised through a pseudo-terminal (`script -qec`), which is the only way to
+observe what a person would actually see, and every case is checked against the
+installer's real behaviour:
+
+| Scenario | Required outcome |
+| --- | --- |
+| only `unit.native` failed, reason `SIGSYS`, answer `yes` | install succeeds; output says the test was **skipped, not passed**; `install.conf` records `HYPERION_SKIPPED_TESTS=unit.native` |
+| same, bare Enter / EOF / no terminal | default **no**: the test stays enabled and the install aborts; nothing is installed |
+| same, `--skip-sigsys-test` or `HYPERION_SKIP_SIGSYS_TEST=1` | no question, skip applied, still reported as skipped |
+| `SIGSYS` **and** another failing test | aborts immediately; the question is never asked (skipping cannot hide an unrelated failure) |
+| `unit.native` fails with output that merely *mentions* SIGSYS | aborts: only ctest's own `(SIGSYS)` verdict counts |
+| healthy suite with `--skip-sigsys-test` | everything runs, "all tests passed", no skip recorded |
+
 ## 5. Sanitizers
 
 ```bash
@@ -300,7 +318,7 @@ Measured on 2026-10-24 (GCC 14.2.0, Debian 13):
 ```
 cmake -B build/asan -G Ninja -DCMAKE_BUILD_TYPE=Debug -DHYPERION_ENABLE_SANITIZERS=ON
 cmake --build build/asan -j8
-ctest --test-dir build/asan        # 16/16 passed
+ctest --test-dir build/asan        # 17/17 passed
 ```
 
 The first run of this build failed immediately, in the `poll` adapter: an eight

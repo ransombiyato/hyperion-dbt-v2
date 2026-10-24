@@ -2239,19 +2239,254 @@ SyscallResult MinimalSyscallHandler::handle_unguarded(GuestState& state, Memory&
                 }
                 break;
             }
-            case 28:  // madvise [stub]
-            case 157: // prctl [stub]
-                // Still stubs, and honestly labelled as such in the inventory.
-                // `madvise` cannot be honoured here: guest memory is backed by
-                // host heap pages owned by GuestAddressSpace, not by mmap, so
-                // MADV_DONTNEED/MADV_FREE would free nothing and the pages would
-                // not read back as zero - the observable half of the call would
-                // be a lie. `prctl` covers process and thread control surface
-                // that does not exist in this execution model (no guest threads,
-                // no core dumps, no dumpable flag). Both are refused rather than
-                // faked.
-                r = 0;
+            case 28: { // madvise(addr, length, advice)
+                // Every guest mapping in this execution model is an anonymous,
+                // private, writable-or-not host-heap region owned by
+                // GuestAddressSpace; there are no file-backed or shared mappings
+                // (see COMPATIBILITY.md). That makes the advice modes split
+                // cleanly into three groups:
+                //
+                //   * pure hints, with no guest-observable effect (reclaim,
+                //     readahead, THP bookkeeping) - success is truthful because
+                //     the kernel makes no promise a guest can test;
+                //   * MADV_DONTNEED, whose *entire* documented effect on
+                //     anonymous private memory is "the pages are zeroed" - that
+                //     is implemented here, exactly;
+                //   * modes whose effect is per-mapping kernel state that this
+                //     layer does not carry (DONTFORK/WIPEONFORK and friends),
+                //     refused with -ENOSYS rather than silently ignored. A guest
+                //     that asked for MADV_DONTFORK and then forked would otherwise
+                //     find its mapping still there.
+                const std::uint64_t addr = arg(state, 0);
+                const std::uint64_t length = arg(state, 1);
+                const std::int32_t advice = arg_i32(state, 2);
+                if (length == 0) {
+                    r = 0; // the kernel returns success without touching anything
+                    break;
+                }
+                if ((addr & 0xFFF) != 0) {
+                    r = -kEinval;
+                    break;
+                }
+                constexpr std::int32_t kMadvNormal = 0;
+                constexpr std::int32_t kMadvRandom = 1;
+                constexpr std::int32_t kMadvSequential = 2;
+                constexpr std::int32_t kMadvWillneed = 3;
+                constexpr std::int32_t kMadvDontneed = 4;
+                constexpr std::int32_t kMadvFree = 8;
+                constexpr std::int32_t kMadvRemove = 9;
+                constexpr std::int32_t kMadvDontfork = 10;
+                constexpr std::int32_t kMadvDofork = 11;
+                constexpr std::int32_t kMadvHugepage = 14;
+                constexpr std::int32_t kMadvNohugepage = 15;
+                constexpr std::int32_t kMadvDontdump = 16;
+                constexpr std::int32_t kMadvDodump = 18;
+                constexpr std::int32_t kMadvKeeponfork = 19;
+                constexpr std::int32_t kMadvCold = 20;
+                constexpr std::int32_t kMadvPageout = 21;
+                constexpr std::int32_t kMadvWipeonfork = 23;
+
+                // MADV_REMOVE is EINVAL for a private anonymous mapping, which is
+                // all there is here - that is the kernel's own answer, not a
+                // limitation of this layer.
+                if (advice == kMadvRemove) {
+                    r = -kEinval;
+                    break;
+                }
+                switch (advice) {
+                case kMadvNormal:
+                case kMadvRandom:
+                case kMadvSequential:
+                case kMadvWillneed:
+                case kMadvFree: // "may" discard: keeping the contents is allowed
+                case kMadvHugepage:
+                case kMadvNohugepage:
+                case kMadvDontdump:
+                case kMadvDodump:
+                case kMadvCold:
+                case kMadvPageout: {
+                    // The range must still be mapped; the kernel returns
+                    // ENOMEM otherwise, and a guest relies on that.
+                    std::uint8_t probe = 0;
+                    if (!memory.read(addr, &probe, 1) ||
+                        !memory.read(addr + length - 1, &probe, 1)) {
+                        r = -kEnomem;
+                        break;
+                    }
+                    r = 0;
+                    break;
+                }
+                case kMadvDontneed: {
+                    // Real semantics for anonymous private memory: the
+                    // contents are gone and later reads see zeros.
+                    std::array<std::uint8_t, 4096> zeros{};
+                    std::uint64_t done = 0;
+                    bool ok = true;
+                    while (done < length) {
+                        const std::uint64_t chunk =
+                            std::min<std::uint64_t>(zeros.size(), length - done);
+                        if (!memory.write(addr + done, zeros.data(),
+                                          static_cast<std::size_t>(chunk))) {
+                            // Unmapped in the middle: the kernel would have
+                            // failed with ENOMEM before changing anything,
+                            // so this is reported rather than half-applied.
+                            ok = false;
+                            break;
+                        }
+                        done += chunk;
+                    }
+                    r = ok ? 0 : -kEnomem;
+                    break;
+                }
+                case kMadvDontfork:
+                case kMadvDofork:
+                case kMadvKeeponfork:
+                case kMadvWipeonfork:
+                    // Per-mapping state this execution model does not carry.
+                    // Refusing tells the guest the truth; pretending would
+                    // make a fork behave differently than asked.
+                    r = -kEnosys;
+                    break;
+                default:
+                    // Unknown advice: the kernel's answer is EINVAL.
+                    r = -kEinval;
+                    break;
+                }
                 break;
+            }
+            case 157: { // prctl(option, arg2, arg3, arg4, arg5)
+                // Implemented for the options whose meaning can be honoured or
+                // truthfully answered here, and refused - with a real errno, not
+                // a fake success - for the ones that cannot:
+                //
+                //   PR_SET_NAME/PR_GET_NAME      recorded, reported back
+                //   PR_SET_PDEATHSIG/GET         recorded, reported back (the
+                //                                host process is not armed: a
+                //                                guest's parent is not HYPERION's
+                //                                parent, so arming would be wrong)
+                //   PR_SET_DUMPABLE/GET          recorded, reported back
+                //   PR_SET_TIMERSLACK/GET        forwarded to the host
+                //   PR_SET_NO_NEW_PRIVS/GET      forwarded to the host (one-way,
+                //                                and strictly more restrictive)
+                //   PR_SET_SECCOMP, PR_SET_MM, PR_CAP_AMBIENT, child subreaper,
+                //   capabilities                    -ENOSYS: they would need to
+                //                                change this process's privileges
+                //                                or install a filter over the
+                //                                guest, which is not modelled
+                //   anything else                -EINVAL, as the kernel does
+                const std::int32_t option = arg_i32(state, 0);
+                constexpr std::int32_t kPrSetPdeathsig = 1;
+                constexpr std::int32_t kPrGetPdeathsig = 2;
+                constexpr std::int32_t kPrGetDumpable = 3;
+                constexpr std::int32_t kPrSetDumpable = 4;
+                constexpr std::int32_t kPrSetName = 15;
+                constexpr std::int32_t kPrGetName = 16;
+                constexpr std::int32_t kPrSetSeccomp = 22;
+                constexpr std::int32_t kPrSetTimerslack = 29;
+                constexpr std::int32_t kPrGetTimerslack = 30;
+                constexpr std::int32_t kPrSetChildSubreaper = 36;
+                constexpr std::int32_t kPrGetChildSubreaper = 37;
+                constexpr std::int32_t kPrSetNoNewPrivs = 38;
+                constexpr std::int32_t kPrGetNoNewPrivs = 39;
+                constexpr std::int32_t kPrCapbsetRead = 23;
+                constexpr std::int32_t kPrCapbsetDrop = 24;
+                constexpr std::int32_t kPrSetMmd = 35;
+                constexpr std::int32_t kPrSetMceKill = 33;
+                switch (option) {
+                case kPrSetName: {
+                    std::array<std::uint8_t, 16> name{};
+                    if (!memory.read(arg(state, 1), name.data(), name.size())) {
+                        r = -kEfault;
+                        break;
+                    }
+                    name.back() = 0; // always NUL-terminated, as the kernel does
+                    std::memcpy(process_name_.data(), name.data(), name.size());
+                    r = 0;
+                    break;
+                }
+                case kPrGetName: {
+                    std::array<std::uint8_t, 16> name{};
+                    std::memcpy(name.data(), process_name_.data(), name.size());
+                    r = memory.write(arg(state, 1), name.data(), name.size()) ? 0 : -kEfault;
+                    break;
+                }
+                case kPrSetPdeathsig: {
+                    const std::int32_t sig = arg_i32(state, 1);
+                    if (sig < 0 || sig > 64) {
+                        r = -kEinval;
+                        break;
+                    }
+                    pdeathsig_ = sig;
+                    r = 0;
+                    break;
+                }
+                case kPrGetPdeathsig: {
+                    std::array<std::uint8_t, 4> out{};
+                    put_u32(out.data(), 0, static_cast<std::uint32_t>(pdeathsig_));
+                    r = memory.write(arg(state, 1), out.data(), out.size()) ? 0 : -kEfault;
+                    break;
+                }
+                case kPrSetDumpable: {
+                    const std::int32_t value = arg_i32(state, 1);
+                    if (value != 0 && value != 1) {
+                        r = -kEinval;
+                        break;
+                    }
+                    dumpable_ = value;
+                    r = 0;
+                    break;
+                }
+                case kPrGetDumpable:
+                    r = dumpable_;
+                    break;
+                case kPrSetTimerslack:
+                case kPrGetTimerslack: {
+                    // Forwarded: the host's timer slack is what this process
+                    // actually uses, and the question is answerable exactly.
+                    const unsigned long host_value = static_cast<unsigned long>(arg(state, 1));
+                    if (option == kPrSetTimerslack) {
+                        r = (::prctl(PR_SET_TIMERSLACK, host_value, 0UL, 0UL, 0UL) == 0)
+                                ? 0
+                                : -static_cast<std::int64_t>(errno == 0 ? kEinval : errno);
+                        break;
+                    }
+                    errno = 0;
+                    const long got = ::prctl(PR_GET_TIMERSLACK, 0UL, 0UL, 0UL, 0UL);
+                    r = (got < 0) ? -static_cast<std::int64_t>(errno == 0 ? kEinval : errno)
+                                  : static_cast<std::int64_t>(got);
+                    break;
+                }
+                case kPrSetNoNewPrivs: {
+                    // One-way and strictly more restrictive, so honouring it
+                    // on the host is the conservative direction.
+                    const unsigned long host_value = arg(state, 1);
+                    r = (::prctl(PR_SET_NO_NEW_PRIVS, host_value, 0UL, 0UL, 0UL) == 0)
+                            ? 0
+                            : -static_cast<std::int64_t>(errno == 0 ? kEinval : errno);
+                    break;
+                }
+                case kPrGetNoNewPrivs: {
+                    errno = 0;
+                    const long got = ::prctl(PR_GET_NO_NEW_PRIVS, 0UL, 0UL, 0UL, 0UL);
+                    r = (got < 0) ? -static_cast<std::int64_t>(errno == 0 ? kEinval : errno)
+                                  : static_cast<std::int64_t>(got);
+                    break;
+                }
+                case kPrSetSeccomp:
+                case kPrSetMmd:
+                case kPrSetMceKill:
+                case kPrSetChildSubreaper:
+                case kPrGetChildSubreaper:
+                case kPrCapbsetRead:
+                case kPrCapbsetDrop:
+                    r = -kEnosys;
+                    break;
+                default:
+                    r = -kEinval;
+                    break;
+                }
+                break;
+            }
             case 221: { // fadvise64(fd, offset, len, advice)
                 // Advisory only, so the translation is real rather than an
                 // approximation: hand it to the host for descriptors that have a
@@ -2480,7 +2715,43 @@ SyscallResult MinimalSyscallHandler::handle_unguarded(GuestState& state, Memory&
                     // The kernel locks, re-reads, and only then decides: the
                     // comparison has to happen here, after the read, or a caller
                     // that raced a change would spin.
-                    r = (cur != val) ? -kEagain : -kEnosys;
+                    if (cur != val) {
+                        r = -kEagain;
+                        break;
+                    }
+                    // A waiter with a relative timeout can be honoured exactly:
+                    // nothing in this execution model can wake it (no guest
+                    // threads), so the kernel's own answer for a waiter that is
+                    // never woken is what happens here - it sleeps for the
+                    // timeout and reports ETIMEDOUT. `pthread_cond_timedwait`
+                    // and every bounded retry loop depend on that.
+                    const std::uint64_t timeout_addr = arg(state, 3);
+                    if (timeout_addr != 0) {
+                        std::array<std::uint8_t, 16> ts_b{};
+                        if (!memory.read(timeout_addr, ts_b.data(), ts_b.size())) {
+                            r = -kEfault;
+                            break;
+                        }
+                        std::int64_t sec = static_cast<std::int64_t>(get_u64_le(ts_b.data()));
+                        std::int64_t nsec = static_cast<std::int64_t>(get_u64_le(ts_b.data() + 8));
+                        if (sec < 0 || nsec < 0 || nsec >= 1000000000LL) {
+                            r = -kEinval;
+                            break;
+                        }
+                        struct timespec req{};
+                        req.tv_sec = static_cast<time_t>(sec);
+                        req.tv_nsec = static_cast<long>(nsec);
+                        while (::nanosleep(&req, &req) != 0) {
+                            if (errno != EINTR) {
+                                break;
+                            }
+                        }
+                        r = -kEtimeout;
+                        break;
+                    }
+                    // No timeout: nothing can ever wake this waiter, so blocking
+                    // would hang and claiming success would lie.
+                    r = -kEnosys;
                     break;
                 }
                 if (op == kFutexWake || op == kFutexWakeBitset) {
@@ -2620,7 +2891,7 @@ bool is_linux_compat_syscall(std::uint64_t number) {
     case 16:  // ioctl
     case 22:  // pipe
     case 25:  // mremap
-    case 28:  // madvise [stub]
+    case 28:  // madvise
     case 35:  // nanosleep
     case 62:  // kill
     case 82:  // rename
@@ -2635,7 +2906,7 @@ bool is_linux_compat_syscall(std::uint64_t number) {
     case 131: // sigaltstack
     case 137: // statfs
     case 138: // fstatfs
-    case 157: // prctl [stub]
+    case 157: // prctl
     case 202: // futex [stub]
     case 204: // sched_getaffinity
     case 221: // fadvise64

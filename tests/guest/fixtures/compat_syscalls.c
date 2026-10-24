@@ -22,6 +22,7 @@
 #include <sys/ioctl.h>
 #include <termios.h>
 #include <sys/mman.h>
+#include <sys/prctl.h>
 #include <sys/resource.h>
 #include <sys/select.h>
 #include <sys/stat.h>
@@ -298,6 +299,33 @@ int main(void) {
             close(fd);
         }
         check("fadvise64_ebadf", posix_fadvise(900, 0, 0, POSIX_FADV_NORMAL) == EBADF);
+    }
+
+    /* --- memory advice, process attributes --------------------------------- */
+    {
+        /* MADV_DONTNEED on an anonymous mapping really does discard: a program
+         * that frees memory this way must see zeros afterwards. */
+        char* region = mmap(NULL, 8192, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (region != MAP_FAILED) {
+            memset(region, 0xA5, 8192);
+            check("madvise_dontneed",
+                  madvise(region, 8192, MADV_DONTNEED) == 0 && region[0] == 0 && region[8191] == 0);
+            /* A hint must not discard anything. */
+            memset(region, 0x5A, 8192);
+            check("madvise_hint_keeps_data",
+                  madvise(region, 8192, MADV_SEQUENTIAL) == 0 && region[0] == 0x5A);
+            check("madvise_einval", madvise(region, 8192, 999) == -1 && errno == EINVAL);
+            munmap(region, 8192);
+        }
+        /* prctl: the name round-trips and unsupported options are refused rather
+         * than silently accepted. */
+        const int named = prctl(PR_SET_NAME, "hyperion-guest", 0UL, 0UL, 0UL) == 0;
+        char got[17];
+        memset(got, 0, sizeof got);
+        const int read_back = prctl(PR_GET_NAME, got, 0UL, 0UL, 0UL) == 0;
+        check("prctl_name", named && read_back && strncmp(got, "hyperion-guest", 16) == 0);
+        check("prctl_get_dumpable", prctl(PR_GET_DUMPABLE, 0UL, 0UL, 0UL, 0UL) >= 0);
+        check("prctl_einval", prctl(9999, 0UL, 0UL, 0UL, 0UL) == -1 && errno == EINVAL);
     }
 
     /* --- process and scheduling ------------------------------------------- */

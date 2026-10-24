@@ -59,6 +59,16 @@ add_test(NAME cli.syscall_registry
             $<TARGET_FILE:hyperion>)
 set_tests_properties(cli.syscall_registry PROPERTIES LABELS "cli;syscall" TIMEOUT 60)
 
+# --- installer: SIGSYS handling ---------------------------------------------
+# The installer runs the test suite before installing anything, and offers to
+# skip `unit.native` when (and only when) a sandbox kills it with SIGSYS. That
+# decision is security-relevant - it must never swallow a real failure - so it is
+# tested against real install.sh runs, driven through a pseudo-terminal.
+add_test(NAME cli.install_sigsys
+    COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/cli/install_sigsys_test.sh"
+            "${CMAKE_SOURCE_DIR}/install.sh")
+set_tests_properties(cli.install_sigsys PROPERTIES LABELS "cli" TIMEOUT 300)
+
 # --- guest process regression tests -----------------------------------------
 #
 # These execute real x86-64 Linux guests, so they need a compiler that can

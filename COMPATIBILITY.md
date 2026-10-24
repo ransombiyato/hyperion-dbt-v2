@@ -218,7 +218,7 @@ Phase 6/7.
 
 Phase 6, syscall compatibility engine. The `syscall` instruction is decoded and
 routed through `SyscallHandler` in both tiers. **128 of the 375** syscalls in the
-pinned Linux 6.12 x86-64 table are answered — 122 implemented and 6 stubbed — and
+pinned Linux 6.12 x86-64 table are answered — 127 implemented and 1 stubbed — and
 every other number returns `-ENOSYS` explicitly (never a silent success) and is
 counted in `RunResult::unimplemented_syscalls`. Guest pointers are validated
 against the mapped region (`-EFAULT`), so a guest can never read host memory.
@@ -332,7 +332,8 @@ guest buffer from the host in 4 KiB chunks, accepting only the two defined
 | Filesystem metadata: `rename`(82)/`renameat`(264)/`renameat2`(316), `mkdir`(83)/`mkdirat`(258), `rmdir`(84), `unlink`(87)/`unlinkat`(263), `link`(86)/`linkat`(265), `symlink`(88)/`symlinkat`(266), `chmod`(90)/`fchmod`(91)/`fchmodat`(268), `truncate`(76)/`ftruncate`(77), `fsync`(74)/`fdatasync`(75)/`sync`(162)/`syncfs`(306), `chdir`(80)/`fchdir`(81), `umask`(95), `statfs`(137)/`fstatfs`(138), `utimensat`(280) | ✅ | 6 | `syscall_adapters.*`, `guest.syscall_compat` |
 | `nanosleep`(35), `clock_nanosleep`(230) | ✅ (real sleep, `-EINTR` with the unslept remainder, `TIMER_ABSTIME`) | 6 | `syscall.linux_compat_nanosleep_*`, `guest.syscall_compat` |
 | Resource/scheduling: `getrusage`(98), `times`(100), `getrlimit`(97)/`setrlimit`(160), `sched_getparam`(143)/`sched_setscheduler`(144)/`sched_getscheduler`(145)/`sched_get_priority_max`(146)/`sched_get_priority_min`(147), `sched_getaffinity`(204), `getitimer`(36)/`setitimer`(38), `setsid`(112)/`setpgid`(109)/`getpgid`(121)/`getpgrp`(111), `sched_yield`(24), `membarrier`(324) | ✅ | 6 | `syscall_adapters.*`, `guest.syscall_compat` |
-| Stubs (answer success, do nothing): `madvise`(28), `prctl`(157), `futex`(202) | ⚠️ stubbed — **not** claimed as implemented | 3 | inventory status `stubbed`, with the reason for each in `src/core/syscall.cpp` |
+| Still a stub: `futex`(202) — real value comparison, real timeout (`-ETIMEDOUT`), but a wait with no timeout refuses (`-ENOSYS`) | ⚠️ stubbed — **not** claimed as implemented | 1 | inventory status `stubbed`, reason in `src/core/syscall.cpp` |
+| `madvise`(28): `MADV_DONTNEED` really zeroes; hints succeed; fork-affecting advice refuses; `prctl`(157): name/pdeathsig/dumpable recorded, timerslack + no_new_privs forwarded | ✅ implemented as documented subsets | 2 | `docs/syscall-engine-report.md` §6d |
 | Thread creation (`clone` with `CLONE_VM`/`CLONE_THREAD`) | ❌ `-ENOSYS` by design, which is *why* `futex` cannot block: no waiter could ever be woken | 6 | `guest.process` |
 | `io_uring`, `rseq`, `vDSO` | ⬜ | 6/7 | — |
 

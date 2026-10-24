@@ -58,7 +58,7 @@
 25	mremap	U2	implemented	Resize or move a mapping.	trace:1
 26	msync	U2	not-started	Flush a memory mapping to backing store.	provisional
 27	mincore	U1	not-started	Query which pages of a mapping are resident.	provisional
-28	madvise	U3	stubbed	Advise the kernel about memory usage.	provisional
+28	madvise	U3	implemented	Advise the kernel about memory usage.	provisional
 29	shmget	E2	not-started	System V shared memory segment.	provisional
 30	shmat	E2	not-started	Attach a System V shared memory segment.	provisional
 31	shmctl	E2	not-started	System V shared memory control.	provisional
@@ -187,7 +187,7 @@
 154	modify_ldt	E1	not-started	Modify the local descriptor table (x86 compatibility).	provisional
 155	pivot_root	E3	not-started	Change the root filesystem (privileged).	provisional
 156	_sysctl	E3	not-started	Legacy kernel parameter control (obsolete).	provisional
-157	prctl	U3	stubbed	Process control (names, dumpability, etc.).	trace:12
+157	prctl	U3	implemented	Process control (names, dumpability, etc.).	trace:12
 158	arch_prctl	E1	implemented	x86-64 arch control: TLS, FS/GS base (process startup).	trace:17
 159	adjtimex	E3	not-started	Adjust the kernel clock.	provisional
 160	setrlimit	U3	implemented	Set a resource limit.	provisional
