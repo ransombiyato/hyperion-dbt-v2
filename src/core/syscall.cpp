@@ -2053,10 +2053,68 @@ SyscallResult MinimalSyscallHandler::handle_unguarded(GuestState& state, Memory&
             case 157: // prctl [stub]
             case 221: // fadvise64 [stub]
             case 229: // clock_getres [stub]
-            case 35:  // nanosleep [stub]
-            case 230: // clock_nanosleep [stub]
                 r = 0;
                 break;
+            case 35:  // nanosleep(req, rem)
+            case 230: { // clock_nanosleep(clockid, flags, req, rem)
+                // Sleeping used to be a stub that returned 0 immediately. That is
+                // not harmless: every retry/backoff loop in the guest becomes a
+                // busy loop, and a program that waits for a child or a timer
+                // spins instead of yielding. The guest ABI here happens to match
+                // the host's (64-bit tv_sec/tv_nsec, same clock ids), so the
+                // translation is a validated copy plus the real call.
+                const bool absolute_form = (result.number == 230);
+                const std::uint64_t req_addr = arg(state, absolute_form ? 2 : 0);
+                const std::uint64_t rem_addr = arg(state, absolute_form ? 3 : 1);
+                std::array<std::uint8_t, 16> req{};
+                if (!memory.read(req_addr, req.data(), req.size())) {
+                    r = -kEfault;
+                    break;
+                }
+                const std::int64_t sec = static_cast<std::int64_t>(get_u64_le(req.data()));
+                const std::int64_t nsec = static_cast<std::int64_t>(get_u64_le(req.data() + 8));
+                if (sec < 0 || nsec < 0 || nsec >= 1000000000LL) {
+                    r = -kEinval;
+                    break;
+                }
+                const int flags = absolute_form ? arg_i32(state, 1) : 0;
+                if (absolute_form && (flags & ~TIMER_ABSTIME) != 0) {
+                    r = -kEinval;
+                    break;
+                }
+                struct timespec host_req{};
+                host_req.tv_sec = static_cast<time_t>(sec);
+                host_req.tv_nsec = static_cast<long>(nsec);
+                struct timespec host_rem{};
+                const int hrc = absolute_form
+                                    ? ::clock_nanosleep(static_cast<clockid_t>(arg_i32(state, 0)),
+                                                        flags, &host_req, &host_rem)
+                                    : ::nanosleep(&host_req, &host_rem);
+                if (hrc == 0) {
+                    r = 0;
+                    break;
+                }
+                if (errno == EINTR) {
+                    // Linux reports an interrupted sleep as -EINTR and, for the
+                    // relative form, writes the unslept remainder back. The
+                    // absolute form never gets a remainder pointer written.
+                    if (!absolute_form && rem_addr != 0) {
+                        std::array<std::uint8_t, 16> rem{};
+                        put_u64(rem.data(), 0,
+                                static_cast<std::uint64_t>(host_rem.tv_sec));
+                        put_u64(rem.data(), 8,
+                                static_cast<std::uint64_t>(host_rem.tv_nsec));
+                        if (!memory.write(rem_addr, rem.data(), rem.size())) {
+                            r = -kEfault;
+                            break;
+                        }
+                    }
+                    r = -kEintr;
+                    break;
+                }
+                r = -static_cast<std::int64_t>(errno == 0 ? kEio : errno);
+                break;
+            }
             case 82:   // rename
             case 83:   // mkdir
             case 84:   // rmdir
@@ -2283,7 +2341,7 @@ bool is_linux_compat_syscall(std::uint64_t number) {
     case 22:  // pipe
     case 25:  // mremap
     case 28:  // madvise [stub]
-    case 35:  // nanosleep [stub]
+    case 35:  // nanosleep
     case 62:  // kill
     case 82:  // rename
     case 83:  // mkdir
@@ -2302,7 +2360,7 @@ bool is_linux_compat_syscall(std::uint64_t number) {
     case 204: // sched_getaffinity
     case 221: // fadvise64 [stub]
     case 229: // clock_getres [stub]
-    case 230: // clock_nanosleep [stub]
+    case 230: // clock_nanosleep
     case 234: // tgkill
     case 258: // mkdirat
     case 263: // unlinkat

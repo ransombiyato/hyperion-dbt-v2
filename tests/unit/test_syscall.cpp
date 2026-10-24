@@ -9,6 +9,7 @@
 // tests that require executing generated AArch64 code are guarded on
 // __aarch64__, matching the rest of the suite.
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -17,6 +18,8 @@
 #include <string>
 #include <unistd.h>
 #include <vector>
+
+#include "hyperion/syscall_detail.hpp"
 
 #include "harness/test_harness.hpp"
 #include "hyperion/address_space.hpp"
@@ -1737,4 +1740,100 @@ HYPERION_TEST("syscall", "phase6_extended_syscalls_dup_fcntl_iov_pread_uname_clo
     char check_buf[8] = {};
     HYPERION_CHECK(memory.read(kBase + 0x700, reinterpret_cast<std::uint8_t*>(check_buf), 7));
     HYPERION_CHECK_EQ(std::string(check_buf), std::string("Hello, "));
+}
+
+// --- linux-compat layer: sleeping -------------------------------------------
+//
+// nanosleep used to be a stub that returned 0 immediately, which turned every
+// guest retry/backoff loop into a busy loop. These tests pin the behaviour that
+// matters: the call really waits, and its argument validation matches Linux.
+
+namespace {
+
+// Writes a guest timespec at `addr`.
+void write_timespec(FlatMemory& memory, std::uint64_t addr, std::int64_t sec,
+                    std::int64_t nsec) {
+    std::array<std::uint8_t, 16> buf{};
+    hyperion::syscall_detail::put_u64(buf.data(), 0, static_cast<std::uint64_t>(sec));
+    hyperion::syscall_detail::put_u64(buf.data(), 8, static_cast<std::uint64_t>(nsec));
+    HYPERION_CHECK(memory.write(addr, buf.data(), buf.size()));
+}
+
+} // namespace
+
+HYPERION_TEST("syscall", "linux_compat_nanosleep_actually_sleeps") {
+    GuestAddressSpace as;
+    MinimalSyscallHandler handler({}, &as);
+    handler.enable_linux_compat();
+    FlatMemory memory(kBase, kMemSize);
+    write_timespec(memory, kBase + 0x100, 0, 30 * 1000 * 1000); // 30 ms
+
+    GuestState s = syscall_state(35 /* nanosleep */, {kBase + 0x100, kBase + 0x200});
+    const auto start = std::chrono::steady_clock::now();
+    const auto r = handler.handle(s, memory);
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                             std::chrono::steady_clock::now() - start)
+                             .count();
+
+    HYPERION_CHECK(r.status == SyscallStatus::kHandled);
+    HYPERION_CHECK_EQ(s.reg(Gpr::kRax), std::uint64_t{0});
+    // A scheduler can oversleep; it cannot under-sleep by 5 ms.
+    HYPERION_CHECK(elapsed >= 25);
+}
+
+HYPERION_TEST("syscall", "linux_compat_nanosleep_rejects_bad_arguments") {
+    GuestAddressSpace as;
+    MinimalSyscallHandler handler({}, &as);
+    handler.enable_linux_compat();
+    FlatMemory memory(kBase, kMemSize);
+
+    // tv_nsec must be < 1e9: Linux rejects anything else with EINVAL rather than
+    // normalising it.
+    write_timespec(memory, kBase + 0x100, 0, 1000000000);
+    GuestState s = syscall_state(35, {kBase + 0x100, 0});
+    handler.handle(s, memory);
+    HYPERION_CHECK_EQ(s.reg(Gpr::kRax), static_cast<std::uint64_t>(-hyperion::kEinval));
+
+    // Negative tv_sec.
+    write_timespec(memory, kBase + 0x100, -1, 0);
+    s = syscall_state(35, {kBase + 0x100, 0});
+    handler.handle(s, memory);
+    HYPERION_CHECK_EQ(s.reg(Gpr::kRax), static_cast<std::uint64_t>(-hyperion::kEinval));
+
+    // A pointer outside the guest's memory is a fault, not a host crash.
+    s = syscall_state(35, {0xDEAD0000ULL, 0});
+    handler.handle(s, memory);
+    HYPERION_CHECK_EQ(s.reg(Gpr::kRax), static_cast<std::uint64_t>(-hyperion::kEfault));
+
+    // The same for clock_nanosleep, whose request is argument 2.
+    s = syscall_state(230, {0 /*CLOCK_REALTIME*/, 0, 0xDEAD0000ULL, 0});
+    handler.handle(s, memory);
+    HYPERION_CHECK_EQ(s.reg(Gpr::kRax), static_cast<std::uint64_t>(-hyperion::kEfault));
+
+    // TIMER_ABSTIME is the only flag clock_nanosleep accepts.
+    write_timespec(memory, kBase + 0x100, 0, 0);
+    s = syscall_state(230, {1 /*CLOCK_MONOTONIC*/, 0x40 /*not TIMER_ABSTIME*/, kBase + 0x100,
+                            0});
+    handler.handle(s, memory);
+    HYPERION_CHECK_EQ(s.reg(Gpr::kRax), static_cast<std::uint64_t>(-hyperion::kEinval));
+}
+
+HYPERION_TEST("syscall", "linux_compat_clock_nanosleep_absolute_deadline_is_immediate") {
+    GuestAddressSpace as;
+    MinimalSyscallHandler handler({}, &as);
+    handler.enable_linux_compat();
+    FlatMemory memory(kBase, kMemSize);
+
+    // A deadline in the past must return at once rather than sleeping until the
+    // epoch rolls round again.
+    write_timespec(memory, kBase + 0x100, 1, 0);
+    GuestState s = syscall_state(
+        230, {0 /*CLOCK_REALTIME*/, 1 /*TIMER_ABSTIME*/, kBase + 0x100, 0});
+    const auto start = std::chrono::steady_clock::now();
+    handler.handle(s, memory);
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                             std::chrono::steady_clock::now() - start)
+                             .count();
+    HYPERION_CHECK_EQ(s.reg(Gpr::kRax), std::uint64_t{0});
+    HYPERION_CHECK(elapsed < 1000);
 }

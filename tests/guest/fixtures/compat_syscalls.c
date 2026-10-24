@@ -178,6 +178,27 @@ int main(void) {
         (void)rmdir(directory);
     }
 
+    /* --- time ------------------------------------------------------------- */
+    /* nanosleep must really wait. A translator that stubs it out turns every
+     * retry loop in the guest into a spin, which looks like a hang under load
+     * but never fails an exit-status check. */
+    struct timespec pause_req;
+    pause_req.tv_sec = 0;
+    pause_req.tv_nsec = 60 * 1000 * 1000; /* 60 ms */
+    struct timespec before;
+    struct timespec after;
+    (void)clock_gettime(CLOCK_MONOTONIC, &before);
+    const int slept = nanosleep(&pause_req, NULL);
+    (void)clock_gettime(CLOCK_MONOTONIC, &after);
+    const long long elapsed_ms =
+        (long long)(after.tv_sec - before.tv_sec) * 1000 + (after.tv_nsec - before.tv_nsec) / 1000000;
+    check("nanosleep", slept == 0 && elapsed_ms >= 50);
+
+    struct timespec bad;
+    bad.tv_sec = 0;
+    bad.tv_nsec = 1000000000; /* the kernel rejects 1e9 rather than normalising */
+    check("nanosleep_einval", nanosleep(&bad, NULL) == -1 && errno == EINVAL);
+
     /* --- process and scheduling ------------------------------------------- */
     check("sched_yield", sched_yield() == 0);
     /* MEMBARRIER_CMD_QUERY. A kernel answers with the command mask; HYPERION

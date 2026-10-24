@@ -65,7 +65,7 @@
 32	dup	U4	implemented	Duplicate a file descriptor.	provisional
 33	dup2	U3	implemented	Duplicate a descriptor to a specific number.	trace:1
 34	pause	U1	not-started	Wait for a signal (legacy).	provisional
-35	nanosleep	U4	stubbed	High-resolution sleep.	provisional
+35	nanosleep	U4	implemented	High-resolution sleep.	provisional
 36	getitimer	U1	implemented	Query an interval timer (legacy).	provisional
 37	alarm	U1	not-started	Set an alarm clock (legacy).	provisional
 38	setitimer	U1	implemented	Set an interval timer (legacy).	provisional
@@ -260,7 +260,7 @@
 227	clock_settime	E3	not-started	Set a clock (privileged).	provisional
 228	clock_gettime	U4	implemented	Query a clock (monotonic, realtime, ...).	provisional
 229	clock_getres	U2	stubbed	Query a clock's resolution.	provisional
-230	clock_nanosleep	U3	stubbed	Sleep on a specific clock.	provisional
+230	clock_nanosleep	U3	implemented	Sleep on a specific clock.	provisional
 231	exit_group	U4	implemented	Terminate all threads in the process.	trace:16
 232	epoll_wait	U3	implemented	Wait for epoll events (legacy).	provisional
 233	epoll_ctl	U3	implemented	Add/modify/remove an epoll interest.	provisional
