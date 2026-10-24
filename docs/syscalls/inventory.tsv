@@ -232,7 +232,7 @@
 199	fremovexattr	E2	not-started	Remove an xattr by descriptor.	provisional
 200	tkill	E3	not-started	Send a signal to a thread (legacy).	provisional
 201	time	U1	not-started	Query time in seconds (legacy).	provisional
-202	futex	U4	implemented	Fast userspace mutex (threading primitive).	trace:16
+202	futex	U4	stubbed	Fast userspace mutex (threading primitive).	trace:16
 203	sched_setaffinity	U2	not-started	Set a thread's CPU affinity.	provisional
 204	sched_getaffinity	U3	implemented	Query a thread's CPU affinity.	trace:1
 205	set_thread_area	E1	not-started	Set a TLS entry (x86 compatibility).	provisional

@@ -322,7 +322,7 @@ guest buffer from the host in 4 KiB chunks, accepting only the two defined
 | `wait4`(61) | ✅ (`WNOHANG`/`WUNTRACED`/`WCONTINUED`, `struct rusage`) | 6 | `guest.process` (`fork + waitpid exit status`) |
 | `waitid`(247) | ⬜ (`siginfo_t` layout differs per arch; BusyBox and glibc use `wait4`) | 6 | — |
 | `pipe`(22)/`pipe2`(293) + inheritance across `fork` | ✅ | 6 | `guest.process` (`pipe + fork IPC`, `file descriptor inheritance`) |
-| `futex`(202) — `WAIT`/`WAKE`, `PRIVATE` variants | ✅ implemented, **not validated** (no dedicated test yet) | 6 | indirect only |
+| `futex`(202) | ⚠️ **stub, deliberately honest**: the value comparison is real (`-EAGAIN` when the word changed, `-EFAULT` on a bad address), `WAKE` reports 0 woken, and the paths that need a wait queue (`WAIT` on a matching value, PI, requeue) are refused with `-ENOSYS` instead of falsely reporting a wake-up | 6 | `syscall.linux_compat_futex_*` |
 | Thread creation (`clone` with `CLONE_THREAD`) | ❌ `-ENOSYS` by design | 6 | `guest.process` |
 | Signals: `rt_sigaction`(13) **stub**, `rt_sigprocmask`(14) tracked in a guest mask, handlers **not** invoked | ⚠️ partial (deliberate stubs, listed as such in the inventory) | 6 | — |
 | `kill`(62)/`tgkill`(234) | ✅ (signal delivery to the single guest thread) | 6 | — |
@@ -333,6 +333,7 @@ guest buffer from the host in 4 KiB chunks, accepting only the two defined
 | `nanosleep`(35), `clock_nanosleep`(230) | ✅ (real sleep, `-EINTR` with the unslept remainder, `TIMER_ABSTIME`) | 6 | `syscall.linux_compat_nanosleep_*`, `guest.syscall_compat` |
 | Resource/scheduling: `getrusage`(98), `times`(100), `getrlimit`(97)/`setrlimit`(160), `sched_getparam`(143)/`sched_setscheduler`(144)/`sched_getscheduler`(145)/`sched_get_priority_max`(146)/`sched_get_priority_min`(147), `sched_getaffinity`(204), `getitimer`(36)/`setitimer`(38), `setsid`(112)/`setpgid`(109)/`getpgid`(121)/`getpgrp`(111), `sched_yield`(24), `membarrier`(324) | ✅ | 6 | `syscall_adapters.*`, `guest.syscall_compat` |
 | Stubs (answer success, do nothing): `madvise`(28), `sigaltstack`(131), `prctl`(157), `fadvise64`(221), `clock_getres`(229), `rt_sigaction`(13) | ⚠️ stubbed — **not** claimed as implemented | 6 | inventory status `stubbed` |
+| Thread creation (`clone` with `CLONE_VM`/`CLONE_THREAD`) | ❌ `-ENOSYS` by design, which is *why* `futex` cannot block: no waiter could ever be woken | 6 | `guest.process` |
 | `io_uring`, `rseq`, `vDSO` | ⬜ | 6/7 | — |
 
 ---

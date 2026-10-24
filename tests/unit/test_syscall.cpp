@@ -2029,3 +2029,82 @@ HYPERION_TEST("syscall", "linux_compat_ioctl_rejects_bad_pointers_and_unknown_re
     handler.handle(s, memory);
     HYPERION_CHECK_EQ(s.reg(Gpr::kRax), static_cast<std::uint64_t>(-hyperion::kEfault));
 }
+
+// --- linux-compat layer: futex ---------------------------------------------
+//
+// futex used to return success from FUTEX_WAIT whether or not it had blocked,
+// which told the caller it had been woken when nothing had happened. A guest
+// thread cannot exist here (CLONE_VM/CLONE_THREAD is refused), so a real block
+// could never be released: the honest answer for the blocking path is a refusal.
+// The value comparison is real, and is what the uncontended path depends on.
+
+namespace {
+
+void write_u32(FlatMemory& memory, std::uint64_t addr, std::uint32_t value) {
+    std::array<std::uint8_t, 4> buf{};
+    hyperion::syscall_detail::put_u32(buf.data(), 0, value);
+    HYPERION_CHECK(memory.write(addr, buf.data(), buf.size()));
+}
+
+} // namespace
+
+HYPERION_TEST("syscall", "linux_compat_futex_wait_refuses_to_block") {
+    GuestAddressSpace as;
+    MinimalSyscallHandler handler({}, &as);
+    handler.enable_linux_compat();
+    FlatMemory memory(kBase, kMemSize);
+    write_u32(memory, kBase + 0x100, 7);
+
+    // Value matches: the kernel would block. We must not claim a wake-up.
+    GuestState s = syscall_state(202, {kBase + 0x100, 0 /*FUTEX_WAIT*/, 7, 0});
+    handler.handle(s, memory);
+    HYPERION_CHECK_EQ(s.reg(Gpr::kRax), static_cast<std::uint64_t>(-hyperion::kEnosys));
+
+    // Value differs: the kernel returns EAGAIN without blocking, and so must we.
+    write_u32(memory, kBase + 0x100, 8);
+    s = syscall_state(202, {kBase + 0x100, 0, 7, 0});
+    handler.handle(s, memory);
+    HYPERION_CHECK_EQ(s.reg(Gpr::kRax), static_cast<std::uint64_t>(-hyperion::kEagain));
+
+    // FUTEX_WAIT_BITSET (9) takes the same path.
+    s = syscall_state(202, {kBase + 0x100, 9, 8, 0, kBase + 0x200});
+    handler.handle(s, memory);
+    HYPERION_CHECK_EQ(s.reg(Gpr::kRax), static_cast<std::uint64_t>(-hyperion::kEnosys));
+
+    // An unmapped address is a fault, not a comparison against garbage.
+    s = syscall_state(202, {0xDEAD0000ULL, 0, 7, 0});
+    handler.handle(s, memory);
+    HYPERION_CHECK_EQ(s.reg(Gpr::kRax), static_cast<std::uint64_t>(-hyperion::kEfault));
+
+    // Waking reports zero woken: true, because no waiter can be blocked here.
+    s = syscall_state(202, {kBase + 0x100, 1 /*FUTEX_WAKE*/, 1, 0});
+    handler.handle(s, memory);
+    HYPERION_CHECK_EQ(s.reg(Gpr::kRax), std::uint64_t{0});
+    s = syscall_state(202, {kBase + 0x100, 10 /*FUTEX_WAKE_BITSET*/, 1, 0, 0, 0xFFFFFFFFULL});
+    handler.handle(s, memory);
+    HYPERION_CHECK_EQ(s.reg(Gpr::kRax), std::uint64_t{0});
+
+    // PI futexes and requeue need a wait queue this layer does not have.
+    s = syscall_state(202, {kBase + 0x100, 3 /*FUTEX_REQUEUE*/, 1, 1});
+    handler.handle(s, memory);
+    HYPERION_CHECK_EQ(s.reg(Gpr::kRax), static_cast<std::uint64_t>(-hyperion::kEnosys));
+}
+
+HYPERION_TEST("syscall", "linux_compat_futex_uncontended_lock_is_unaffected") {
+    // glibc's pthread_mutex_fast path is an atomic compare-and-swap and never
+    // reaches the kernel; only a contended lock issues FUTEX_WAIT. This pins the
+    // property that matters: a single-threaded guest never touches the refusal
+    // path, so marking futex 'stubbed' cannot break ordinary programs.
+    GuestAddressSpace as;
+    MinimalSyscallHandler handler({}, &as);
+    handler.enable_linux_compat();
+    FlatMemory memory(kBase, kMemSize);
+
+    // A lock word that is already free when the waiter looks: the classic
+    // "someone released it before I slept" race, which must report EAGAIN so the
+    // caller retries instead of sleeping.
+    write_u32(memory, kBase + 0x100, 0);
+    GuestState s = syscall_state(202, {kBase + 0x100, 0, 1, 0});
+    handler.handle(s, memory);
+    HYPERION_CHECK_EQ(s.reg(Gpr::kRax), static_cast<std::uint64_t>(-hyperion::kEagain));
+}

@@ -155,7 +155,8 @@ LIMITATIONS
   - rt_sigaction, sigaltstack, prctl, madvise, fadvise64 and clock_getres are
     stubs: they report success without doing the work, and are listed as
     'stubbed' (not 'implemented') in the inventory
-  - futex is implemented but not yet validated by a dedicated test
+  - futex compares the value and refuses to block (ENOSYS): a guest thread
+    cannot exist, so no waiter could ever be woken; it is listed as 'stubbed'
   - no AVX2 / AVX-512 yet
 EOF
 }

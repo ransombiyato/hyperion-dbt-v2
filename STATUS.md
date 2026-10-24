@@ -71,7 +71,7 @@ works, what was last verified, and what to do next.
 
 **Implemented-syscall status (verified automatically by
 `tools/gen_syscall_inventory.py --check`).** 128 numbers are answered
-today — 122 implemented and 6 stubbed — of the 375 in the pinned kernel
+today — 121 implemented and 7 stubbed — of the 375 in the pinned kernel
 table. The validator now cross-checks three sources in both directions:
 `MinimalSyscallHandler::handle()`, `is_linux_compat_syscall()` (whose numbers carry
 a `[stub]` or `[unsupported]` annotation that decides the expected status), and the
@@ -79,10 +79,11 @@ compatibility layer's adapter table and alias rules. A syscall cannot be counted
 as implemented in the inventory without a handler somewhere, and a handler cannot
 exist without the inventory saying so.
 
-The 6 stubs answer success without performing the call — `rt_sigaction`(13),
-`madvise`(28), `sigaltstack`(131), `prctl`(157), `fadvise64`(221) and
-`clock_getres`(229) — and are listed as `stubbed`, not `implemented`, because
-claiming them would be a lie a roadmap could be built on. `rseq`(334) is
+The 7 stubs are `rt_sigaction`(13), `madvise`(28), `sigaltstack`(131),
+`prctl`(157), `fadvise64`(221), `clock_getres`(229) and `futex`(202). They answer
+success without performing the call, or — for `futex` — perform the value
+comparison and then refuse to block, and are listed as `stubbed` rather than
+`implemented` because claiming them would be a lie a roadmap could be built on. `rseq`(334) is
 recognised only to be refused cleanly and stays `not-started`.
 
 Anything not listed returns `-ENOSYS` explicitly and is counted. The full list is

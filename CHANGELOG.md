@@ -83,6 +83,14 @@ Meaningful changes by milestone. Format loosely follows
   at work that was already done.
 
 ### Fixed
+- **`futex` reported wake-ups that never happened.** `FUTEX_WAIT` returned 0
+  whenever the value matched, without blocking — telling the caller it had been
+  woken when nothing had occurred. A guest thread cannot exist here (`clone` with
+  `CLONE_VM`/`CLONE_THREAD` is refused), so no waiter could ever be released and
+  blocking would hang. The call now does the real work it *can* do and refuses the
+  rest: `-EAGAIN` when the word changed, `-EFAULT` on an unmapped address,
+  `WAKE` reports zero woken (true), and the blocking/PI/requeue paths return
+  `-ENOSYS`. Its inventory status was corrected from `implemented` to `stubbed`.
 - **A terminal application could not enter raw mode.** `ioctl` handled
   `TIOCGWINSZ` only, so `cfmakeraw()` — the first thing every TUI does — failed
   and the application either exited or drove the terminal in cooked mode.

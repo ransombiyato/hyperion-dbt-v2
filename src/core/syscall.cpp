@@ -2289,21 +2289,44 @@ SyscallResult MinimalSyscallHandler::handle_unguarded(GuestState& state, Memory&
                 break;
             }
             case 202: { // futex(uaddr, futex_op, val, ...)
+                // Honest, not approximated. A guest thread cannot exist here
+                // (clone with CLONE_VM/CLONE_THREAD is refused), so no one can
+                // ever wake a waiter: blocking would hang forever, and reporting
+                // success - which this used to do - tells the caller it was woken
+                // when nothing happened. The value comparison is real and is what
+                // the caller relies on for the uncontended path; the blocking
+                // path refuses explicitly.
                 const std::uint64_t uaddr = arg(state, 0);
                 const int op = arg_i32(state, 1) & 0x7F;
                 const auto val = static_cast<std::uint32_t>(arg(state, 2));
-                if (op == 0 || op == 9) { // FUTEX_WAIT / FUTEX_WAIT_BITSET
+                constexpr int kFutexWait = 0;
+                constexpr int kFutexWake = 1;
+                constexpr int kFutexWaitBitset = 9;
+                constexpr int kFutexWakeBitset = 10;
+                if (op == kFutexWait || op == kFutexWaitBitset) {
                     std::array<std::uint8_t, 4> cur_b{};
                     if (!memory.read(uaddr, cur_b.data(), 4)) {
                         r = -kEfault;
-                    } else {
-                        std::uint32_t cur = 0;
-                        std::memcpy(&cur, cur_b.data(), 4);
-                        r = (cur != val) ? -11 /* -EAGAIN */ : 0;
+                        break;
                     }
-                } else {
-                    r = 0; // FUTEX_WAKE etc.
+                    std::uint32_t cur = 0;
+                    std::memcpy(&cur, cur_b.data(), 4);
+                    // The kernel locks, re-reads, and only then decides: the
+                    // comparison has to happen here, after the read, or a caller
+                    // that raced a change would spin.
+                    r = (cur != val) ? -kEagain : -kEnosys;
+                    break;
                 }
+                if (op == kFutexWake || op == kFutexWakeBitset) {
+                    // No waiter can be blocked, so zero woken is the truth rather
+                    // than a placeholder. A caller that expected to wake someone
+                    // and gets 0 is told exactly what happened.
+                    r = 0;
+                    break;
+                }
+                // FUTEX_REQUEUE, FUTEX_CMP_REQUEUE, FUTEX_WAKE_OP, PI futexes and
+                // the rest manipulate a wait queue this layer does not have.
+                r = -kEnosys;
                 break;
             }
             case 204: { // sched_getaffinity(pid, cpusetsize, mask)
@@ -2414,9 +2437,10 @@ SyscallResult MinimalSyscallHandler::handle_unguarded(GuestState& state, Memory&
 //
 // Two per-number annotations are read by tools/gen_syscall_inventory.py, which
 // keeps docs/syscalls/inventory.tsv honest:
-//   [stub]        the number is accepted and answers success, but does not
-//                 perform the call (nanosleep returns 0 immediately, prctl is a
-//                 no-op, and so on).
+//   [stub]        the number is accepted but does not do the whole job: it may
+//                 answer success without performing the call (prctl is a no-op,
+//                 madvise returns 0) or refuse the part it cannot do (futex
+//                 compares the value, then refuses to block).
 //   [unsupported] the number is recognised only so that it can be rejected with
 //                 a clean -ENOSYS instead of being counted as a fault. It is not
 //                 an implementation and stays `not-started` in the inventory.
@@ -2446,7 +2470,7 @@ bool is_linux_compat_syscall(std::uint64_t number) {
     case 137: // statfs
     case 138: // fstatfs
     case 157: // prctl [stub]
-    case 202: // futex
+    case 202: // futex [stub]
     case 204: // sched_getaffinity
     case 221: // fadvise64 [stub]
     case 229: // clock_getres [stub]

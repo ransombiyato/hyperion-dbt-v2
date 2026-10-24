@@ -409,8 +409,10 @@ not by syscall number:
 
 1. `rt_sigaction` + `sigaltstack` — replace the stubs with either a real
    implementation or an explicit refusal.
-2. `futex` validation (wait/wake bit sets, timeouts, `-EAGAIN`) before any thread
-   work begins.
+2. **Real `futex` blocking**, which is coupled to thread creation: `futex` now
+   performs the value comparison and refuses to block (it used to report a
+   wake-up that never happened). Making it block requires a guest wait queue,
+   which requires `clone` with `CLONE_VM`/`CLONE_THREAD` first.
 3. `select`/`poll`/`epoll` are done; `signalfd`, `inotify_*` are the next
    event-source gaps a file-watching editor hits.
 4. Sockets.

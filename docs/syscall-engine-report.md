@@ -138,7 +138,7 @@ deleting it restores `-ENOSYS`:
 Counts are generated from `docs/syscalls/inventory.tsv` and enforced in both
 directions by `tools/gen_syscall_inventory.py --check`.
 
-**128 of 375** numbers are answered: **122 implemented, 6 stubbed**. Before this
+**128 of 375** numbers are answered: **121 implemented, 7 stubbed**. Before this
 work the inventory claimed 47.
 
 Newly `implemented` in this work (42 numbers):
@@ -169,7 +169,13 @@ pointed at work that was already done.
 - **Moved from stub to real:** `nanosleep`(35), `clock_nanosleep`(230).
 - **Still stubbed, and labelled `stubbed` rather than `implemented`:**
   `rt_sigaction`(13), `madvise`(28), `sigaltstack`(131), `prctl`(157),
-  `fadvise64`(221), `clock_getres`(229).
+  `fadvise64`(221), `clock_getres`(229), and `futex`(202).
+- **`futex` was corrected *downwards* in this work.** It had been counted as
+  implemented while returning success from `FUTEX_WAIT` without blocking — i.e.
+  telling callers they had been woken when nothing had happened. It now does the
+  real value comparison (`-EAGAIN`/`-EFAULT`), reports `WAKE` truthfully as zero
+  woken, and refuses the paths that need a wait queue with `-ENOSYS`. A stub that
+  lies is worse than a refusal, and the inventory now says `stubbed`.
 
 ## 5. Changed files
 
@@ -308,7 +314,7 @@ device. They must not be quoted as end-to-end performance.
 | Area | State | Risk |
 | --- | --- | --- |
 | Threads (`clone` with `CLONE_VM`/`CLONE_THREAD`) | refused with `-ENOSYS` by design | correct, but any threaded guest does not run |
-| `futex`(202) | implemented, **not validated** by a dedicated test | a threaded guest would lean on it hard |
+| `futex`(202) | **stub by design**: value comparison real, blocking refused | cannot be fixed before thread creation exists; a guest that contends will get a clean `-ENOSYS` rather than a false wake-up |
 | `rt_sigaction`, `sigaltstack`, `prctl`, `madvise`, `fadvise64`, `clock_getres` | stubs that report success | **worst category**: a guest that depends on the effect misbehaves later, looks like an unrelated bug. Rust's stack-overflow guard checks that `sigaltstack` took effect |
 | Sockets | not started | blocks an editor that spawns a language server |
 | `signalfd`, `inotify_*` | not started | blocks file-watching |
