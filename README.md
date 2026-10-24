@@ -108,6 +108,10 @@ Everything needed to continue the project is **in this repository**. In order:
 | Register allocation | **Implemented within a block** (Phase 5, D-021) — hottest guest registers kept in `x19..x23` across block bodies, memory ops, SSE2 loops, and self-loop superblocks |
 | Block chaining & cache invalidation | **Implemented** — direct in-JIT 4096-slot jump table + native self-loop superblocks + `Memory::code_epoch()` invalidation exclusively on executable `kExec` changes |
 
+The syscall compatibility engine (dispatch layers, ABI adapters, registry schema,
+measurements, remaining gaps and a handoff note) is described in
+[`docs/syscall-engine-report.md`](docs/syscall-engine-report.md).
+
 See [`docs/real-world-evaluation.md`](docs/real-world-evaluation.md) for the complete
 real-binary compatibility & multi-sample performance evaluation across five compiled
 `gcc 14.2 -O2 -static` (`glibc 2.41`) C workloads (`120,313,691` dynamic instructions).
