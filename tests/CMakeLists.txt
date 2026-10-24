@@ -81,6 +81,18 @@ if(HYPERION_GUEST_CC)
                 $<TARGET_FILE:hyperion>
                 "${CMAKE_CURRENT_SOURCE_DIR}/guest/fixtures")
     set_tests_properties(guest.process PROPERTIES LABELS "guest" TIMEOUT 120)
+
+    # End-to-end proof of the syscall compatibility layer: a real x86-64 guest
+    # using the adapted syscalls, a user-written registry rule that enables a
+    # syscall the binary does not implement, its removal, and a corrupt file that
+    # must not change behaviour or be overwritten.
+    add_test(NAME guest.syscall_compat
+        COMMAND ${CMAKE_COMMAND} -E env
+                HYPERION_GUEST_CC=${HYPERION_GUEST_CC}
+                bash "${CMAKE_CURRENT_SOURCE_DIR}/guest/syscall_compat_test.sh"
+                $<TARGET_FILE:hyperion>
+                "${CMAKE_CURRENT_SOURCE_DIR}/guest/fixtures")
+    set_tests_properties(guest.syscall_compat PROPERTIES LABELS "guest;syscall" TIMEOUT 180)
 else()
     message(STATUS "HYPERION: no static x86-64 fixture compiler found; "
                    "guest.process tests not registered (set HYPERION_GUEST_CC)")

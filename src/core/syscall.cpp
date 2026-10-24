@@ -2060,7 +2060,9 @@ SyscallResult MinimalSyscallHandler::handle_unguarded(GuestState& state, Memory&
             case 82:   // rename
             case 83:   // mkdir
             case 84:   // rmdir
+            case 86:   // link
             case 87:   // unlink
+            case 88:   // symlink
             case 90: { // chmod
                 std::string p1;
                 const std::int64_t rc1 = read_guest_cstr(memory, arg(state, 0), p1);
@@ -2086,7 +2088,19 @@ SyscallResult MinimalSyscallHandler::handle_unguarded(GuestState& state, Memory&
                         break;
                     }
                     p2 = resolve_guest_path(p2, sysroot_);
-                    hrc = ::rename(p1.c_str(), p2.c_str());
+                    if (result.number == 86) {
+                        // link(2) and symlink(2) are the non-`at` spelling of
+                        // linkat(2)/symlinkat(2); glibc issues them directly, so
+                        // a guest that calls plain link()/symlink() misses the
+                        // `at` adapters entirely. `ln` and `ln -s` are used by
+                        // every install script, including terminal applications'
+                        // startup wrappers.
+                        hrc = ::linkat(AT_FDCWD, p1.c_str(), AT_FDCWD, p2.c_str(), 0);
+                    } else if (result.number == 88) {
+                        hrc = ::symlinkat(p1.c_str(), AT_FDCWD, p2.c_str());
+                    } else {
+                        hrc = ::rename(p1.c_str(), p2.c_str());
+                    }
                 }
                 r = (hrc == 0) ? 0 : -static_cast<std::int64_t>(errno == 0 ? kEio : errno);
                 break;
@@ -2265,7 +2279,9 @@ bool is_linux_compat_syscall(std::uint64_t number) {
     case 82:  // rename
     case 83:  // mkdir
     case 84:  // rmdir
+    case 86:  // link
     case 87:  // unlink
+    case 88:  // symlink
     case 90:  // chmod
     case 91:  // fchmod
     case 99:  // sysinfo
