@@ -23,6 +23,7 @@
 // counts as an unsupported syscall rather than a silent success.
 #include <atomic>
 #include <cerrno>
+#include <cstdlib>
 #include <climits>
 #include <cstdint>
 #include <cstring>
@@ -45,6 +46,7 @@
 #include <vector>
 
 #include "hyperion/syscall_detail.hpp"
+#include "hyperion/host_syscalls.hpp"
 #include "hyperion/syscall_dispatch.hpp"
 
 namespace hyperion {
@@ -514,6 +516,57 @@ std::int64_t adapter_epoll_create1(SyscallContext& ctx) {
     return guest_fd;
 }
 
+// memfd_create(2), or the closest thing the host allows.
+//
+// On Android before API 30 memfd_create is outside the app seccomp allowlist and
+// issuing it is a fatal SIGSYS (SECCOMP_RET_TRAP), not an errno - see
+// hyperion/host_syscalls.hpp. There is no way to probe for it, so the decision is
+// taken from the device's API level.
+//
+// The substitute is O_TMPFILE on a writable temporary directory: an unnamed,
+// already-unlinked file with the same read/write/mmap behaviour, which is what a
+// guest uses an memfd for in practice (shared anonymous memory, seals excepted).
+// It is not identical to memfd_create:
+//   - F_ADD_SEALS/F_GET_SEALS are not supported on the resulting descriptor, so
+//     MFD_ALLOW_SEALING is accepted but not honoured;
+//   - the file lives on the temporary filesystem, so it consumes that space.
+// When O_TMPFILE is unavailable the call reports -ENOSYS, which is a documented
+// answer a guest can fall back from. A wrong "success" is never fabricated.
+std::int64_t create_anonymous_file(const std::string& name, unsigned int host_flags, bool cloexec) {
+    const int open_flags = O_RDWR | O_TMPFILE | (cloexec ? O_CLOEXEC : 0);
+    (void)name;
+    if (host_memfd_create_syscall_usable()) {
+#ifdef SYS_memfd_create
+        // Issued through syscall(2) rather than ::memfd_create so the binary does
+        // not require a libc symbol that only exists from Android 11 onwards.
+        const long fd = ::syscall(SYS_memfd_create, name.c_str(), host_flags);
+        if (fd >= 0) {
+            return static_cast<std::int64_t>(fd);
+        }
+        if (errno != ENOSYS) {
+            return errno_result();
+        }
+#else
+        (void)host_flags;
+#endif
+    }
+    std::vector<std::string> bases;
+    if (const char* tmpdir = std::getenv("TMPDIR"); tmpdir != nullptr && *tmpdir != '\0') {
+        bases.emplace_back(tmpdir);
+    }
+    if (const char* prefix = std::getenv("PREFIX"); prefix != nullptr && *prefix != '\0') {
+        bases.emplace_back(std::string(prefix) + "/tmp");
+    }
+    bases.emplace_back("/tmp");
+    for (const std::string& base : bases) {
+        const int fd = ::open(base.c_str(), open_flags, 0600);
+        if (fd >= 0) {
+            return static_cast<std::int64_t>(fd);
+        }
+    }
+    return -kEnosys;
+}
+
 std::int64_t adapter_memfd_create(SyscallContext& ctx) {
     constexpr std::uint64_t kMfdCloexec = 0x1;
     constexpr std::uint64_t kMfdAllowSealing = 0x2;
@@ -534,10 +587,11 @@ std::int64_t adapter_memfd_create(SyscallContext& ctx) {
     if ((flags & kMfdAllowSealing) != 0) {
         host_flags |= static_cast<unsigned int>(MFD_ALLOW_SEALING);
     }
-    const int fd = ::memfd_create(name.c_str(), host_flags);
-    if (fd < 0) {
-        return errno_result();
+    const std::int64_t created = create_anonymous_file(name, host_flags, (flags & kMfdCloexec) != 0);
+    if (created < 0) {
+        return created;
     }
+    const int fd = static_cast<int>(created);
     const std::int64_t guest_fd = ctx.add_host_fd(fd, (flags & kMfdCloexec) != 0);
     if (guest_fd < 0) {
         ::close(fd);

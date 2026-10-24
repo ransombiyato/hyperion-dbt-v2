@@ -7,6 +7,7 @@
 
 #include "hyperion/process.hpp"
 #include "hyperion/syscall_detail.hpp"
+#include "hyperion/host_syscalls.hpp"
 #include "hyperion/syscall_dispatch.hpp"
 
 #include <array>
@@ -22,6 +23,7 @@
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/statfs.h>
+#include <sys/sysmacros.h>
 #include <sys/syscall.h>
 #include <sys/sysinfo.h>
 #include <sys/utsname.h>
@@ -818,6 +820,83 @@ std::int64_t do_newfstatat(GuestState& s, Memory& memory, const std::vector<Gues
     return write_guest_stat(memory, buf, st);
 }
 
+// Write a guest `struct statx` derived from an fstatat(2)/fstat(2) result.
+//
+// Used on hosts that cannot issue statx(2) - see hyperion/host_syscalls.hpp: on
+// Android the syscall is outside the app seccomp allowlist before API 30 and is
+// answered with SIGSYS (SECCOMP_RET_TRAP), which kills the process outright.
+//
+// Everything in STATX_BASIC_STATS is present in `struct stat`, so the fields
+// below are real values, not placeholders. Two things cannot be derived and are
+// reported as absent rather than guessed:
+//   - stx_btime (creation time): fstatat does not expose it, so STATX_BTIME is
+//     clear in stx_mask and the field is zero.
+//   - stx_attributes / stx_attributes_mask: only statx(2) reports them; both
+//     stay zero, which means "no attributes are claimed to be known".
+std::int64_t write_guest_statx_from_stat(Memory& memory, std::uint64_t buf,
+                                         const struct ::stat& st, unsigned requested_mask) {
+    std::array<std::uint8_t, guest_statx::kSize> out{};
+    const auto s64 = [](std::int64_t v) { return static_cast<std::uint64_t>(v); };
+
+    // STATX_TYPE|MODE|NLINK|UID|GID|ATIME|MTIME|CTIME|INO|SIZE|BLOCKS: exactly the
+    // fields fstatat(2) provides. A guest that asked for fewer bits still gets
+    // the basic set, which is what the kernel does for STATX_BASIC_STATS.
+    const unsigned available = static_cast<unsigned>(statx::kBasicStats);
+    const unsigned returned = available & (requested_mask == 0 ? available : requested_mask);
+
+    put_u32(out.data(), guest_statx::kOffMask, returned);
+    put_u32(out.data(), guest_statx::kOffBlksize, static_cast<std::uint32_t>(st.st_blksize));
+    put_u64(out.data(), guest_statx::kOffAttributes, 0);
+    put_u32(out.data(), guest_statx::kOffNlink, static_cast<std::uint32_t>(st.st_nlink));
+    put_u32(out.data(), guest_statx::kOffUid, static_cast<std::uint32_t>(st.st_uid));
+    put_u32(out.data(), guest_statx::kOffGid, static_cast<std::uint32_t>(st.st_gid));
+    put_u16(out.data(), guest_statx::kOffMode, static_cast<std::uint16_t>(st.st_mode));
+    put_u64(out.data(), guest_statx::kOffIno, static_cast<std::uint64_t>(st.st_ino));
+    put_u64(out.data(), guest_statx::kOffSize, static_cast<std::uint64_t>(st.st_size));
+    put_u64(out.data(), guest_statx::kOffBlocks, static_cast<std::uint64_t>(st.st_blocks));
+    put_u64(out.data(), guest_statx::kOffAttrmask, 0);
+
+    const auto put_timestamp = [&out, &s64](std::size_t off, const struct ::timespec& ts) {
+        put_u64(out.data(), off, s64(static_cast<std::int64_t>(ts.tv_sec)));
+        put_u32(out.data(), off + 8, static_cast<std::uint32_t>(ts.tv_nsec));
+        put_u32(out.data(), off + 12, 0); // __reserved
+    };
+    put_timestamp(guest_statx::kOffAtime, st.st_atim);
+    put_timestamp(guest_statx::kOffMtime, st.st_mtim);
+    put_timestamp(guest_statx::kOffCtime, st.st_ctim);
+    // kOffBtime stays zero: STATX_BTIME is not in the returned mask.
+
+    put_u32(out.data(), guest_statx::kOffRdevMajor, ::major(st.st_rdev));
+    put_u32(out.data(), guest_statx::kOffRdevMinor, ::minor(st.st_rdev));
+    put_u32(out.data(), guest_statx::kOffDevMajor, ::major(st.st_dev));
+    put_u32(out.data(), guest_statx::kOffDevMinor, ::minor(st.st_dev));
+
+    if (!memory.write(buf, out.data(), out.size())) {
+        return -kEfault;
+    }
+    return 0;
+}
+
+// do_statx without statx(2): resolve the path the same way as do_newfstatat and
+// describe the result in terms of fstatat(2).
+std::int64_t portable_statx(Memory& memory, int host_dirfd, const std::string& path,
+                            bool empty_path, unsigned mask, std::uint64_t buf) {
+    struct ::stat st{};
+    if (empty_path) {
+        // statx(AT_FDCWD, "", AT_EMPTY_PATH, ...) describes the current
+        // directory; anything else describes the descriptor itself.
+        const int rc = host_dirfd == AT_FDCWD ? ::stat(".", &st) : ::fstat(host_dirfd, &st);
+        if (rc != 0) {
+            return -static_cast<std::int64_t>(errno == 0 ? kEio : errno);
+        }
+        return write_guest_statx_from_stat(memory, buf, st, mask);
+    }
+    if (::fstatat(host_dirfd, path.c_str(), &st, 0) != 0) {
+        return -static_cast<std::int64_t>(errno == 0 ? kEio : errno);
+    }
+    return write_guest_statx_from_stat(memory, buf, st, mask);
+}
+
 std::int64_t do_statx(GuestState& s, Memory& memory, const std::vector<GuestDescriptor>& files,
                       bool compat = false, const std::string& sysroot = {}) {
     const std::int32_t dirfd = arg_i32(s, 0);
@@ -845,16 +924,39 @@ std::int64_t do_statx(GuestState& s, Memory& memory, const std::vector<GuestDesc
         return rc;
     }
     path = resolve_guest_path(path, sysroot);
+    const bool empty_path = (flags & statx::kAtEmptyPath) != 0 && path.empty();
+    const bool symlink_nofollow = (flags & kAtSymlinkNofollow) != 0;
+
+    // Handled without statx(2) on Android before API 30, where the syscall is
+    // outside the app seccomp allowlist and terminates the process with SIGSYS.
+    if (!host_statx_syscall_usable()) {
+        if (symlink_nofollow) {
+            struct ::stat st{};
+            if (::fstatat(host_dirfd, path.c_str(), &st, AT_SYMLINK_NOFOLLOW) != 0) {
+                return -static_cast<std::int64_t>(errno == 0 ? kEio : errno);
+            }
+            return write_guest_statx_from_stat(memory, buf, st, mask);
+        }
+        return portable_statx(memory, host_dirfd, path, empty_path, mask, buf);
+    }
+
+#ifdef SYS_statx
     std::array<std::uint8_t, guest_statx::kSize> out{};
     const long host_rc =
         ::syscall(SYS_statx, host_dirfd, path.c_str(), static_cast<int>(flags), mask, out.data());
-    if (host_rc != 0) {
+    if (host_rc == 0) {
+        if (!memory.write(buf, out.data(), out.size())) {
+            return -kEfault;
+        }
+        return 0;
+    }
+    // A kernel older than 4.11 has no statx at all: fall back rather than
+    // reporting ENOSYS for a stat that fstatat can answer.
+    if (errno != ENOSYS) {
         return -static_cast<std::int64_t>(errno == 0 ? kEio : errno);
     }
-    if (!memory.write(buf, out.data(), out.size())) {
-        return -kEfault;
-    }
-    return 0;
+#endif
+    return portable_statx(memory, host_dirfd, path, empty_path, mask, buf);
 }
 
 std::int64_t readlink_common(Memory& memory, int host_dirfd, std::uint64_t path_addr,

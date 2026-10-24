@@ -12,6 +12,7 @@ add_executable(hyperion_unit_tests
     unit/test_syscall_dispatch.cpp
     unit/test_syscall_adapters.cpp
     unit/test_host_probe.cpp
+    unit/test_host_syscalls.cpp
     unit/test_bench_stats.cpp
     unit/test_guest_state.cpp
     unit/test_decoder.cpp

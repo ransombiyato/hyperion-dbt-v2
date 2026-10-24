@@ -116,6 +116,13 @@ inline void remove_tree(const std::string& path) {
 
 } // namespace detail
 
+// A mkstemp()/mkdtemp() template that lives in the usable temporary directory
+// rather than in a hardcoded /tmp. The returned string is owned by the caller
+// and can be passed to mkstemp after .data() has made it mutable.
+inline std::string temp_template(const char* tag) {
+    return detail::pick_temp_base() + "/hyperion-" + tag + "-XXXXXX";
+}
+
 // A private, empty directory that is deleted (recursively) when the test ends.
 class TempDir {
 public:

@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "harness/test_harness.hpp"
+#include "harness/test_tempdir.hpp"
 #include "hyperion/guest_state.hpp"
 #include "hyperion/interpreter.hpp"
 #include "hyperion/syscall.hpp"
@@ -26,6 +27,7 @@ using hyperion::MinimalSyscallHandler;
 using hyperion::RegistryOptions;
 using hyperion::RegistryReport;
 using hyperion::RegistryRule;
+using hyperion::test::TempDir;
 using hyperion::RuleImplementation;
 using hyperion::RuleOrigin;
 using hyperion::SyscallStatus;
@@ -34,26 +36,6 @@ namespace {
 
 constexpr std::uint64_t kBase = 0x400000;
 constexpr std::size_t kMemSize = 4096;
-
-class TempDir {
-public:
-    TempDir() {
-        char pattern[] = "/tmp/hyperion-dispatch-XXXXXX";
-        const char* made = ::mkdtemp(pattern);
-        HYPERION_CHECK(made != nullptr);
-        path_ = made;
-    }
-    ~TempDir() {
-        const std::string command = "rm -rf '" + path_ + "'";
-        (void)std::system(command.c_str());
-    }
-    TempDir(const TempDir&) = delete;
-    TempDir& operator=(const TempDir&) = delete;
-    std::string file(const std::string& name) const { return path_ + "/" + name; }
-
-private:
-    std::string path_;
-};
 
 // Write `text` to `path` verbatim.
 void write_text(const std::string& path, const std::string& text) {

@@ -25,6 +25,7 @@
 #include "hyperion/syscall_detail.hpp"
 
 #include "harness/test_harness.hpp"
+#include "harness/test_tempdir.hpp"
 #include "hyperion/address_space.hpp"
 #include "hyperion/decoder.hpp"
 #include "hyperion/guest_state.hpp"
@@ -584,8 +585,8 @@ struct TempFile {
     std::string path;
     int fd = -1;
     TempFile() {
-        char tmpl[] = "/tmp/hyperion_openat_XXXXXX";
-        fd = ::mkstemp(tmpl);
+        std::string tmpl = hyperion::test::temp_template("openat");
+        fd = ::mkstemp(tmpl.data());
         if (fd >= 0) {
             path = tmpl;
         }
@@ -657,7 +658,9 @@ HYPERION_TEST("syscall", "openat_opens_a_real_file_and_returns_a_guest_fd") {
 HYPERION_TEST("syscall", "openat_missing_file_is_enoent") {
     MinimalSyscallHandler handler;
     FlatMemory memory = program({});
-    put_cstr(memory, kBase + 0x400, "/tmp/hyperion_definitely_does_not_exist_9c1f");
+    const std::string missing_path =
+        hyperion::test::detail::pick_temp_base() + "/hyperion-no-such-file-9c1f";
+    put_cstr(memory, kBase + 0x400, missing_path.c_str());
 
     GuestState s =
         syscall_state(hyperion::sysno::kOpenat, {hyperion::kAtFdcwd, kBase + 0x400, 0, 0});
@@ -859,16 +862,16 @@ HYPERION_TEST("syscall", "newfstatat_with_a_real_dirfd_or_bad_flag_is_unimplemen
 HYPERION_TEST("syscall", "newfstatat_symlink_nofollow_uses_lstat") {
     // A dangling symlink resolves with stat (follow -> ENOENT) but reports the
     // link itself with AT_SYMLINK_NOFOLLOW (lstat -> S_IFLNK).
-    char link_path[] = "/tmp/hyperion_nfstat_link_XXXXXX";
-    const int fd = ::mkstemp(link_path);
+    std::string link_path = hyperion::test::temp_template("nfstat_link");
+    const int fd = ::mkstemp(link_path.data());
     HYPERION_CHECK(fd >= 0);
     ::close(fd);
-    ::unlink(link_path); // remove the temp file, keep the unique name
-    HYPERION_CHECK(::symlink("/nonexistent/hyperion/target", link_path) == 0);
+    ::unlink(link_path.c_str()); // remove the temp file, keep the unique name
+    HYPERION_CHECK(::symlink("/nonexistent/hyperion/target", link_path.c_str()) == 0);
 
     MinimalSyscallHandler handler;
     FlatMemory memory = program({});
-    put_cstr(memory, kBase + 0x400, link_path);
+    put_cstr(memory, kBase + 0x400, link_path.c_str());
 
     GuestState follow = syscall_state(hyperion::sysno::kNewfstatat,
                                       {hyperion::kAtFdcwd, kBase + 0x400, kBase + 0x800, 0});
@@ -883,7 +886,7 @@ HYPERION_TEST("syscall", "newfstatat_symlink_nofollow_uses_lstat") {
     const std::uint32_t mode = read_u32(memory, kBase + 0x800 + hyperion::guest_stat::kOffStMode);
     HYPERION_CHECK((mode & 0xF000u) == 0xA000u); // S_IFLNK
 
-    ::unlink(link_path);
+    ::unlink(link_path.c_str());
 }
 
 HYPERION_TEST("syscall", "newfstatat_is_advertised_as_minimal") {
@@ -912,9 +915,10 @@ HYPERION_TEST("syscall", "access_reports_a_real_file_and_enoent_for_a_missing_on
 }
 
 HYPERION_TEST("syscall", "access_bad_mode_is_einval_and_bad_path_pointer_is_efault") {
+    hyperion::test::TempDir dir; // Termux has no /tmp; see tests/harness/test_tempdir.hpp
     MinimalSyscallHandler handler;
     FlatMemory memory = program({});
-    put_cstr(memory, kBase + 0x400, "/tmp");
+    put_cstr(memory, kBase + 0x400, dir.path().c_str());
 
     // Bit 0x8 is not a valid access mode.
     GuestState bad = syscall_state(hyperion::sysno::kAccess, {kBase + 0x400, 0x8});
@@ -927,16 +931,16 @@ HYPERION_TEST("syscall", "access_bad_mode_is_einval_and_bad_path_pointer_is_efau
 }
 
 HYPERION_TEST("syscall", "readlink_copies_the_target_without_a_terminator") {
-    char link_path[] = "/tmp/hyperion_readlink_XXXXXX";
-    const int fd = ::mkstemp(link_path);
+    std::string link_path = hyperion::test::temp_template("readlink");
+    const int fd = ::mkstemp(link_path.data());
     HYPERION_CHECK(fd >= 0);
     ::close(fd);
-    ::unlink(link_path);
-    HYPERION_CHECK(::symlink("/tmp/hyperion/target", link_path) == 0);
+    ::unlink(link_path.c_str());
+    HYPERION_CHECK(::symlink("/tmp/hyperion/target", link_path.c_str()) == 0);
 
     MinimalSyscallHandler handler;
     FlatMemory memory = program({});
-    put_cstr(memory, kBase + 0x400, link_path);
+    put_cstr(memory, kBase + 0x400, link_path.c_str());
 
     GuestState s = syscall_state(hyperion::sysno::kReadlink, {kBase + 0x400, kBase + 0x800, 64});
     HYPERION_CHECK(handler.handle(s, memory).status == SyscallStatus::kHandled);
@@ -948,20 +952,20 @@ HYPERION_TEST("syscall", "readlink_copies_the_target_without_a_terminator") {
     HYPERION_CHECK_EQ(
         std::strncmp(reinterpret_cast<const char*>(got), expected, std::strlen(expected)), 0);
 
-    ::unlink(link_path);
+    ::unlink(link_path.c_str());
 }
 
 HYPERION_TEST("syscall", "readlink_truncates_a_long_target_and_rejects_zero_size") {
-    char link_path[] = "/tmp/hyperion_readlink2_XXXXXX";
-    const int fd = ::mkstemp(link_path);
+    std::string link_path = hyperion::test::temp_template("readlink2");
+    const int fd = ::mkstemp(link_path.data());
     HYPERION_CHECK(fd >= 0);
     ::close(fd);
-    ::unlink(link_path);
-    HYPERION_CHECK(::symlink("/tmp/hyperion/target", link_path) == 0);
+    ::unlink(link_path.c_str());
+    HYPERION_CHECK(::symlink("/tmp/hyperion/target", link_path.c_str()) == 0);
 
     MinimalSyscallHandler handler;
     FlatMemory memory = program({});
-    put_cstr(memory, kBase + 0x400, link_path);
+    put_cstr(memory, kBase + 0x400, link_path.c_str());
 
     // A short buffer truncates to its size, and that is not an error.
     GuestState trunc = syscall_state(hyperion::sysno::kReadlink, {kBase + 0x400, kBase + 0x800, 4});
@@ -982,7 +986,7 @@ HYPERION_TEST("syscall", "readlink_truncates_a_long_target_and_rejects_zero_size
     handler.handle(notlink, memory);
     HYPERION_CHECK_EQ(notlink.reg(Gpr::kRax), static_cast<std::uint64_t>(-hyperion::kEinval));
 
-    ::unlink(link_path);
+    ::unlink(link_path.c_str());
 }
 
 HYPERION_TEST("syscall", "access_and_readlink_are_advertised_as_minimal") {
@@ -994,16 +998,16 @@ HYPERION_TEST("syscall", "access_and_readlink_are_advertised_as_minimal") {
 // --- readlinkat(267) (eighth slice) ----------------------------------------
 
 HYPERION_TEST("syscall", "readlinkat_with_at_fdcwd_matches_readlink") {
-    char link_path[] = "/tmp/hyperion_readlinkat_XXXXXX";
-    const int fd = ::mkstemp(link_path);
+    std::string link_path = hyperion::test::temp_template("readlinkat");
+    const int fd = ::mkstemp(link_path.data());
     HYPERION_CHECK(fd >= 0);
     ::close(fd);
-    ::unlink(link_path);
-    HYPERION_CHECK(::symlink("/tmp/hyperion/at_target", link_path) == 0);
+    ::unlink(link_path.c_str());
+    HYPERION_CHECK(::symlink("/tmp/hyperion/at_target", link_path.c_str()) == 0);
 
     MinimalSyscallHandler handler;
     FlatMemory memory = program({});
-    put_cstr(memory, kBase + 0x400, link_path);
+    put_cstr(memory, kBase + 0x400, link_path.c_str());
 
     GuestState s = syscall_state(hyperion::sysno::kReadlinkat,
                                  {hyperion::kAtFdcwd, kBase + 0x400, kBase + 0x800, 64});
@@ -1016,13 +1020,14 @@ HYPERION_TEST("syscall", "readlinkat_with_at_fdcwd_matches_readlink") {
     HYPERION_CHECK_EQ(
         std::strncmp(reinterpret_cast<const char*>(got), expected, std::strlen(expected)), 0);
 
-    ::unlink(link_path);
+    ::unlink(link_path.c_str());
 }
 
 HYPERION_TEST("syscall", "readlinkat_with_a_real_dirfd_is_unimplemented") {
+    hyperion::test::TempDir dir;
     MinimalSyscallHandler handler;
     FlatMemory memory = program({});
-    put_cstr(memory, kBase + 0x400, "/tmp");
+    put_cstr(memory, kBase + 0x400, dir.path().c_str());
 
     // dirfd 3 is a real descriptor, not AT_FDCWD: outside this increment.
     GuestState s =
@@ -1032,9 +1037,10 @@ HYPERION_TEST("syscall", "readlinkat_with_a_real_dirfd_is_unimplemented") {
 }
 
 HYPERION_TEST("syscall", "readlinkat_rejects_zero_size_and_bad_pointer") {
+    hyperion::test::TempDir dir;
     MinimalSyscallHandler handler;
     FlatMemory memory = program({});
-    put_cstr(memory, kBase + 0x400, "/tmp");
+    put_cstr(memory, kBase + 0x400, dir.path().c_str());
 
     GuestState zero = syscall_state(hyperion::sysno::kReadlinkat,
                                     {hyperion::kAtFdcwd, kBase + 0x400, kBase + 0x800, 0});
@@ -1057,8 +1063,8 @@ HYPERION_TEST("syscall", "readlinkat_is_advertised_as_minimal") {
 struct TempDir {
     std::string path;
     TempDir() {
-        char tmpl[] = "/tmp/hyperion_getdents_XXXXXX";
-        char* made = ::mkdtemp(tmpl);
+        std::string tmpl = hyperion::test::temp_template("getdents");
+        char* made = ::mkdtemp(tmpl.data());
         if (made != nullptr) {
             path = made;
             const std::string child = path + "/known_entry";
@@ -1277,9 +1283,10 @@ HYPERION_TEST("syscall", "statx_bad_buffer_is_efault_and_bad_pointer_is_efault")
 }
 
 HYPERION_TEST("syscall", "statx_with_a_real_dirfd_is_unimplemented") {
+    hyperion::test::TempDir dir;
     MinimalSyscallHandler handler;
     FlatMemory memory = program({});
-    put_cstr(memory, kBase + 0x400, "/tmp");
+    put_cstr(memory, kBase + 0x400, dir.path().c_str());
 
     GuestState s =
         syscall_state(hyperion::sysno::kStatx,
@@ -1289,9 +1296,10 @@ HYPERION_TEST("syscall", "statx_with_a_real_dirfd_is_unimplemented") {
 }
 
 HYPERION_TEST("syscall", "statx_unhandled_flag_is_unimplemented") {
+    hyperion::test::TempDir dir;
     MinimalSyscallHandler handler;
     FlatMemory memory = program({});
-    put_cstr(memory, kBase + 0x400, "/tmp");
+    put_cstr(memory, kBase + 0x400, dir.path().c_str());
 
     // AT_EMPTY_PATH (0x1000) is outside the honoured set.
     GuestState s = syscall_state(hyperion::sysno::kStatx,
@@ -1547,8 +1555,8 @@ HYPERION_TEST("translation_cache", "tier1_syscall_write_matches_interpreter") {
 #endif // __aarch64__
 
 HYPERION_TEST("syscall", "zero_extended_32bit_at_fdcwd_and_unbuffered_rdwr_file_io") {
-    char tmpl[] = "/tmp/hyperion_syscall_XXXXXX";
-    const int pre_fd = ::mkstemp(tmpl);
+    std::string tmpl = hyperion::test::temp_template("syscall");
+    const int pre_fd = ::mkstemp(tmpl.data());
     HYPERION_CHECK(pre_fd >= 0);
     ::close(pre_fd);
 
@@ -1621,7 +1629,7 @@ HYPERION_TEST("syscall", "zero_extended_32bit_at_fdcwd_and_unbuffered_rdwr_file_
     HYPERION_CHECK(handler.handle(s, memory).status == SyscallStatus::kHandled);
     HYPERION_CHECK_EQ(static_cast<std::int64_t>(s.reg(Gpr::kRax)), -hyperion::kEbadf);
 
-    ::unlink(tmpl);
+    ::unlink(tmpl.c_str());
 }
 
 HYPERION_TEST("syscall", "phase6_extended_syscalls_dup_fcntl_iov_pread_uname_clock_and_tls") {

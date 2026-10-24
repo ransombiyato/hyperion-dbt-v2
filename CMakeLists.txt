@@ -53,6 +53,7 @@ add_library(hyperion_core
     src/core/version.cpp
     src/core/json.cpp
     src/core/host_probe.cpp
+    src/core/host_syscalls.cpp
     src/core/bench_stats.cpp
     src/core/guest_state.cpp
     src/core/decoder.cpp

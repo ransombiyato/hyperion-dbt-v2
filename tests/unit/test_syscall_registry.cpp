@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "harness/test_harness.hpp"
+#include "harness/test_tempdir.hpp"
 #include "hyperion/json.hpp"
 #include "hyperion/syscall_registry.hpp"
 
@@ -25,32 +26,9 @@ using hyperion::RegistryOptions;
 using hyperion::RegistryPathInfo;
 using hyperion::RegistryReport;
 using hyperion::RegistryRule;
+using hyperion::test::TempDir;
 
 namespace {
-
-// A temporary directory removed on destruction.
-class TempDir {
-public:
-    TempDir() {
-        char pattern[] = "/tmp/hyperion-registry-XXXXXX";
-        const char* made = ::mkdtemp(pattern);
-        HYPERION_CHECK(made != nullptr);
-        path_ = made;
-    }
-    ~TempDir() {
-        // Best effort: the tests assert on the files they care about.
-        const std::string command = "rm -rf '" + path_ + "'";
-        (void)std::system(command.c_str());
-    }
-    TempDir(const TempDir&) = delete;
-    TempDir& operator=(const TempDir&) = delete;
-
-    std::string file(const std::string& name) const { return path_ + "/" + name; }
-    const std::string& path() const { return path_; }
-
-private:
-    std::string path_;
-};
 
 // Set an environment variable for the duration of a scope.
 class ScopedEnv {
