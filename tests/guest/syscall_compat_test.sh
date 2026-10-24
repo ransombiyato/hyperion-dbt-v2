@@ -45,7 +45,7 @@ else
     exit 1
 fi
 
-for name in compat_syscalls syscall_custom; do
+for name in compat_syscalls syscall_custom fork_rule_inherit; do
     if ! ${CC} -O2 -static -o "${WORK}/${name}" "${FIXTURE_SRC}/${name}.c" 2>"${WORK}/cc.err"; then
         echo "syscall compat tests: cannot compile ${name}.c with '${CC}'" >&2
         sed 's/^/  /' "${WORK}/cc.err" >&2
@@ -55,7 +55,7 @@ done
 
 # The fixtures must really be static x86-64 ELFs, or this would be testing the
 # host's own execution.
-for name in compat_syscalls syscall_custom; do
+for name in compat_syscalls syscall_custom fork_rule_inherit; do
     if ! head -c 20 "${WORK}/${name}" | grep -q 'ELF'; then
         echo "syscall compat tests: ${name} is not an ELF" >&2
         exit 1
@@ -163,6 +163,19 @@ if [ "${out}" = "custom=OK" ]; then
 else
     fail "user rule did not take effect (guest printed '${out}')"
     sed 's/^/  stderr: /' "${WORK}/err3" >&2
+fi
+
+# --- 4b. a forked child keeps the parent's rules -----------------------------
+#
+# The child is a separate host process with its own syscall handler. It must use
+# the same compiled rules as the parent rather than silently falling back to the
+# built-ins.
+out="$(run "${WORK}/fork_rule_inherit" 2>"${WORK}/err3b")"
+if [ "${out}" = "parent=1 child=1" ]; then
+    pass "a forked child inherits the parent's registry rules"
+else
+    fail "a forked child did not inherit the registry rules (guest printed '${out}')"
+    sed 's/^/  stderr: /' "${WORK}/err3b" >&2
 fi
 
 # --- 5. removing the rule removes the behaviour ------------------------------

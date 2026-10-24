@@ -26,6 +26,8 @@ using hyperion::MinimalSyscallHandler;
 using hyperion::RegistryOptions;
 using hyperion::RegistryReport;
 using hyperion::RegistryRule;
+using hyperion::RuleImplementation;
+using hyperion::RuleOrigin;
 using hyperion::SyscallStatus;
 
 namespace {
@@ -504,4 +506,96 @@ HYPERION_TEST("dispatch", "summary_names_the_unsupported_syscalls") {
     HYPERION_CHECK(summary.find("unsupported=2") != std::string::npos);
     HYPERION_CHECK(summary.find("451") != std::string::npos);
     HYPERION_CHECK(summary.find("futex") != std::string::npos);
+}
+
+// --- fork(2) inheritance ----------------------------------------------------
+//
+// A child process builds its own handler. Before this was fixed it started with
+// the built-in rules only, so a rule from the user's registry worked in the
+// parent and silently became -ENOSYS after fork(2) - a failure that looks like
+// an unrelated bug in the child. The child adopts the parent's immutable
+// snapshot instead of re-reading the file (which would be slow and racy against a
+// concurrent reload).
+
+namespace {
+
+// A registry document with one user rule mapping syscall 300 onto getpid(2).
+RegistryRule custom_rule() {
+    RegistryRule rule;
+    rule.id = "user.test.fork_inherit";
+    rule.name = "custom300";
+    rule.syscall = 300;
+    rule.implementation = hyperion::RuleImplementation::kGuestAlias;
+    rule.target_syscall = 39; // getpid
+    rule.origin = hyperion::RuleOrigin::kUser;
+    rule.rule_version = 1;
+    rule.enabled = true;
+    return rule;
+}
+
+} // namespace
+
+HYPERION_TEST("syscall_dispatch", "child_adopts_the_parents_compiled_rules") {
+    TempDir dir;
+    const std::string path = dir.file("registry.json");
+    hyperion::RegistryDocument document;
+    document.schema_version = hyperion::kRegistrySchemaVersion;
+    document.guest_arch = "x86_64";
+    document.rules.push_back(custom_rule());
+    std::string write_error;
+    HYPERION_CHECK(hyperion::write_registry_atomic(path, document, write_error));
+
+    MinimalSyscallHandler parent({}, nullptr);
+    RegistryOptions options;
+    options.use_environment = false;
+    options.explicit_path = path;
+    std::string message;
+    HYPERION_CHECK_EQ(parent.reload_syscall_registry(options, message), 0);
+    HYPERION_CHECK(parent.dispatcher().lookup(300) != nullptr);
+
+    // A child handler, as process.cpp builds it, knows nothing about the file.
+    MinimalSyscallHandler child({}, nullptr);
+    HYPERION_CHECK(child.dispatcher().lookup(300) == nullptr);
+
+    hyperion::SyscallAccess::inherit_compiled_rules(child, parent);
+    const auto* inherited = child.dispatcher().lookup(300);
+    HYPERION_CHECK(inherited != nullptr);
+    HYPERION_CHECK(inherited->kind == DispatchKind::kGuestAlias);
+    // The provenance travels with the snapshot, so a diagnostic in the child
+    // names the same file the parent used.
+    HYPERION_CHECK(child.dispatcher().registry_path() == path);
+    // Counters do not: they belong to the process that ran the syscall.
+    HYPERION_CHECK_EQ(child.dispatcher().counters().unsupported_events.load(), std::uint64_t{0});
+}
+
+HYPERION_TEST("syscall_dispatch", "child_inheritance_survives_a_parent_reload") {
+    TempDir dir;
+    const std::string path = dir.file("registry.json");
+    hyperion::RegistryDocument document;
+    document.schema_version = hyperion::kRegistrySchemaVersion;
+    document.guest_arch = "x86_64";
+    document.rules.push_back(custom_rule());
+    std::string write_error;
+    HYPERION_CHECK(hyperion::write_registry_atomic(path, document, write_error));
+
+    MinimalSyscallHandler parent({}, nullptr);
+    RegistryOptions options;
+    options.use_environment = false;
+    options.explicit_path = path;
+    std::string message;
+    HYPERION_CHECK_EQ(parent.reload_syscall_registry(options, message), 0);
+
+    MinimalSyscallHandler child({}, nullptr);
+    hyperion::SyscallAccess::inherit_compiled_rules(child, parent);
+
+    // The child holds the snapshot it adopted: a later reload in the parent
+    // publishes a new immutable snapshot rather than mutating the old one, so a
+    // syscall already in flight in the child cannot observe a half-swapped table.
+    hyperion::RegistryDocument empty;
+    empty.schema_version = hyperion::kRegistrySchemaVersion;
+    empty.guest_arch = "x86_64";
+    HYPERION_CHECK(hyperion::write_registry_atomic(path, empty, write_error));
+    HYPERION_CHECK_EQ(parent.reload_syscall_registry(options, message), 0);
+    HYPERION_CHECK(parent.dispatcher().lookup(300) == nullptr);
+    HYPERION_CHECK(child.dispatcher().lookup(300) != nullptr);
 }

@@ -41,6 +41,8 @@
 // the errno a real kernel would, and leaves guest state untouched.
 #include "hyperion/process.hpp"
 
+#include "hyperion/syscall_dispatch.hpp"
+
 #include <array>
 #include <cerrno>
 #include <cstdio>
@@ -392,11 +394,13 @@ namespace process {
 
 // --- child side --------------------------------------------------------------
 
-[[noreturn]] void
-run_child_prologue(const GuestState& child_state, const GuestAddressSpace& parent_space,
-                   const std::vector<GuestDescriptor>& parent_files, const std::string& sysroot,
-                   const std::string& guest_argv0, const std::string& guest_image_path, int tier,
-                   std::uint64_t max_steps, const ChildCloneSpec& spec, int vfork_write_fd) {
+[[noreturn]] void run_child_prologue(const GuestState& child_state,
+                                     const GuestAddressSpace& parent_space,
+                                     const std::vector<GuestDescriptor>& parent_files,
+                                     const std::string& sysroot, const std::string& guest_argv0,
+                                     const std::string& guest_image_path, int tier,
+                                     std::uint64_t max_steps, const ChildCloneSpec& spec,
+                                     int vfork_write_fd, const MinimalSyscallHandler& parent) {
     // Deep copy: the child gets guest memory that is genuinely its own, so a
     // later mmap/munmap on either side cannot invalidate the other's cached host
     // page pointers.
@@ -421,6 +425,11 @@ run_child_prologue(const GuestState& child_state, const GuestAddressSpace& paren
     MinimalSyscallHandler handler({}, &space);
     ProcessAccess::files(handler) = parent_files;
     handler.enable_linux_compat(sysroot);
+    // The child must answer syscalls the same way the parent did. A fresh handler
+    // starts with the built-in rules only, so without this a rule from the user's
+    // registry would work in the parent and silently degrade to -ENOSYS after
+    // fork(2) - a failure that looks like an unrelated bug in the child.
+    SyscallAccess::inherit_compiled_rules(handler, parent);
     ProcessAccess::guest_argv0(handler) = guest_argv0;
     ProcessAccess::guest_image_path(handler) = guest_image_path;
     ProcessAccess::vfork_sync_fd(handler) = vfork_write_fd;
@@ -535,7 +544,7 @@ std::int64_t do_fork_common(MinimalSyscallHandler& self, const GuestState& state
         GuestState child = child_state;
         child.gpr[static_cast<std::size_t>(Gpr::kRax)] = 0;
         run_child_prologue(child, *space, child_files, sysroot, guest_argv0, guest_image_path, tier,
-                           max_steps, spec, sync_fds[1]);
+                           max_steps, spec, sync_fds[1], self);
     }
 
     // Parent. Discard the parent's translated code before it resumes: every

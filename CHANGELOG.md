@@ -101,6 +101,14 @@ Meaningful changes by milestone. Format loosely follows
   `struct pollfd`. The overrun stayed inside the same stack frame, so every
   ordinary build passed; AddressSanitizer caught it. Fixed, and `get_u16_le` /
   `get_u32_le` / `put_u16` added so a field can be read at its own width.
+- **A forked child lost the parent's registry rules.** `src/core/process.cpp`
+  built the child's handler from scratch, so it started with the built-in rules
+  only: a user rule that worked before `fork(2)` returned `-ENOSYS` afterwards.
+  The child now adopts the parent's immutable snapshot
+  (`SyscallDispatcher::adopt_snapshot`), which is both correct and cheaper than
+  re-reading the file. Proven end-to-end by `tests/guest/fixtures/fork_rule_inherit.c`
+  — with the fix removed, the guest prints `parent=1 child=0`, so the test cannot
+  pass vacuously.
 - **`install.sh` ignored the registry.** It now creates the registry outside the
   install directory only when it is absent, validates (never overwrites) an
   existing one, and deliberately keeps user rules on `--uninstall`.

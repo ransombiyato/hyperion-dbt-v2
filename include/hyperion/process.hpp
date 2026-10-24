@@ -27,11 +27,16 @@ struct ChildCloneSpec {
 // status. Does not return. Called from the child branch of the fork inside
 // do_clone()/do_fork(), because these flags must take effect before the guest's
 // first instruction in the child executes.
-[[noreturn]] void
-run_child_prologue(const GuestState& child_state, const GuestAddressSpace& parent_space,
-                   const std::vector<GuestDescriptor>& parent_files, const std::string& sysroot,
-                   const std::string& guest_argv0, const std::string& guest_image_path, int tier,
-                   std::uint64_t max_steps, const ChildCloneSpec& spec, int vfork_write_fd);
+//
+// `parent` supplies the compiled syscall rules the child must keep using: a
+// registry rule that works before fork(2) has to keep working after it.
+[[noreturn]] void run_child_prologue(const GuestState& child_state,
+                                     const GuestAddressSpace& parent_space,
+                                     const std::vector<GuestDescriptor>& parent_files,
+                                     const std::string& sysroot, const std::string& guest_argv0,
+                                     const std::string& guest_image_path, int tier,
+                                     std::uint64_t max_steps, const ChildCloneSpec& spec,
+                                     int vfork_write_fd, const MinimalSyscallHandler& parent);
 
 // fork(2): duplicate the calling guest process. Returns the child's pid in the
 // parent and 0 in the child, or a negative errno.

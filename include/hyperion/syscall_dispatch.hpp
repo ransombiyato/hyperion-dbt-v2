@@ -227,14 +227,20 @@ struct SyscallAccess {
     static const std::string& sysroot(const MinimalSyscallHandler& handler) {
         return handler.sysroot_;
     }
+    // fork(2)/clone(2) child: inherit the parent's compiled syscall rules.
+    // Declared here and defined below, because SyscallDispatcher is incomplete at
+    // this point in the header.
+    static void inherit_compiled_rules(MinimalSyscallHandler& child,
+                                       const MinimalSyscallHandler& parent);
 };
 
 // How the top-level handler integrates with the dispatcher.
 //
 // The dispatcher owns a shared, immutable compiled-rule snapshot. A
 // MinimalSyscallHandler holds one dispatcher; fork(2)/clone(2) children build
-// their own handler but share the same process-wide snapshot, so parsing a
-// registry happens once per process, not once per child and never per syscall.
+// their own handler and adopt the parent's snapshot with adopt_snapshot(), so
+// parsing a registry happens once per process, not once per child and never per
+// syscall.
 class SyscallDispatcher {
 public:
     SyscallDispatcher();
@@ -248,6 +254,22 @@ public:
     // load, for diagnostics.
     const std::vector<std::string>& diagnostics() const noexcept { return diagnostics_; }
     const CompiledRules* rules() const noexcept { return rules_.get(); }
+
+    // Share another dispatcher's compiled-rule snapshot.
+    //
+    // Used by fork(2)/clone(2): the child is a new host process with its own
+    // handler, but it must not fall back to the built-in rules. Without this a
+    // user's registry rule works in the parent and silently stops working the
+    // moment the guest forks - which is exactly the kind of failure that looks
+    // like a different bug entirely. The child does not re-read the file: that
+    // would be slow, and racy against a concurrent reload in the parent. Only
+    // the immutable snapshot and the provenance strings are shared; counters and
+    // the unsupported set stay per-process.
+    void adopt_snapshot(const SyscallDispatcher& other) {
+        rules_ = other.rules_;
+        registry_path_ = other.registry_path_;
+        diagnostics_ = other.diagnostics_;
+    }
     const std::string& registry_path() const noexcept { return registry_path_; }
 
     // --- hot path ---------------------------------------------------------
@@ -292,6 +314,13 @@ private:
     std::vector<std::string> diagnostics_;
     std::string registry_path_;
 };
+
+inline void SyscallAccess::inherit_compiled_rules(MinimalSyscallHandler& child,
+                                                  const MinimalSyscallHandler& parent) {
+    if (child.dispatcher_ != nullptr && parent.dispatcher_ != nullptr) {
+        child.dispatcher_->adopt_snapshot(*parent.dispatcher_);
+    }
+}
 
 // Resolve the guest syscall number to its symbolic name for diagnostics.
 // Returns nullptr when the number is unknown to the built-in table.

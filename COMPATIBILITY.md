@@ -494,6 +494,10 @@ statically linked binary.
 | `ioctl` requests (`TIOCGWINSZ`, …) | request numbers and `struct winsize` differ per arch | as host | request constants are compared against the *guest's* values and the payload is built in the guest layout |
 | `epoll` timeouts | `epoll_wait`/`epoll_pwait` take the timeout **by value**, not by pointer | same | handled as a value, which a pointer-based reading would have got wrong |
 
+The compiled rule table is inherited across `fork(2)`/`vfork(2)`/`clone(2)`: a
+child process answers syscalls exactly as its parent did, because it adopts the
+parent's immutable snapshot instead of reloading the registry.
+
 Flags are translated rather than passed through where the values differ; for
 example `openat`'s `O_*` bits are mapped explicitly (`translate_open_flags`)
 instead of being assumed equal across architectures.

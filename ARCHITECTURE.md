@@ -283,6 +283,14 @@ creates it only when it is absent.
 - **Provenance:** every rule carries an `origin` (`builtin`, `package`, `user`)
   so package-shipped defaults can be updated without touching user rules, and
   the shipped defaults are merged by rule id.
+- **Children inherit the snapshot, they do not re-read the file.** `fork(2)`,
+  `vfork(2)` and the process-creating `clone(2)` produce a child with its own
+  syscall handler; that child adopts the parent's compiled rules
+  (`SyscallDispatcher::adopt_snapshot`). Reloading would be both slow and racy
+  against a reload in the parent, and doing nothing — the original behaviour —
+  meant a user rule worked before `fork` and silently returned `-ENOSYS` after
+  it. Counters and the unsupported set stay per-process, because they describe
+  what that process did.
 
 ### 6.4 Observability
 
