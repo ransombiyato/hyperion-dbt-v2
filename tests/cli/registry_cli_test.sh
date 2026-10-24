@@ -23,6 +23,12 @@ BIN="${1:?usage: registry_cli_test.sh <path-to-hyperion-binary> [emulator]}"
 # Same convention as the guest suites: an optional emulator prefix, used by the
 # cross pipeline to run the AArch64-built binary under qemu-user.
 EMULATOR="${2:-${HYPERION_EMULATOR:-}}"
+# The emulator prefix may carry arguments ("qemu-aarch64 -L /usr/aarch64-linux-gnu"),
+# so it is split into words rather than used as a single quoted command.
+EMULATOR_CMD=()
+if [ -n "${EMULATOR}" ]; then
+    read -r -a EMULATOR_CMD <<<"${EMULATOR}"
+fi
 
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
@@ -38,8 +44,8 @@ REGISTRY="${WORK}/registry.json"
 export HYPERION_SYSCALL_REGISTRY="${REGISTRY}"
 
 run() {
-    if [ -n "${EMULATOR}" ]; then
-        "${EMULATOR}" "${BIN}" syscall-registry "$@"
+    if [ "${#EMULATOR_CMD[@]}" -gt 0 ]; then
+        "${EMULATOR_CMD[@]}" "${BIN}" syscall-registry "$@"
     else
         "${BIN}" syscall-registry "$@"
     fi

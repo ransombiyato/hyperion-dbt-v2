@@ -23,7 +23,16 @@ FIXTURE="${2:?usage: elf_test.sh <hyperion-binary> <fixture.elf>}"
 EMULATOR="${HYPERION_EMULATOR:-}"
 
 TMP="$(mktemp -d)"
-trap 'rm -rf "$TMP"' EXIT
+
+# Keep the run hermetic: without this the CLI creates and reads the *user's*
+# real syscall registry under $XDG_DATA_HOME/$HOME, so the test both writes to
+# the developer's machine and changes behaviour depending on what is already
+# there. tests/harness/test_tempdir.hpp does the same for the C++ tests.
+HYPERION_TEST_ROOT="$(mktemp -d)"
+export XDG_DATA_HOME="${HYPERION_TEST_ROOT}/xdg-data"
+export HOME="${HYPERION_TEST_ROOT}/home"
+mkdir -p "$XDG_DATA_HOME" "$HOME"
+trap 'rm -rf "$HYPERION_TEST_ROOT" "$TMP"' EXIT
 
 # shellcheck disable=SC2086
 run() { $EMULATOR "$BIN" "$@"; }

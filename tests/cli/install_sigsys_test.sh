@@ -66,6 +66,14 @@ WORK="$(mktemp -d "${TMPDIR:-/tmp}/hyperion_install_sigsys.XXXXXX")"
 cleanup() { rm -rf "${WORK}"; }
 trap cleanup EXIT
 
+# The installer reads and creates the syscall registry under
+# $XDG_DATA_HOME/$HOME. Point both at the throwaway tree so a run neither
+# inspects nor writes the machine's real registry - and so the result does not
+# depend on rules somebody happened to have installed.
+export XDG_DATA_HOME="${WORK}/xdg-data"
+export HOME="${WORK}/home"
+mkdir -p "${XDG_DATA_HOME}" "${HOME}"
+
 # A throwaway source tree shaped like this repository: a CMake project with
 # `unit.native` plus whatever other tests the scenario needs, and a `scripts/`
 # directory the installer can copy from.

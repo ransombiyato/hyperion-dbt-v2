@@ -192,8 +192,13 @@ HYPERION_TEST("adapters", "chdir_and_fchdir_change_the_working_directory") {
     // the pair the test is named for; asserting only on chdir would leave
     // adapter_fchdir unverified.
     f.put_string(kBase + 0x200, cwd_guard.saved());
-    const auto opened = f.call(kSysOpenat, {static_cast<std::uint64_t>(-100), kBase + 0x200,
-                                            static_cast<std::uint64_t>(O_RDONLY | O_DIRECTORY), 0});
+    // O_DIRECTORY must be the *guest's* value (0x10000), not the host's: the
+    // guest is x86-64 whatever the translator is running on, and AArch64 hosts
+    // put O_DIRECTORY at 0x4000. Using <fcntl.h>'s constant here made the test
+    // pass on x86-64 and fail on AArch64.
+    const auto opened =
+        f.call(kSysOpenat, {static_cast<std::uint64_t>(-100), kBase + 0x200,
+                            hyperion::open_flags::kORdonly | hyperion::open_flags::kODirectory, 0});
     HYPERION_CHECK(opened.status == SyscallStatus::kHandled);
     const std::int64_t guest_dir_fd = f.result();
     HYPERION_CHECK(guest_dir_fd >= 0);

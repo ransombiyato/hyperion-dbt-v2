@@ -167,9 +167,12 @@ inline constexpr std::uint64_t kBasicStats = 0x7ff; // STATX_BASIC_STATS
 // Guest (x86-64) `struct statx` field offsets. Unlike `struct stat`, this
 // structure is built entirely from fixed-width `__u32`/`__u64` fields (the
 // kernel's UAPI forbids padding differences), so the layout is *identical* on
-// x86-64 and AArch64 and the host's bytes can be forwarded verbatim. The
-// offsets are recorded here so a test can assert them against the UAPI, and so
-// the writer is explicit rather than an unchecked struct copy.
+// x86-64 and AArch64. When the host permits statx(2) the kernel's bytes are
+// therefore forwarded verbatim; where it does not - Android before API 30, see
+// hyperion/host_syscalls.hpp - the same layout is filled from fstatat(2) by
+// write_guest_statx_from_stat(). The offsets are recorded here so a test can
+// assert them against the UAPI, and so both writers are explicit rather than
+// unchecked struct copies.
 namespace guest_statx {
 inline constexpr std::size_t kSize = 256;         // sizeof(struct statx)
 inline constexpr std::size_t kOffMask = 0;        // __u32 stx_mask

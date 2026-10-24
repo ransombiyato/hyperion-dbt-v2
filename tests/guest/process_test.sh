@@ -28,16 +28,31 @@ set -euo pipefail
 BIN="${1:?usage: process_test.sh <hyperion-binary> <fixture-dir> [emulator]}"
 FIXTURE_SRC="${2:?usage: process_test.sh <hyperion-binary> <fixture-dir> [emulator]}"
 EMULATOR="${3:-${HYPERION_EMULATOR:-}}"
+# A user-mode emulator needs arguments ("qemu-aarch64 -L /usr/aarch64-linux-gnu"),
+# so the prefix is kept as words rather than one quoted command.
+EMULATOR_CMD=()
+if [ -n "${EMULATOR}" ]; then
+    read -r -a EMULATOR_CMD <<<"${EMULATOR}"
+fi
 
 WORK="$(mktemp -d)"
-trap 'rm -rf "$WORK"' EXIT
+
+# Keep the run hermetic: without this the CLI creates and reads the *user's*
+# real syscall registry under $XDG_DATA_HOME/$HOME, so the test both writes to
+# the developer's machine and changes behaviour depending on what is already
+# there. tests/harness/test_tempdir.hpp does the same for the C++ tests.
+HYPERION_TEST_ROOT="$(mktemp -d)"
+export XDG_DATA_HOME="${HYPERION_TEST_ROOT}/xdg-data"
+export HOME="${HYPERION_TEST_ROOT}/home"
+mkdir -p "$XDG_DATA_HOME" "$HOME"
+trap 'rm -rf "$HYPERION_TEST_ROOT" "$WORK"' EXIT
 
 # Every guest run has a bound: a process regression must fail loudly rather than
 # hanging CTest forever (vfork/exec regressions used to trigger exactly that).
 GUEST_TIMEOUT="${HYPERION_GUEST_TIMEOUT:-20s}"
 run_hyperion() {
-    if [ -n "$EMULATOR" ]; then
-        timeout "$GUEST_TIMEOUT" "$EMULATOR" "$BIN" "$@"
+    if [ "${#EMULATOR_CMD[@]}" -gt 0 ]; then
+        timeout "$GUEST_TIMEOUT" "${EMULATOR_CMD[@]}" "$BIN" "$@"
     else
         timeout "$GUEST_TIMEOUT" "$BIN" "$@"
     fi

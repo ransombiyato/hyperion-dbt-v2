@@ -24,9 +24,22 @@ FIXTURE_SRC="${2:?usage: syscall_compat_test.sh <hyperion-binary> <fixture-dir> 
 # Same convention as process_test.sh: a third argument (or HYPERION_EMULATOR) is
 # a prefix command, used to run an AArch64-built hyperion under qemu-user.
 EMULATOR="${3:-${HYPERION_EMULATOR:-}}"
+EMULATOR_CMD=()
+if [ -n "${EMULATOR}" ]; then
+    read -r -a EMULATOR_CMD <<<"${EMULATOR}"
+fi
 
 WORK="$(mktemp -d)"
-trap 'rm -rf "$WORK"' EXIT
+
+# Keep the run hermetic: without this the CLI creates and reads the *user's*
+# real syscall registry under $XDG_DATA_HOME/$HOME, so the test both writes to
+# the developer's machine and changes behaviour depending on what is already
+# there. tests/harness/test_tempdir.hpp does the same for the C++ tests.
+HYPERION_TEST_ROOT="$(mktemp -d)"
+export XDG_DATA_HOME="${HYPERION_TEST_ROOT}/xdg-data"
+export HOME="${HYPERION_TEST_ROOT}/home"
+mkdir -p "$XDG_DATA_HOME" "$HOME"
+trap 'rm -rf "$HYPERION_TEST_ROOT" "$WORK"' EXIT
 
 GUEST_TIMEOUT="${HYPERION_GUEST_TIMEOUT:-60s}"
 REGISTRY="${WORK}/registry.json"
@@ -73,8 +86,8 @@ done
 # Every guest run goes through this helper, so the emulator and the tier apply to
 # all of them - including the ones run with the registry disabled.
 run() {
-    if [ -n "${EMULATOR}" ]; then
-        timeout "${GUEST_TIMEOUT}" "${EMULATOR}" "${BIN}" run --quiet \
+    if [ "${#EMULATOR_CMD[@]}" -gt 0 ]; then
+        timeout "${GUEST_TIMEOUT}" "${EMULATOR_CMD[@]}" "${BIN}" run --quiet \
             --tier="${HYPERION_TIER:-0}" "$@"
     else
         timeout "${GUEST_TIMEOUT}" "${BIN}" run --quiet --tier="${HYPERION_TIER:-0}" "$@"

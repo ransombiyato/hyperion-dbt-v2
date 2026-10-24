@@ -24,7 +24,16 @@ EMULATOR="${HYPERION_EMULATOR:-}"
 BLOB="$(mktemp)"
 ERRFILE="$(mktemp)"
 STATIC_ELF="$(mktemp)"
-trap 'rm -f "$BLOB" "$ERRFILE" "$STATIC_ELF"' EXIT
+
+# Keep the run hermetic: without this the CLI creates and reads the *user's*
+# real syscall registry under $XDG_DATA_HOME/$HOME, so the test both writes to
+# the developer's machine and changes behaviour depending on what is already
+# there. tests/harness/test_tempdir.hpp does the same for the C++ tests.
+HYPERION_TEST_ROOT="$(mktemp -d)"
+export XDG_DATA_HOME="${HYPERION_TEST_ROOT}/xdg-data"
+export HOME="${HYPERION_TEST_ROOT}/home"
+mkdir -p "$XDG_DATA_HOME" "$HOME"
+trap 'rm -rf "$HYPERION_TEST_ROOT"; rm -f "$BLOB" "$ERRFILE" "$STATIC_ELF"' EXIT
 
 # mov ecx, 5 ; add rbx, rax ; dec rcx ; jnz -5 ; hlt
 printf '\xB9\x05\x00\x00\x00\x48\x01\xC3\x48\xFF\xC9\x75\xF8\xF4' > "$BLOB"
