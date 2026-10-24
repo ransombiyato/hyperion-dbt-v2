@@ -37,8 +37,8 @@
 #include <sys/resource.h>
 #include <sys/select.h>
 #include <sys/stat.h>
-#include <sys/timerfd.h>
 #include <sys/time.h>
+#include <sys/timerfd.h>
 #include <sys/times.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -54,10 +54,10 @@ namespace {
 // Guest-visible struct sizes. `struct epoll_event` is the one layout that
 // genuinely differs; the rest are listed so a future ABI change is caught by a
 // test rather than by a silently corrupted field.
-constexpr std::size_t kGuestEpollEventSize = 12;   // x86-64: packed {u32 events; u64 data}
+constexpr std::size_t kGuestEpollEventSize = 12; // x86-64: packed {u32 events; u64 data}
 constexpr std::size_t kGuestEpollEventDataOffset = 4;
-constexpr std::size_t kGuestPollfdSize = 8;        // {int fd; short events; short revents}
-constexpr std::size_t kGuestFdSetSize = 128;       // 1024 bits
+constexpr std::size_t kGuestPollfdSize = 8;  // {int fd; short events; short revents}
+constexpr std::size_t kGuestFdSetSize = 128; // 1024 bits
 constexpr int kGuestFdSetMax = 1024;
 constexpr std::size_t kGuestRusageSize = 144;
 constexpr std::size_t kGuestItimervalSize = 32;
@@ -66,7 +66,9 @@ constexpr std::size_t kGuestSchedParamSize = 4;
 constexpr std::size_t kGuestTimespecSize = 16;
 constexpr std::size_t kGuestTimevalSize = 16;
 
-std::int64_t errno_result() { return -static_cast<std::int64_t>(errno == 0 ? kEio : errno); }
+std::int64_t errno_result() {
+    return -static_cast<std::int64_t>(errno == 0 ? kEio : errno);
+}
 
 std::uint32_t get_u32_le(const std::uint8_t* p) {
     std::uint32_t v = 0;
@@ -279,7 +281,7 @@ std::int64_t adapter_sched_yield(SyscallContext&) {
 // validated guest memory.
 std::int64_t adapter_sched_getparam(SyscallContext& ctx) {
     const auto pid = static_cast<pid_t>(ctx.arg_i32(0));
-    struct sched_param param {};
+    struct sched_param param{};
     if (::sched_getparam(pid, &param) != 0) {
         return errno_result();
     }
@@ -298,7 +300,7 @@ std::int64_t adapter_sched_setscheduler(SyscallContext& ctx) {
     if (!ctx.copy_in(ctx.arg(2), raw, sizeof(raw))) {
         return -kEfault;
     }
-    struct sched_param param {};
+    struct sched_param param{};
     param.sched_priority = static_cast<int>(get_u32_le(raw));
     if (::sched_setscheduler(pid, policy, &param) != 0) {
         return errno_result();
@@ -336,7 +338,7 @@ std::int64_t adapter_sched_get_priority_min(SyscallContext& ctx) {
 // cannot write past what the guest allocated.
 std::int64_t adapter_getrusage(SyscallContext& ctx) {
     const int who = ctx.arg_i32(0);
-    struct rusage usage {};
+    struct rusage usage{};
     if (::getrusage(who, &usage) != 0) {
         return errno_result();
     }
@@ -405,7 +407,7 @@ std::int64_t adapter_membarrier(SyscallContext& ctx) {
 // times(buf): returns the clock tick count and fills `struct tms` (four longs,
 // identical layout on both ABIs).
 std::int64_t adapter_times(SyscallContext& ctx) {
-    struct tms info {};
+    struct tms info{};
     const clock_t ticks = ::times(&info);
     if (ticks == static_cast<clock_t>(-1)) {
         return errno_result();
@@ -429,7 +431,7 @@ std::int64_t adapter_times(SyscallContext& ctx) {
 // written through guest memory so a bad pointer is -EFAULT rather than a crash.
 std::int64_t adapter_getitimer(SyscallContext& ctx) {
     const int which = ctx.arg_i32(0);
-    struct itimerval current {};
+    struct itimerval current{};
     if (::getitimer(which, &current) != 0) {
         return errno_result();
     }
@@ -445,11 +447,11 @@ std::int64_t adapter_getitimer(SyscallContext& ctx) {
 
 std::int64_t adapter_setitimer(SyscallContext& ctx) {
     const int which = ctx.arg_i32(0);
-    struct itimerval wanted {};
+    struct itimerval wanted{};
     if (!ctx.copy_in(ctx.arg(1), &wanted, sizeof(wanted))) {
         return -kEfault;
     }
-    struct itimerval previous {};
+    struct itimerval previous{};
     if (::setitimer(which, &wanted, &previous) != 0) {
         return errno_result();
     }
@@ -581,11 +583,11 @@ std::int64_t adapter_timerfd_settime(SyscallContext& ctx) {
     if ((flags & ~kKnown) != 0) {
         return -kEinval;
     }
-    struct itimerspec wanted {};
+    struct itimerspec wanted{};
     if (!ctx.copy_in(ctx.arg(2), &wanted, sizeof(wanted))) {
         return -kEfault;
     }
-    struct itimerspec previous {};
+    struct itimerspec previous{};
     if (::timerfd_settime(static_cast<int>(host), static_cast<int>(flags), &wanted, &previous) !=
         0) {
         return errno_result();
@@ -601,7 +603,7 @@ std::int64_t adapter_timerfd_gettime(SyscallContext& ctx) {
     if (host < 0) {
         return host;
     }
-    struct itimerspec current {};
+    struct itimerspec current{};
     if (::timerfd_gettime(static_cast<int>(host), &current) != 0) {
         return errno_result();
     }
@@ -614,13 +616,12 @@ std::int64_t adapter_timerfd_gettime(SyscallContext& ctx) {
 // --- epoll --------------------------------------------------------------------
 
 // Translate one guest `struct epoll_event` (12 packed bytes) into the host layout.
-bool read_guest_epoll_event(SyscallContext& ctx, std::uint64_t address,
-                            struct epoll_event& out) {
+bool read_guest_epoll_event(SyscallContext& ctx, std::uint64_t address, struct epoll_event& out) {
     std::uint8_t raw[kGuestEpollEventSize] = {};
     if (!ctx.copy_in(address, raw, sizeof(raw))) {
         return false;
     }
-    out.events = static_cast<std::uint32_t>(syscall_detail::get_u64_le(raw) & 0xFFFFFFFFULL);
+    out.events = syscall_detail::get_u32_le(raw);
     out.data.u64 = syscall_detail::get_u64_le(raw + kGuestEpollEventDataOffset);
     return true;
 }
@@ -649,7 +650,7 @@ std::int64_t adapter_epoll_ctl(SyscallContext& ctx) {
     if (fd < 0) {
         return fd;
     }
-    struct epoll_event event {};
+    struct epoll_event event{};
     if (op != kEpollCtlDel) {
         // A NULL event is only legal for EPOLL_CTL_DEL; anything else must read
         // the guest's descriptor, and an unreadable pointer is -EFAULT.
@@ -669,8 +670,7 @@ std::int64_t adapter_epoll_ctl(SyscallContext& ctx) {
 // Shared body of epoll_pwait (millisecond timeout) and epoll_pwait2 (guest
 // timespec timeout). The guest's epoll_event array is 12 packed bytes per entry;
 // the host's is 16, so entries are converted one at a time and never memcpy'd.
-std::int64_t epoll_wait_common(SyscallContext& ctx, bool timespec_timeout,
-                               bool has_sigmask_args) {
+std::int64_t epoll_wait_common(SyscallContext& ctx, bool timespec_timeout, bool has_sigmask_args) {
     const std::int64_t epfd = ctx.host_fd(ctx.arg_i32(0));
     if (epfd < 0) {
         return epfd;
@@ -704,7 +704,7 @@ std::int64_t epoll_wait_common(SyscallContext& ctx, bool timespec_timeout,
     if (timespec_timeout) {
         // epoll_pwait2(2) is the only variant whose timeout is a pointer.
         if (timeout_address != 0) {
-            struct timespec spec {};
+            struct timespec spec{};
             if (!ctx.copy_in(timeout_address, &spec, kGuestTimespecSize)) {
                 return -kEfault;
             }
@@ -726,8 +726,8 @@ std::int64_t epoll_wait_common(SyscallContext& ctx, bool timespec_timeout,
     }
 
     std::vector<struct epoll_event> host_events(static_cast<std::size_t>(maxevents));
-    const int ready = ::epoll_wait(static_cast<int>(epfd), host_events.data(), maxevents,
-                                   timeout_ms);
+    const int ready =
+        ::epoll_wait(static_cast<int>(epfd), host_events.data(), maxevents, timeout_ms);
     if (ready < 0) {
         return errno_result();
     }
@@ -776,10 +776,11 @@ std::int64_t poll_common(SyscallContext& ctx, int timeout_ms) {
                          sizeof(raw))) {
             return -kEfault;
         }
-        const std::int32_t guest_fd = static_cast<std::int32_t>(
-            static_cast<std::uint32_t>(syscall_detail::get_u64_le(raw) & 0xFFFFFFFFULL));
-        const auto events = static_cast<std::int16_t>(
-            static_cast<std::uint16_t>(syscall_detail::get_u64_le(raw + 4) & 0xFFFFULL));
+        // struct pollfd is exactly 8 bytes: int fd; short events; short revents.
+        // Read each field with a reader of its own width - a 64-bit read of the
+        // 16-bit `events` field ran four bytes past the end of `raw`.
+        const std::int32_t guest_fd = static_cast<std::int32_t>(syscall_detail::get_u32_le(raw));
+        const auto events = static_cast<std::int16_t>(syscall_detail::get_u16_le(raw + 4));
         guest_fds_backup[static_cast<std::size_t>(i)] = guest_fd;
         if (guest_fd < 0) {
             host_fds[static_cast<std::size_t>(i)].fd = -1;
@@ -800,15 +801,12 @@ std::int64_t poll_common(SyscallContext& ctx, int timeout_ms) {
     for (std::int32_t i = 0; i < nfds; ++i) {
         const std::size_t index = static_cast<std::size_t>(i);
         std::uint8_t raw[kGuestPollfdSize] = {};
-        syscall_detail::put_u32(raw, 0,
-                                static_cast<std::uint32_t>(guest_fds_backup[index]));
+        syscall_detail::put_u32(raw, 0, static_cast<std::uint32_t>(guest_fds_backup[index]));
         // struct pollfd { int fd; short events; short revents; }
         // `events` is an input the kernel leaves alone, so it is written back
         // unchanged rather than dropped.
-        syscall_detail::put_u32(raw, 4, static_cast<std::uint32_t>(
-                                            static_cast<std::uint16_t>(host_fds[index].events)));
-        syscall_detail::put_u32(raw, 6, static_cast<std::uint32_t>(
-                                            static_cast<std::uint16_t>(host_fds[index].revents)));
+        syscall_detail::put_u16(raw, 4, static_cast<std::uint16_t>(host_fds[index].events));
+        syscall_detail::put_u16(raw, 6, static_cast<std::uint16_t>(host_fds[index].revents));
         if (!ctx.copy_out(fds_address + static_cast<std::uint64_t>(i) * kGuestPollfdSize, raw,
                           sizeof(raw))) {
             return -kEfault;
@@ -817,7 +815,9 @@ std::int64_t poll_common(SyscallContext& ctx, int timeout_ms) {
     return static_cast<std::int64_t>(ready);
 }
 
-std::int64_t adapter_poll(SyscallContext& ctx) { return poll_common(ctx, ctx.arg_i32(2)); }
+std::int64_t adapter_poll(SyscallContext& ctx) {
+    return poll_common(ctx, ctx.arg_i32(2));
+}
 
 std::int64_t adapter_ppoll(SyscallContext& ctx) {
     const std::uint64_t timeout_address = ctx.arg(2);
@@ -828,7 +828,7 @@ std::int64_t adapter_ppoll(SyscallContext& ctx) {
     }
     int timeout_ms = -1;
     if (timeout_address != 0) {
-        struct timespec spec {};
+        struct timespec spec{};
         if (!ctx.copy_in(timeout_address, &spec, kGuestTimespecSize)) {
             return -kEfault;
         }
@@ -849,9 +849,9 @@ std::int64_t adapter_ppoll(SyscallContext& ctx) {
 // host call runs on host descriptors, and the result is mapped back by scanning
 // the same guest range again.
 struct SelectSets {
-    fd_set read_set {};
-    fd_set write_set {};
-    fd_set except_set {};
+    fd_set read_set{};
+    fd_set write_set{};
+    fd_set except_set{};
     bool has_read = false;
     bool has_write = false;
     bool has_except = false;
@@ -922,12 +922,12 @@ std::int64_t select_common(SyscallContext& ctx, bool pselect) {
         }
     }
 
-    struct timeval timeout {};
+    struct timeval timeout{};
     struct timeval* timeout_ptr = nullptr;
     int host_timeout_ms = -1;
     if (timeout_address != 0) {
         if (pselect) {
-            struct timespec spec {};
+            struct timespec spec{};
             if (!ctx.copy_in(timeout_address, &spec, kGuestTimespecSize)) {
                 return -kEfault;
             }
@@ -978,16 +978,16 @@ std::int64_t select_common(SyscallContext& ctx, bool pselect) {
         }
         const auto host_index = static_cast<std::size_t>(host);
         if (FD_ISSET(static_cast<int>(host_index), &host_sets.read_set)) {
-            out_read[static_cast<std::size_t>(fd) / 8] |= static_cast<std::uint8_t>(
-                1U << (static_cast<unsigned>(fd) % 8));
+            out_read[static_cast<std::size_t>(fd) / 8] |=
+                static_cast<std::uint8_t>(1U << (static_cast<unsigned>(fd) % 8));
         }
         if (FD_ISSET(static_cast<int>(host_index), &host_sets.write_set)) {
-            out_write[static_cast<std::size_t>(fd) / 8] |= static_cast<std::uint8_t>(
-                1U << (static_cast<unsigned>(fd) % 8));
+            out_write[static_cast<std::size_t>(fd) / 8] |=
+                static_cast<std::uint8_t>(1U << (static_cast<unsigned>(fd) % 8));
         }
         if (FD_ISSET(static_cast<int>(host_index), &host_sets.except_set)) {
-            out_except[static_cast<std::size_t>(fd) / 8] |= static_cast<std::uint8_t>(
-                1U << (static_cast<unsigned>(fd) % 8));
+            out_except[static_cast<std::size_t>(fd) / 8] |=
+                static_cast<std::uint8_t>(1U << (static_cast<unsigned>(fd) % 8));
         }
     }
     if (read_address != 0 && !ctx.copy_out(read_address, out_read, kGuestFdSetSize)) {
@@ -1002,292 +1002,94 @@ std::int64_t select_common(SyscallContext& ctx, bool pselect) {
     return static_cast<std::int64_t>(ready);
 }
 
-std::int64_t adapter_select(SyscallContext& ctx) { return select_common(ctx, false); }
-std::int64_t adapter_pselect6(SyscallContext& ctx) { return select_common(ctx, true); }
+std::int64_t adapter_select(SyscallContext& ctx) {
+    return select_common(ctx, false);
+}
+std::int64_t adapter_pselect6(SyscallContext& ctx) {
+    return select_common(ctx, true);
+}
 
 // --- the compiled-in whitelist ------------------------------------------------
 
 const AdapterDescriptor kAdapterTable[] = {
-    {"compat.poll",
-     7,
-     "poll",
-     adapter_poll,
-     kAdapterNone,
-     "poll(2) over an arbitrary set of guest descriptors",
-     kPollWait},
-    {"compat.select",
-     23,
-     "select",
-     adapter_select,
-     kAdapterNone,
-     "select(2) with guest/host descriptor translation",
-     kSelectWait},
-    {"compat.sched_yield",
-     24,
-     "sched_yield",
-     adapter_sched_yield,
-     kAdapterNone,
-     "yield the processor",
-     nullptr},
-    {"compat.getitimer",
-     36,
-     "getitimer",
-     adapter_getitimer,
-     kAdapterNone,
-     "read an interval timer",
+    {"compat.poll", 7, "poll", adapter_poll, kAdapterNone,
+     "poll(2) over an arbitrary set of guest descriptors", kPollWait},
+    {"compat.select", 23, "select", adapter_select, kAdapterNone,
+     "select(2) with guest/host descriptor translation", kSelectWait},
+    {"compat.sched_yield", 24, "sched_yield", adapter_sched_yield, kAdapterNone,
+     "yield the processor", nullptr},
+    {"compat.getitimer", 36, "getitimer", adapter_getitimer, kAdapterNone, "read an interval timer",
      kItimer},
-    {"compat.setitimer",
-     38,
-     "setitimer",
-     adapter_setitimer,
-     kAdapterNone,
-     "arm an interval timer",
+    {"compat.setitimer", 38, "setitimer", adapter_setitimer, kAdapterNone, "arm an interval timer",
      kItimer},
-    {"compat.fsync",
-     74,
-     "fsync",
-     adapter_fsync,
-     kAdapterNone,
-     "flush a descriptor to stable storage",
-     kFdOnly},
-    {"compat.fdatasync",
-     75,
-     "fdatasync",
-     adapter_fdatasync,
-     kAdapterNone,
-     "flush data (not metadata) to stable storage",
-     kFdOnly},
-    {"compat.truncate",
-     76,
-     "truncate",
-     adapter_truncate,
-     kAdapterNone,
-     "truncate a path to a length",
+    {"compat.fsync", 74, "fsync", adapter_fsync, kAdapterNone,
+     "flush a descriptor to stable storage", kFdOnly},
+    {"compat.fdatasync", 75, "fdatasync", adapter_fdatasync, kAdapterNone,
+     "flush data (not metadata) to stable storage", kFdOnly},
+    {"compat.truncate", 76, "truncate", adapter_truncate, kAdapterNone,
+     "truncate a path to a length", kPathOnly},
+    {"compat.ftruncate", 77, "ftruncate", adapter_ftruncate, kAdapterNone,
+     "truncate a descriptor to a length", kFdOnly},
+    {"compat.chdir", 80, "chdir", adapter_chdir, kAdapterNone, "change the working directory",
      kPathOnly},
-    {"compat.ftruncate",
-     77,
-     "ftruncate",
-     adapter_ftruncate,
-     kAdapterNone,
-     "truncate a descriptor to a length",
-     kFdOnly},
-    {"compat.chdir",
-     80,
-     "chdir",
-     adapter_chdir,
-     kAdapterNone,
-     "change the working directory",
-     kPathOnly},
-    {"compat.fchdir",
-     81,
-     "fchdir",
-     adapter_fchdir,
-     kAdapterNone,
-     "change the working directory to a descriptor's directory",
-     kFdOnly},
-    {"compat.umask",
-     95,
-     "umask",
-     adapter_umask,
-     kAdapterNone,
-     "set and return the file mode creation mask",
-     nullptr},
-    {"compat.getrusage",
-     98,
-     "getrusage",
-     adapter_getrusage,
-     kAdapterNone,
-     "report resource usage",
+    {"compat.fchdir", 81, "fchdir", adapter_fchdir, kAdapterNone,
+     "change the working directory to a descriptor's directory", kFdOnly},
+    {"compat.umask", 95, "umask", adapter_umask, kAdapterNone,
+     "set and return the file mode creation mask", nullptr},
+    {"compat.getrusage", 98, "getrusage", adapter_getrusage, kAdapterNone, "report resource usage",
      kRusageList},
-    {"compat.times",
-     100,
-     "times",
-     adapter_times,
-     kAdapterNone,
-     "report process and child times",
+    {"compat.times", 100, "times", adapter_times, kAdapterNone, "report process and child times",
      kTimesList},
-    {"compat.setpgid",
-     109,
-     "setpgid",
-     adapter_setpgid,
-     kAdapterNone,
-     "set a process group",
+    {"compat.setpgid", 109, "setpgid", adapter_setpgid, kAdapterNone, "set a process group",
      nullptr},
-    {"compat.getpgrp",
-     111,
-     "getpgrp",
-     adapter_getpgrp,
-     kAdapterNone,
-     "return the process group",
+    {"compat.getpgrp", 111, "getpgrp", adapter_getpgrp, kAdapterNone, "return the process group",
      nullptr},
-    {"compat.setsid",
-     112,
-     "setsid",
-     adapter_setsid,
-     kAdapterNone,
-     "create a new session",
+    {"compat.setsid", 112, "setsid", adapter_setsid, kAdapterNone, "create a new session", nullptr},
+    {"compat.getpgid", 121, "getpgid", adapter_getpgid, kAdapterNone, "return a process's group",
      nullptr},
-    {"compat.getpgid",
-     121,
-     "getpgid",
-     adapter_getpgid,
-     kAdapterNone,
-     "return a process's group",
-     nullptr},
-    {"compat.sched_getparam",
-     143,
-     "sched_getparam",
-     adapter_sched_getparam,
-     kAdapterNone,
-     "read a scheduling parameter block",
-     kSchedParamList},
-    {"compat.sched_setscheduler",
-     144,
-     "sched_setscheduler",
-     adapter_sched_setscheduler,
-     kAdapterNone,
-     "set the scheduling policy and parameters",
-     kSchedParamList},
-    {"compat.sched_getscheduler",
-     145,
-     "sched_getscheduler",
-     adapter_sched_getscheduler,
-     kAdapterNone,
-     "read the scheduling policy",
-     nullptr},
-    {"compat.sched_get_priority_max",
-     146,
-     "sched_get_priority_max",
-     adapter_sched_get_priority_max,
-     kAdapterNone,
-     "read the maximum priority for a policy",
-     nullptr},
-    {"compat.sched_get_priority_min",
-     147,
-     "sched_get_priority_min",
-     adapter_sched_get_priority_min,
-     kAdapterNone,
-     "read the minimum priority for a policy",
-     nullptr},
-    {"compat.sync",
-     162,
-     "sync",
-     adapter_sync,
-     kAdapterNone,
-     "flush all filesystems",
-     nullptr},
-    {"compat.epoll_wait",
-     232,
-     "epoll_wait",
-     adapter_epoll_wait,
-     kAdapterNone,
-     "wait for epoll events (millisecond timeout)",
-     kEpollWait},
-    {"compat.epoll_ctl",
-     233,
-     "epoll_ctl",
-     adapter_epoll_ctl,
-     kAdapterNone,
-     "add/modify/remove a guest descriptor from an epoll set",
-     kEpollCtl},
-    {"compat.linkat",
-     265,
-     "linkat",
-     adapter_linkat,
-     kAdapterNone,
-     "create a hard link relative to directory descriptors",
-     kPathAndBuffer},
-    {"compat.symlinkat",
-     266,
-     "symlinkat",
-     adapter_symlinkat,
-     kAdapterNone,
-     "create a symbolic link relative to a directory descriptor",
-     kPathAndBuffer},
-    {"compat.pselect6",
-     270,
-     "pselect6",
-     adapter_pselect6,
-     kAdapterNone,
-     "pselect(2) with guest/host descriptor translation",
-     kSelectWait},
-    {"compat.ppoll",
-     271,
-     "ppoll",
-     adapter_ppoll,
-     kAdapterNone,
-     "ppoll(2) with a timespec timeout",
+    {"compat.sched_getparam", 143, "sched_getparam", adapter_sched_getparam, kAdapterNone,
+     "read a scheduling parameter block", kSchedParamList},
+    {"compat.sched_setscheduler", 144, "sched_setscheduler", adapter_sched_setscheduler,
+     kAdapterNone, "set the scheduling policy and parameters", kSchedParamList},
+    {"compat.sched_getscheduler", 145, "sched_getscheduler", adapter_sched_getscheduler,
+     kAdapterNone, "read the scheduling policy", nullptr},
+    {"compat.sched_get_priority_max", 146, "sched_get_priority_max", adapter_sched_get_priority_max,
+     kAdapterNone, "read the maximum priority for a policy", nullptr},
+    {"compat.sched_get_priority_min", 147, "sched_get_priority_min", adapter_sched_get_priority_min,
+     kAdapterNone, "read the minimum priority for a policy", nullptr},
+    {"compat.sync", 162, "sync", adapter_sync, kAdapterNone, "flush all filesystems", nullptr},
+    {"compat.epoll_wait", 232, "epoll_wait", adapter_epoll_wait, kAdapterNone,
+     "wait for epoll events (millisecond timeout)", kEpollWait},
+    {"compat.epoll_ctl", 233, "epoll_ctl", adapter_epoll_ctl, kAdapterNone,
+     "add/modify/remove a guest descriptor from an epoll set", kEpollCtl},
+    {"compat.linkat", 265, "linkat", adapter_linkat, kAdapterNone,
+     "create a hard link relative to directory descriptors", kPathAndBuffer},
+    {"compat.symlinkat", 266, "symlinkat", adapter_symlinkat, kAdapterNone,
+     "create a symbolic link relative to a directory descriptor", kPathAndBuffer},
+    {"compat.pselect6", 270, "pselect6", adapter_pselect6, kAdapterNone,
+     "pselect(2) with guest/host descriptor translation", kSelectWait},
+    {"compat.ppoll", 271, "ppoll", adapter_ppoll, kAdapterNone, "ppoll(2) with a timespec timeout",
      kPollWait},
-    {"compat.epoll_pwait",
-     281,
-     "epoll_pwait",
-     adapter_epoll_pwait,
-     kAdapterNone,
-     "wait for epoll events (millisecond timeout)",
-     kEpollWait},
-    {"compat.timerfd_create",
-     283,
-     "timerfd_create",
-     adapter_timerfd_create,
-     kAdapterNone,
-     "create a timer that reports expirations through a descriptor",
-     kFdOnly},
-    {"compat.timerfd_settime",
-     286,
-     "timerfd_settime",
-     adapter_timerfd_settime,
-     kAdapterNone,
-     "arm or disarm a timerfd",
-     kTimerfdSet},
-    {"compat.timerfd_gettime",
-     287,
-     "timerfd_gettime",
-     adapter_timerfd_gettime,
-     kAdapterNone,
-     "read the remaining time of a timerfd",
-     kFdAndBuffer},
-    {"compat.eventfd2",
-     290,
-     "eventfd2",
-     adapter_eventfd2,
-     kAdapterNone,
-     "create an event notification descriptor",
-     kFdOnly},
-    {"compat.epoll_create1",
-     291,
-     "epoll_create1",
-     adapter_epoll_create1,
-     kAdapterNone,
-     "create an epoll instance",
-     kFdOnly},
-    {"compat.syncfs",
-     306,
-     "syncfs",
-     adapter_syncfs,
-     kAdapterNone,
-     "flush the filesystem containing a descriptor",
-     kFdOnly},
-    {"compat.memfd_create",
-     319,
-     "memfd_create",
-     adapter_memfd_create,
-     kAdapterNone,
-     "create an anonymous memory-backed file",
-     kFdOnly},
-    {"compat.membarrier",
-     324,
-     "membarrier",
-     adapter_membarrier,
-     kAdapterNone,
-     "issue a memory barrier",
-     nullptr},
-    {"compat.epoll_pwait2",
-     441,
-     "epoll_pwait2",
-     adapter_epoll_pwait2,
-     kAdapterNone,
-     "wait for epoll events (nanosecond timeout)",
-     kEpollWaitMasked},
+    {"compat.epoll_pwait", 281, "epoll_pwait", adapter_epoll_pwait, kAdapterNone,
+     "wait for epoll events (millisecond timeout)", kEpollWait},
+    {"compat.timerfd_create", 283, "timerfd_create", adapter_timerfd_create, kAdapterNone,
+     "create a timer that reports expirations through a descriptor", kFdOnly},
+    {"compat.timerfd_settime", 286, "timerfd_settime", adapter_timerfd_settime, kAdapterNone,
+     "arm or disarm a timerfd", kTimerfdSet},
+    {"compat.timerfd_gettime", 287, "timerfd_gettime", adapter_timerfd_gettime, kAdapterNone,
+     "read the remaining time of a timerfd", kFdAndBuffer},
+    {"compat.eventfd2", 290, "eventfd2", adapter_eventfd2, kAdapterNone,
+     "create an event notification descriptor", kFdOnly},
+    {"compat.epoll_create1", 291, "epoll_create1", adapter_epoll_create1, kAdapterNone,
+     "create an epoll instance", kFdOnly},
+    {"compat.syncfs", 306, "syncfs", adapter_syncfs, kAdapterNone,
+     "flush the filesystem containing a descriptor", kFdOnly},
+    {"compat.memfd_create", 319, "memfd_create", adapter_memfd_create, kAdapterNone,
+     "create an anonymous memory-backed file", kFdOnly},
+    {"compat.membarrier", 324, "membarrier", adapter_membarrier, kAdapterNone,
+     "issue a memory barrier", nullptr},
+    {"compat.epoll_pwait2", 441, "epoll_pwait2", adapter_epoll_pwait2, kAdapterNone,
+     "wait for epoll events (nanosecond timeout)", kEpollWaitMasked},
 };
 
 constexpr std::size_t kAdapterCount = sizeof(kAdapterTable) / sizeof(kAdapterTable[0]);
@@ -1300,28 +1102,94 @@ struct NameEntry {
 };
 
 const NameEntry kExistingNames[] = {
-    {0, "read"},         {1, "write"},        {2, "open"},         {3, "close"},
-    {4, "stat"},         {5, "fstat"},        {6, "lstat"},        {8, "lseek"},
-    {9, "mmap"},         {10, "mprotect"},    {11, "munmap"},      {12, "brk"},
-    {13, "rt_sigaction"}, {14, "rt_sigprocmask"}, {15, "rt_sigreturn"}, {16, "ioctl"},
-    {17, "pread64"},     {18, "pwrite64"},    {19, "readv"},       {20, "writev"},
-    {21, "access"},      {22, "pipe"},        {25, "mremap"},      {28, "madvise"},
-    {32, "dup"},         {33, "dup2"},        {35, "nanosleep"},   {39, "getpid"},
-    {56, "clone"},       {57, "fork"},        {58, "vfork"},       {59, "execve"},
-    {60, "exit"},        {61, "wait4"},       {62, "kill"},        {63, "uname"},
-    {72, "fcntl"},       {79, "getcwd"},      {82, "rename"},      {83, "mkdir"},
-    {84, "rmdir"},       {87, "unlink"},      {89, "readlink"},    {90, "chmod"},
-    {91, "fchmod"},      {96, "gettimeofday"}, {97, "getrlimit"},  {99, "sysinfo"},
-    {102, "getuid"},     {104, "getgid"},     {107, "geteuid"},    {108, "getegid"},
-    {110, "getppid"},    {131, "sigaltstack"}, {137, "statfs"},    {138, "fstatfs"},
-    {157, "prctl"},      {158, "arch_prctl"}, {160, "setrlimit"},  {186, "gettid"},
-    {202, "futex"},      {204, "sched_getaffinity"}, {217, "getdents64"}, {218, "set_tid_address"},
-    {221, "fadvise64"},  {228, "clock_gettime"}, {229, "clock_getres"}, {230, "clock_nanosleep"},
-    {231, "exit_group"}, {234, "tgkill"},     {257, "openat"},     {258, "mkdirat"},
-    {262, "newfstatat"}, {263, "unlinkat"},   {264, "renameat"},   {267, "readlinkat"},
-    {268, "fchmodat"},   {269, "faccessat"},  {273, "set_robust_list"}, {280, "utimensat"},
-    {292, "dup3"},       {293, "pipe2"},      {302, "prlimit64"},  {316, "renameat2"},
-    {318, "getrandom"},  {332, "statx"},      {334, "rseq"},       {435, "clone3"},
+    {0, "read"},
+    {1, "write"},
+    {2, "open"},
+    {3, "close"},
+    {4, "stat"},
+    {5, "fstat"},
+    {6, "lstat"},
+    {8, "lseek"},
+    {9, "mmap"},
+    {10, "mprotect"},
+    {11, "munmap"},
+    {12, "brk"},
+    {13, "rt_sigaction"},
+    {14, "rt_sigprocmask"},
+    {15, "rt_sigreturn"},
+    {16, "ioctl"},
+    {17, "pread64"},
+    {18, "pwrite64"},
+    {19, "readv"},
+    {20, "writev"},
+    {21, "access"},
+    {22, "pipe"},
+    {25, "mremap"},
+    {28, "madvise"},
+    {32, "dup"},
+    {33, "dup2"},
+    {35, "nanosleep"},
+    {39, "getpid"},
+    {56, "clone"},
+    {57, "fork"},
+    {58, "vfork"},
+    {59, "execve"},
+    {60, "exit"},
+    {61, "wait4"},
+    {62, "kill"},
+    {63, "uname"},
+    {72, "fcntl"},
+    {79, "getcwd"},
+    {82, "rename"},
+    {83, "mkdir"},
+    {84, "rmdir"},
+    {87, "unlink"},
+    {89, "readlink"},
+    {90, "chmod"},
+    {91, "fchmod"},
+    {96, "gettimeofday"},
+    {97, "getrlimit"},
+    {99, "sysinfo"},
+    {102, "getuid"},
+    {104, "getgid"},
+    {107, "geteuid"},
+    {108, "getegid"},
+    {110, "getppid"},
+    {131, "sigaltstack"},
+    {137, "statfs"},
+    {138, "fstatfs"},
+    {157, "prctl"},
+    {158, "arch_prctl"},
+    {160, "setrlimit"},
+    {186, "gettid"},
+    {202, "futex"},
+    {204, "sched_getaffinity"},
+    {217, "getdents64"},
+    {218, "set_tid_address"},
+    {221, "fadvise64"},
+    {228, "clock_gettime"},
+    {229, "clock_getres"},
+    {230, "clock_nanosleep"},
+    {231, "exit_group"},
+    {234, "tgkill"},
+    {257, "openat"},
+    {258, "mkdirat"},
+    {262, "newfstatat"},
+    {263, "unlinkat"},
+    {264, "renameat"},
+    {267, "readlinkat"},
+    {268, "fchmodat"},
+    {269, "faccessat"},
+    {273, "set_robust_list"},
+    {280, "utimensat"},
+    {292, "dup3"},
+    {293, "pipe2"},
+    {302, "prlimit64"},
+    {316, "renameat2"},
+    {318, "getrandom"},
+    {332, "statx"},
+    {334, "rseq"},
+    {435, "clone3"},
     {439, "faccessat2"},
 };
 

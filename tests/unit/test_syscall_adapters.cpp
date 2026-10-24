@@ -27,12 +27,12 @@
 
 using hyperion::Gpr;
 using hyperion::GuestState;
-using hyperion::MinimalSyscallHandler;
-using hyperion::SyscallStatus;
 using hyperion::kEbadf;
 using hyperion::kEfault;
 using hyperion::kEinval;
 using hyperion::kEnosys;
+using hyperion::MinimalSyscallHandler;
+using hyperion::SyscallStatus;
 
 namespace {
 
@@ -66,7 +66,8 @@ struct Fixture {
 
     Fixture() = default;
 
-    hyperion::SyscallResult call(std::uint64_t number, std::initializer_list<std::uint64_t> args = {}) {
+    hyperion::SyscallResult call(std::uint64_t number,
+                                 std::initializer_list<std::uint64_t> args = {}) {
         state.reg(Gpr::kRax) = number;
         const Gpr regs[6] = {Gpr::kRdi, Gpr::kRsi, Gpr::kRdx, Gpr::kR10, Gpr::kR8, Gpr::kR9};
         std::size_t i = 0;
@@ -145,7 +146,7 @@ HYPERION_TEST("adapters", "ftruncate_truncates_and_reports_errors") {
     HYPERION_CHECK(r.status == SyscallStatus::kHandled);
     HYPERION_CHECK_EQ(static_cast<std::int64_t>(state.reg(Gpr::kRax)), std::int64_t{0});
 
-    struct stat info {};
+    struct stat info{};
     HYPERION_CHECK_EQ(::fstat(fileno(stream), &info), 0);
     HYPERION_CHECK_EQ(static_cast<long>(info.st_size), 4L);
 
@@ -249,10 +250,10 @@ HYPERION_TEST("adapters", "timerfd_is_created_and_armed") {
 
     // struct itimerspec: two guest timespecs (16 bytes each).
     std::uint8_t spec[32] = {};
-    hyperion::syscall_detail::put_u64(spec, 0, 0);        // it_interval.tv_sec
-    hyperion::syscall_detail::put_u64(spec, 8, 0);        // it_interval.tv_nsec
-    hyperion::syscall_detail::put_u64(spec, 16, 1000);    // it_value.tv_sec
-    hyperion::syscall_detail::put_u64(spec, 24, 0);       // it_value.tv_nsec
+    hyperion::syscall_detail::put_u64(spec, 0, 0);     // it_interval.tv_sec
+    hyperion::syscall_detail::put_u64(spec, 8, 0);     // it_interval.tv_nsec
+    hyperion::syscall_detail::put_u64(spec, 16, 1000); // it_value.tv_sec
+    hyperion::syscall_detail::put_u64(spec, 24, 0);    // it_value.tv_nsec
     HYPERION_CHECK(f.memory.write(kBase + 0x100, spec, sizeof(spec)));
     (void)f.call(kSysTimerfdSettime, {3, 0, kBase + 0x100, 0});
     HYPERION_CHECK_EQ(f.result(), std::int64_t{0});

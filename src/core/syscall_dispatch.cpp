@@ -13,8 +13,8 @@
 #include <algorithm>
 #include <array>
 #include <cstdio>
-#include <fcntl.h>
 #include <cstring>
+#include <fcntl.h>
 #include <string_view>
 #include <sys/utsname.h>
 #include <unistd.h>
@@ -102,7 +102,9 @@ bool UnsupportedSet::contains(std::uint64_t number) const noexcept {
     return false;
 }
 
-std::size_t UnsupportedSet::unique_count() const noexcept { return count_; }
+std::size_t UnsupportedSet::unique_count() const noexcept {
+    return count_;
+}
 
 std::size_t UnsupportedSet::snapshot(std::uint64_t* out, std::size_t capacity) const noexcept {
     std::size_t written = 0;
@@ -130,12 +132,17 @@ std::int32_t SyscallContext::arg_i32(int index) const {
     return syscall_detail::arg_i32(state, index);
 }
 
-bool SyscallContext::linux_compat() const { return SyscallAccess::linux_compat(handler); }
+bool SyscallContext::linux_compat() const {
+    return SyscallAccess::linux_compat(handler);
+}
 
-const std::string& SyscallContext::sysroot() const { return SyscallAccess::sysroot(handler); }
+const std::string& SyscallContext::sysroot() const {
+    return SyscallAccess::sysroot(handler);
+}
 
 std::int64_t SyscallContext::host_fd(std::int32_t guest_fd) const {
-    const OpenFileDescription* ofd = syscall_detail::lookup_ofd(SyscallAccess::files(handler), guest_fd);
+    const OpenFileDescription* ofd =
+        syscall_detail::lookup_ofd(SyscallAccess::files(handler), guest_fd);
     if (ofd == nullptr) {
         return -kEbadf;
     }
@@ -243,8 +250,8 @@ CompileOutcome compile_document(const RegistryDocument& document, const std::str
         }
         if (rule.return_transform != kRegistryReturnTransformErrno) {
             reject(outcome.rejected, rule,
-                   "unsupported return_transform '" + rule.return_transform +
-                       "' (only '" + kRegistryReturnTransformErrno + "' is defined)");
+                   "unsupported return_transform '" + rule.return_transform + "' (only '" +
+                       kRegistryReturnTransformErrno + "' is defined)");
             continue;
         }
         if (existing_layer_implements(rule.syscall)) {
@@ -303,7 +310,8 @@ CompileOutcome compile_document(const RegistryDocument& document, const std::str
             if (adapter->syscall != rule.syscall) {
                 reject(outcome.rejected, rule,
                        "handler '" + rule.handler + "' implements syscall " +
-                           std::to_string(adapter->syscall) + ", not " + std::to_string(rule.syscall));
+                           std::to_string(adapter->syscall) + ", not " +
+                           std::to_string(rule.syscall));
                 continue;
             }
             // Declared ABI transformations must match what the adapter really
@@ -364,8 +372,8 @@ CompileOutcome compile_document(const RegistryDocument& document, const std::str
         }
         case RuleImplementation::kGuestAlias: {
             if (rule.target_syscall >= kMaxSyscall) {
-                reject(outcome.rejected, rule, "target_syscall is outside 0.." +
-                                                   std::to_string(kMaxSyscall - 1));
+                reject(outcome.rejected, rule,
+                       "target_syscall is outside 0.." + std::to_string(kMaxSyscall - 1));
                 continue;
             }
             if (rule.target_syscall == rule.syscall) {
@@ -414,8 +422,9 @@ CompileOutcome compile_document(const RegistryDocument& document, const std::str
         }
 
         for (const char c : rule.id) {
-            fingerprint = (fingerprint ^ static_cast<std::uint64_t>(static_cast<unsigned char>(c))) *
-                          1099511628211ULL;
+            fingerprint =
+                (fingerprint ^ static_cast<std::uint64_t>(static_cast<unsigned char>(c))) *
+                1099511628211ULL;
         }
         fingerprint = (fingerprint ^ rule.syscall) * 1099511628211ULL;
     }
@@ -514,17 +523,15 @@ std::string SyscallDispatcher::summary() const {
     std::string out;
     char line[256];
     const auto& c = counters_;
-    std::snprintf(line, sizeof(line),
-                  "syscall dispatch: adapter=%llu alias=%llu existing=%llu unsupported=%llu "
-                  "translation_failures=%llu\n",
-                  static_cast<unsigned long long>(c.handled_adapter.load(std::memory_order_relaxed)),
-                  static_cast<unsigned long long>(c.handled_alias.load(std::memory_order_relaxed)),
-                  static_cast<unsigned long long>(
-                      c.handled_existing.load(std::memory_order_relaxed)),
-                  static_cast<unsigned long long>(
-                      c.unsupported_events.load(std::memory_order_relaxed)),
-                  static_cast<unsigned long long>(
-                      c.translation_failures.load(std::memory_order_relaxed)));
+    std::snprintf(
+        line, sizeof(line),
+        "syscall dispatch: adapter=%llu alias=%llu existing=%llu unsupported=%llu "
+        "translation_failures=%llu\n",
+        static_cast<unsigned long long>(c.handled_adapter.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(c.handled_alias.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(c.handled_existing.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(c.unsupported_events.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(c.translation_failures.load(std::memory_order_relaxed)));
     out.append(line);
     const std::size_t unique = unsupported_.unique_count();
     if (unique != 0) {
@@ -544,7 +551,8 @@ std::string SyscallDispatcher::summary() const {
     if (!rules_) {
         out.append("registry: not loaded\n");
     } else {
-        std::snprintf(line, sizeof(line), "registry: %s (%llu adapter rule(s), %llu alias rule(s))\n",
+        std::snprintf(line, sizeof(line),
+                      "registry: %s (%llu adapter rule(s), %llu alias rule(s))\n",
                       rules_->source_path.empty() ? "<built-in>" : rules_->source_path.c_str(),
                       static_cast<unsigned long long>(rules_->adapter_rules),
                       static_cast<unsigned long long>(rules_->alias_rules));

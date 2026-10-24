@@ -65,21 +65,29 @@ works, what was last verified, and what to do next.
 | 18. Startup, TLS, clock, resource, dup/fcntl, and scatter/positional I/O (eleventh slice) | **Implemented & tested** — adds `pread64`(17), `pwrite64`(18), `readv`(19), `writev`(20), `dup`(32), `dup2`(33), `dup3`(292), `fcntl`(72), `uname`(63, always advertising `"x86_64"`), `gettimeofday`(96), `clock_gettime`(228), `arch_prctl`(158, `ARCH_SET_FS`/`ARCH_GET_FS`), `set_tid_address`(218), `set_robust_list`(273), and `prlimit64`(302); **42 implemented syscalls total** |
 | 19. Guest process creation (twelfth slice) | **Implemented & tested** — adds `fork`(57), `vfork`(58), the process-creating subset of `clone`(56), `execve`(59) and `wait4`(61) in `src/core/process.cpp`; **47 implemented syscalls total**. A guest child is a real host process running a *deep copy* of the `GuestAddressSpace` (guest pages are host heap storage, so a bare host `fork` would leave both sides sharing vectors that a later `mmap` reallocates). Process clone now honors `child_stack`; thread-creating and namespace-creating flags return `-ENOSYS` rather than being downgraded. A vfork child releases its parent on successful guest exec (not merely host exec), and a forked child can re-exec its image through `/proc/self/exe`. Verified against static x86-64 BusyBox: `sh -c 'printf "9\\n2\\n5\\n1\\n" \| sort -n'` → `1 2 5 9`, and `sh -c 'echo benchmark \| wc -c'` → `10`, matching native output on x86-64 and under AArch64 QEMU at both tiers |
 | 20. Two CLI/loader correctness fixes found by the new guest tests | **Fixed** — (a) `hyperion run` returned 0 even when the guest exited non-zero unless `--quiet` was given, so an exit-status gate was told a failing guest had succeeded; the guest's status is now always the process status. (b) `AT_EXECFN` was filled from `argv[0]` instead of the executable's absolute path, which made a statically linked glibc guest abort inside `_dl_get_origin()` before its `main` ran; it now carries the real path, and the initial `%rsp` is explicitly re-aligned to 16 bytes rather than relying on the string pushes leaving it aligned |
+| 21. Multi-layer syscall dispatch + compatibility adapters | **Implemented & tested** — `include/hyperion/syscall_dispatch.hpp`, `src/core/syscall_dispatch.cpp`, `src/core/syscall_adapters.cpp`. Dispatch order is compiled rule table (`kMaxSyscall = 512`, one bounds check + one index) → static switch → legacy compat switch → `-ENOSYS`. 39 adapters translate ABI differences (packed 12-byte `epoll_event`, `pollfd`, `fd_set`, `rusage`, `tms`, `itimerval`, `timespec`, guest fd → host fd). No JSON parsing, file I/O, lock, allocation or string hashing on the hot path; `reload()` publishes an immutable `shared_ptr<CompiledRules>` snapshot |
+| 22. Persistent external JSON registry | **Implemented & tested** — `include/hyperion/syscall_registry.hpp`, `src/core/syscall_registry.cpp`. Schema v2 (v1 migrated on read), resolved as `--syscall-registry` → `$HYPERION_SYSCALL_REGISTRY` → `$XDG_DATA_HOME` → `$HOME/.local/share`; atomic write (temp + fsync + rename + dir fsync) with a `.bak`, `0600` files and `0700` directories; missing/corrupt/newer-schema files never block startup and are never rewritten by a read |
+| 23. Registry CLI, installer integration, observability | **Implemented & tested** — `hyperion syscall-registry --list/--validate/--json/--export-defaults/--write` (`--validate` exits 3 when a rule was rejected rather than reporting success), `scripts/hyperion` gained the subcommand, `install.sh` creates the registry outside the install dir only when absent and preserves user rules on upgrade and uninstall; per-layer counters distinguish handled / unsupported / translation failures and unique numbers from events |
 
-**Implemented-syscall status (verified automatically by `tools/gen_syscall_inventory.py --check`).**
-Forty-seven numbers are implemented today: `read`(0), `write`(1), `close`(3),
-`fstat`(5), `lseek`(8), `mmap`(9), `mprotect`(10), `munmap`(11), `brk`(12),
-`pread64`(17), `pwrite64`(18), `readv`(19), `writev`(20), `access`(21),
-`dup`(32), `dup2`(33), `getpid`(39), `clone`(56), `fork`(57), `vfork`(58),
-`execve`(59), `exit`(60), `wait4`(61), `uname`(63), `fcntl`(72), `getcwd`(79), `readlink`(89),
-`gettimeofday`(96), `getuid`(102), `getgid`(104), `geteuid`(107), `getegid`(108),
-`getppid`(110), `arch_prctl`(158), `gettid`(186), `getdents64`(217),
-`set_tid_address`(218), `clock_gettime`(228), `exit_group`(231), `openat`(257),
-`newfstatat`(262), `readlinkat`(267), `set_robust_list`(273), `dup3`(292),
-`prlimit64`(302), `getrandom`(318), `statx`(332). Everything else
-returns `-ENOSYS` explicitly and is enforced bidirectionally between
-`src/core/syscall.cpp`, `docs/syscalls/inventory.tsv`, and the generated tier
-Markdown files by `ctest` (`syscall.inventory_valid`).
+**Implemented-syscall status (verified automatically by
+`tools/gen_syscall_inventory.py --check`).** 128 numbers are answered
+today — 122 implemented and 6 stubbed — of the 375 in the pinned kernel
+table. The validator now cross-checks three sources in both directions:
+`MinimalSyscallHandler::handle()`, `is_linux_compat_syscall()` (whose numbers carry
+a `[stub]` or `[unsupported]` annotation that decides the expected status), and the
+compatibility layer's adapter table and alias rules. A syscall cannot be counted
+as implemented in the inventory without a handler somewhere, and a handler cannot
+exist without the inventory saying so.
+
+The 6 stubs answer success without performing the call — `rt_sigaction`(13),
+`madvise`(28), `sigaltstack`(131), `prctl`(157), `fadvise64`(221) and
+`clock_getres`(229) — and are listed as `stubbed`, not `implemented`, because
+claiming them would be a lie a roadmap could be built on. `rseq`(334) is
+recognised only to be refused cleanly and stays `not-started`.
+
+Anything not listed returns `-ENOSYS` explicitly and is counted. The full list is
+generated into `docs/syscalls/U1..U4.md`; the machine-readable source is
+`docs/syscalls/inventory.tsv`.
 
 **Address-space facts (verified).** `GuestAddressSpace` is the guest's virtual
 memory: a set of regions with `MemPerm` (read/write/exec) and page-granular
@@ -442,7 +450,35 @@ main path, and Phases 2-5 still build it.
 
 ## 2. Last successful verification
 
-Re-verified from a clean tree on **2026-10-19**, host: x86-64, Debian 13
+Re-verified on **2026-10-24** after the syscall compatibility engine (multi-layer
+dispatch, ABI adapters, persistent registry, tests, benchmark, docs). Host:
+x86-64, Debian 13, kernel 6.1.158, GCC 14.2.0, CMake 4.4.4, Ninja 1.13.2.
+**AArch64 execution was not available on this host**, so Tier 1 and the qemu
+cross tree were not re-run in this session — that is the one gap in the table
+below, and it is a host limitation, not a passing claim:
+
+| Suite | Command | Result (measured) |
+| --- | --- | --- |
+| Native unit tests | `./build/dev/tests/hyperion_unit_tests` | **311 passed, 0 failed, 24 skipped** (of 335) |
+| Full CTest tree | `ctest --test-dir build/dev` | **16/16 passed** (unit, differential, 3 CLI, 2 guest, inventory, 7 bench) |
+| ASan + UBSan | `cmake -B build/asan -DHYPERION_ENABLE_SANITIZERS=ON` + `ctest` | **16/16 passed**, no sanitizer report |
+| Guest compat suite | `guest.syscall_compat` | 9/9 checks (27 guest-side ABI assertions) |
+| Registry CLI suite | `cli.syscall_registry` | 11/11 checks |
+| Syscall inventory | `python3 tools/gen_syscall_inventory.py --check` | OK (0 errors, 0 warnings) |
+| Dispatch microbenchmark | `benchmarks/hyperion_syscall_bench --iterations 300000 --repeats 9` | see `TESTING.md` §6 |
+| Cross (qemu-user) | `scripts/dev.sh cross-test` | **not run this session** (no AArch64 toolchain on this host) |
+
+The ASan run earned its keep immediately: it found a stack buffer overflow in the
+`poll` adapter that no ordinary build could see (`get_u64_le(raw + 4)` reading
+eight bytes out of an eight-byte `struct pollfd`, where the overrun stayed inside
+the same stack frame). Fixed, along with the 16/64-bit reader helpers that made
+the mistake possible.
+
+Previous run, from a clean tree on **2026-10-19**, host: x86-64, Debian 13
+(trixie), GCC 14.2.0, Clang 19.1.7, CMake 3.31.6, Ninja 1.12.1, qemu-aarch64
+10.0.13, aarch64-linux-gnu-g++ 14.2.0. This run followed a container reset that
+removed `/usr`; the toolchain was restored from `tools/vendor/host-debs/` and
+`tools/cache/` (with an apt fallback for the cross compiler) before rebuilding:, host: x86-64, Debian 13
 (trixie), GCC 14.2.0, Clang 19.1.7, CMake 3.31.6, Ninja 1.12.1, qemu-aarch64
 10.0.13, aarch64-linux-gnu-g++ 14.2.0. This run followed a container reset that
 removed `/usr`; the toolchain was restored from `tools/vendor/host-debs/` and
@@ -754,66 +790,64 @@ stable-vs-noisy discrimination case).
 
 ## 4. Immediate next task
 
-**Phase 6's tenth syscall slice (`statx`) is implemented and tested in both
-tiers. Phase 5 has six accepted, measured optimizations
-(BENCHMARKS.md §4.2.1–4.2.6), all deterministic-evidence based.**
+**The syscall compatibility engine is in place** — four-layer dispatch, 39 ABI
+adapters, an external validated registry, a CLI, an installer step and tests at
+three levels (unit, CLI, real-guest). 128 of 375 syscall numbers are answered.
 
-The single best next action (Phase 6, extend coverage in U4 order):
+The next work is ordered by what a real terminal application (the stated target:
+a TUI editor like Fresh) hits, not by syscall number:
 
-- **Add the remaining U4/E1 syscalls a real program needs to start and run**:
-  `arch_prctl`(158) (set up the thread-local/FS base — required before glibc
-  startup, and the one that needs a new `GuestState.fs_base` field),
-  `set_tid_address`(218), `rseq`(334) and `prlimit64`(302).
-  `newfstatat` covers glibc's `stat`/`lstat` entry point and `statx` now covers
-  the modern entry point (both over the shared guest layouts); `access`/
-  `readlink`/`readlinkat` cover the common path queries.
-  Validate
-  every guest buffer pointer against the address
-  space before use; return `-EBADF`/`-EFAULT`/`-ENOENT`/`-ENOSYS` exactly as the
-  kernel does, and keep the "unimplemented is counted, never silent" rule. Move
-  each number's `status` in `docs/syscalls/inventory.tsv` from `not-started` to
-  `implemented`, regenerate the docs
-  (`python3 tools/gen_syscall_inventory.py`), add a focused test per call, and
-  update the §0e table and implemented-count.
+1. **`rt_sigaction`(13) and `sigaltstack`(131) are stubs.** Both currently answer
+   success without doing anything. Rust's standard library installs a SIGSEGV
+   handler with an alternate stack for stack-overflow detection, and expects
+   `sigaltstack` to have taken effect. An honest implementation records the
+   action in guest memory and either delivers or explicitly refuses; it must not
+   pretend. This is the highest-value correctness item because a stub that lies
+   is worse than a refusal.
+2. **`ioctl`(16) coverage.** `TIOCGWINSZ` is implemented; a TUI needs `TCGETS`/
+   `TCSETS` (raw mode, what every terminal app calls through `cfmakeraw`),
+   `TIOCSWINSZ`, and `FIONREAD`. Each is a small, testable addition with a
+   well-defined guest layout, and `TERMIOS` on x86-64 and AArch64 differ in
+   `c_cc` ordering — the exact class of bug the adapter layer exists for.
+3. **Cross-architecture verification.** `scripts/dev.sh cross-test` was **not**
+   run this session: the host is x86-64 and has no AArch64 toolchain, so Tier 1
+   and the qemu tree are unverified for the new code. Until that run happens,
+   treat the Tier 1 numbers in this file as historical.
+4. **`futex`(202) is implemented but not `validated`.** It was written before the
+   adapter layer and is only exercised indirectly. A guest that creates threads
+   will lean on it hard; it needs the same test treatment as the adapters
+   (bit-set/wait, timeout, `-EAGAIN`, cancellation) before it is called done.
+5. **Sockets** (`socket`(41), `connect`(42), `bind`(49), `listen`(50), …) are
+   `not-started`. A TUI editor that spawns a language server needs them, but
+   they are a large, separable piece — do them after 1–2.
+6. **A process-wide registry reload test.** `reload()` swaps an immutable
+   snapshot and is unit-tested for consistency, but no test runs guest syscalls
+   concurrently with a reload. The design is sound; the concurrency is unproven.
+
+Rules that apply to every syscall added from here:
+
+- Implement it or refuse it; never a stub that reports success. If a temporary
+  stub is unavoidable it goes in `is_linux_compat_syscall()` with a `[stub]`
+  annotation, and the inventory gate then *requires* its status to be `stubbed`.
+- Validate every guest pointer against the address space before use; return
+  `-EBADF`/`-EFAULT`/`-EINVAL`/`-ENOSYS` exactly as the kernel does.
+- Add a unit test including the invalid-argument paths, and a line in the guest
+  fixture if the syscall is reachable from a real program.
+- Move the number in `docs/syscalls/inventory.tsv`, regenerate the docs
+  (`python3 tools/gen_syscall_inventory.py`), and update the counts in this file
+  and `README.md`. The gate fails if the source and the table disagree.
+- If the syscall needs structure or flag translation, write an adapter and a
+  registry rule — do not special-case it in `handle_unguarded()`.
 
 Then, independent and larger (Phase 5):
-
-- **Block chaining.** Today every block exit returns to the dispatcher, which
-  does a direct-mapped lookup. Link a block's exit directly to its successor's
-  generated code so a hot loop stays in generated code, guarded by the same
-  authoritative-`rip` rule and keeping the dispatcher as the fallback for any
-  unlinked exit. The direct-mapped table (BENCHMARKS.md §4.2.4) gives a natural
-  place to record a link, and the block exit already reports the target hint.
-  Require the whole differential suite to pass before accepting, re-run
-  `scripts/bench-tier-qemu.sh` (both workloads), and record before/after in
-  BENCHMARKS.md with a verdict. Add a deterministic guard for whatever the
-  change should move (e.g. dispatcher lookups per run) so the win is provable
-  even when `qemu-user` timing is noisy.
-
-Then, larger Phase 6/7 work (independent):
 
 - **Memory operands in the code generator.** The AArch64 generator is
   register-only: it rejects any instruction with a memory operand
   (`translator.cpp validate_body`). Every real program loads and stores, so this
-  is the gating item for running anything nontrivial in Tier 1. It is the
-  natural pairing with `read`/`openat`, because a syscall result buffer is
-  written to guest memory. Until it lands, Tier 1 stops honestly at the first
-  memory operand (see the `mmap_end_to_end_..._stops_at_memory_operand` test).
-- **Extend coverage in U4 order** (`docs/syscalls/U4.md`) beyond the above:
-  `getrandom`, `set_tid_address`, `rseq`, `prlimit64`, `arch_prctl` (TLS setup is
-  required for most dynamically linked programs).
-- Every implemented syscall must: follow the x86-64 argument/return convention
-  (args in `rdi, rsi, rdx, r10, r8, r9`; result in `rax`; errors as `-errno`),
-  validate guest pointers, be listed in `docs/syscalls/inventory.tsv` with
-  `status` moved from `not-started` to `implemented`/`validated`, and have a
-  focused test. Never present a stub as full support. Update the table in §0e
-  and the implemented-count whenever the set changes.
-
-Also still open from Phase 5 (independent, larger):
-
-- **Multi-tier compilation.** Add a cheaper first tier (or reuse Tier 0) and
-  promote only hot blocks to the optimising tier, with a fixed, reproducible
-  promotion policy.
+  is the gating item for running anything nontrivial in Tier 1.
+- **Block chaining.** Today every block exit returns to the dispatcher. Link a
+  block's exit directly to its successor's generated code, keeping the dispatcher
+  as the fallback for unlinked exits.
 
 Rules for every Phase 5 experiment (from `ROADMAP.md` and BENCHMARKS.md §5):
 

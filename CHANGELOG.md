@@ -5,6 +5,117 @@ Meaningful changes by milestone. Format loosely follows
 
 ---
 
+## [Unreleased] — Dynamic syscall translation and compatibility engine
+
+### Added
+- **Multi-layer syscall dispatch (`include/hyperion/syscall_dispatch.hpp`,
+  `src/core/syscall_dispatch.cpp`).** `MinimalSyscallHandler::handle()` now runs
+  four layers in a fixed order: a compiled rule table (one bounds check and one
+  array index, `kMaxSyscall = 512`), then the existing static switch, then the
+  existing legacy compat switch, then a refusal that is counted. No JSON parsing,
+  file I/O, lock, allocation or string hashing happens on this path: the registry
+  is compiled once into an immutable `CompiledRules` snapshot published through a
+  `shared_ptr`, and dispatch only reads it. Nothing was rewritten: the existing
+  handlers are unchanged and the static implementation always wins — a rule for a
+  number HYPERION already implements is rejected at compile time with a
+  diagnostic instead of silently shadowing tested code.
+- **39 ABI adapters (`src/core/syscall_adapters.cpp`).** Each translates a real
+  cross-architecture difference rather than copying bytes: the x86-64 **packed
+  12-byte** `struct epoll_event` versus the host's 16-byte aligned one (converted
+  per entry, never `memcpy`'d), `struct pollfd` write-back that restores *guest*
+  descriptor numbers and preserves the input `events` field, `fd_set`
+  reconstruction for `select`/`pselect6`, and `struct rusage`, `struct tms`,
+  `struct itimerval` and `timespec` layouts. Adapters are the only way a registry
+  rule can name an implementation: the JSON can select a compiled, tested
+  function by id, never a host syscall number, a library, a shell command or an
+  expression.
+- **Persistent external JSON registry
+  (`include/hyperion/syscall_registry.hpp`, `src/core/syscall_registry.cpp`).**
+  Schema v2 (v1 migrated on read), stored *outside* the install directory at
+  `$XDG_DATA_HOME/hyperion/syscalls/registry.json` or
+  `$HOME/.local/share/hyperion/syscalls/registry.json`, overridable with
+  `$HYPERION_SYSCALL_REGISTRY` or `--syscall-registry=FILE`. Rules carry an id,
+  name, syscall number, implementation, handler, `origin` (`builtin`/`package`/
+  `user`), `rule_version` and `enabled`; shipped defaults are merged by id so an
+  upgrade can update them without touching user rules.
+- **Safe persistence.** Every field is validated, a bad rule is rejected without
+  clobbering the rest of the registry, writes are atomic (temp file + `fsync` +
+  `rename` + directory `fsync`, previous contents kept as `.bak`, files `0600`,
+  directories `0700`), reads are capped at 16 MiB, and a missing, unreadable,
+  corrupt or newer-schema file leaves the built-in rules in force — it can never
+  prevent startup, and reading never rewrites the file. The previously accepted
+  "any schema_version up to 1000" check now rejects anything newer than the build
+  supports and says so.
+- **Real semantic translations.** `nanosleep`(35) and `clock_nanosleep`(230)
+  were stubs that returned 0 immediately — which turned every guest retry or
+  backoff loop into a spin. They now validate the request (`tv_nsec < 1e9`, no
+  negative fields), perform the host call, report `-EINTR` with the unslept
+  remainder written back for the relative form, and accept only `TIMER_ABSTIME`.
+  `link`(86) and `symlink`(88) were missing entirely: the adapter layer had
+  `linkat`/`symlinkat`, but glibc issues the plain calls on x86-64, so `ln` and
+  `ln -s` failed under translation. Found by the new guest fixture, not by
+  inspection.
+- **Observability.** Per-layer counters (`adapter`, `alias`, `existing`,
+  `unsupported`, `translation_failures`), a distinct unsupported-number set
+  reported with its numeric and hex value, and a dispatch summary printed by
+  `hyperion run`. `HYPERION_TRACE_SYSCALLS=1` already logged every call; the
+  counters add the aggregate view. The long-standing `unimplemented syscalls: N`
+  line is now documented as counting **events**, not distinct numbers, and as
+  including refusals that a later layer then handled.
+- **`hyperion syscall-registry` CLI** (`--list`, `--validate`, `--json`,
+  `--export-defaults`, `--write`, `--registry=FILE`), plus `--no-syscall-registry`
+  and `HYPERION_NO_SYSCALL_REGISTRY` on `run`. `scripts/hyperion` gained the
+  subcommand (it previously printed `unknown command`).
+- **Tests.** ~55 new unit cases across `test_json.cpp`,
+  `test_syscall_registry.cpp`, `test_syscall_dispatch.cpp` and
+  `test_syscall_adapters.cpp`; a real-guest suite
+  (`tests/guest/syscall_compat_test.sh`, CTest `guest.syscall_compat`) that runs a
+  statically linked x86-64 fixture with 27 behavioural checks and proves a
+  user-written rule enables a syscall the binary has never heard of; a CLI
+  contract suite (`tests/cli/registry_cli_test.sh`, CTest
+  `cli.syscall_registry`); and a dispatch microbenchmark
+  (`benchmarks/syscall_bench.cpp`).
+- **Inventory accuracy.** `tools/gen_syscall_inventory.py` now also scans
+  `is_linux_compat_syscall()` (with `[stub]`/`[unsupported]` annotations) and the
+  adapter/alias tables, so the inventory cannot claim a syscall has no
+  implementation while one exists, or vice versa. That correction alone moved 39
+  rows from `not-started` to `implemented`/`stubbed`: the roadmap had been aimed
+  at work that was already done.
+
+### Fixed
+- **Real registry rules could be silently dropped while `--validate` exited 0.**
+  A rule for a syscall HYPERION implements statically, or with an unknown
+  handler, was rejected during compilation and reported only as a warning. A user
+  checking "is my rule in effect?" was told yes. `--validate` now exits `3` when
+  the file parsed but at least one rule was rejected, and `1` when the file could
+  not be used at all.
+- **`--json` reported the file's own rules, not the effective set.** For a setup
+  with 43 active rules it printed one, and said nothing about rejections. It now
+  reports the resolved path and its source, the effective rule set, per-layer
+  counts, rejected rules and diagnostics.
+- **Every rejected/warning diagnostic was printed twice**, because
+  `reload_syscall_registry` folded the dispatcher's diagnostics into its own
+  one-line summary.
+- **Stack buffer overflow in the `poll` adapter.** `get_u64_le(raw + 4)` read
+  eight bytes out of the sixteen-bit `events` field of an eight-byte
+  `struct pollfd`. The overrun stayed inside the same stack frame, so every
+  ordinary build passed; AddressSanitizer caught it. Fixed, and `get_u16_le` /
+  `get_u32_le` / `put_u16` added so a field can be read at its own width.
+- **`install.sh` ignored the registry.** It now creates the registry outside the
+  install directory only when it is absent, validates (never overwrites) an
+  existing one, and deliberately keeps user rules on `--uninstall`.
+
+### Changed
+- **`enable_linux_compat()`'s switch is documented as the third dispatch layer**
+  and its number list is machine-read: `[stub]` marks a number that answers
+  success without doing the work (the inventory must then say `stubbed`) and
+  `[unsupported]` marks one that is only recognised to be refused cleanly
+  (`rseq`), which stays `not-started`.
+- **AArch64/Tier 1 status for this work is unverified.** The development host is
+  x86-64 with no AArch64 toolchain, so `scripts/dev.sh cross-test` was not run.
+
+---
+
 ## [Unreleased] — Guest process creation (`fork`/`vfork`/`clone` subset/`execve`/`wait4`), installer repair, and documentation reconciliation
 
 ### Added

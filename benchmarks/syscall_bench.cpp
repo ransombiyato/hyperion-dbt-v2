@@ -86,7 +86,8 @@ bool parse(int argc, char** argv, Options& options) {
         } else if (arg.rfind("--iterations=", 0) == 0) {
             options.iterations = std::strtoull(arg.c_str() + 13, nullptr, 10);
         } else if (arg.rfind("--repeats=", 0) == 0) {
-            options.repeats = static_cast<std::uint32_t>(std::strtoul(arg.c_str() + 10, nullptr, 10));
+            options.repeats =
+                static_cast<std::uint32_t>(std::strtoul(arg.c_str() + 10, nullptr, 10));
         } else if (arg == "--iterations" && i + 1 < argc) {
             options.iterations = std::strtoull(argv[++i], nullptr, 10);
         } else if (arg == "--repeats" && i + 1 < argc) {

@@ -100,7 +100,9 @@ Everything needed to continue the project is **in this repository**. In order:
 | W^X executable memory (`ExecMem` + `ExecArena`) | **Implemented** — single-block `ExecMem` plus 16-byte-aligned multi-page W^X `ExecArena` |
 | x86-64 → AArch64 instruction translation | **Implemented** — standalone `translate_block()` plus full-system `translate_cached_block()` covering memory, stack (`PUSH`/`POP`/`CALL`/`RET`/`LEAVE`), full integer ALU, and hardware 128-bit ARMv8 NEON SIMD |
 | Multi-instruction program translation + code cache | **Implemented** — shared trampoline ABI, in-JIT 4096-slot jump table, branchless `CSEL` exits, self-loop superblocks, inline `SoftTlb` fast path (**104.5×** microbench / **5.17×–20.12×** full `glibc` binary speedup) |
-| Linux syscall layer | **Partial** (Phase 6, eleven slices) — **42 numbers** implemented & CI-checked against `docs/syscalls/inventory.tsv`; `-ENOSYS` otherwise. See `STATUS.md` for the full list |
+| Linux syscall layer | **Partial** — **128 of 375** numbers answered (122 implemented, 6 stubbed), CI-checked against `docs/syscalls/inventory.tsv`; `-ENOSYS` otherwise. Counts and the full list are in `STATUS.md` |
+| Syscall compatibility engine (adapters + persistent registry) | **Implemented** — 4-layer dispatch (compiled rule table → static switch → legacy compat switch → `-ENOSYS`), 39 ABI adapters, and a validated external JSON registry at `~/.local/share/hyperion/syscalls/registry.json`, created on install and never overwritten by an upgrade. See `ARCHITECTURE.md` §6 |
+| Syscall observability | **Implemented** — per-layer counters, unique-vs-total unsupported accounting, `HYPERION_TRACE_SYSCALLS=1`, and `hyperion syscall-registry --list/--validate/--json` |
 | Guest address space (mmap/brk/NX) | **Implemented** (Phase 6) — page-granular `split_region_at()` `mprotect`/`munmap`, enforced `MemPerm::kExec` fetch permissions, reserved heap window, per-mapping size cap (D-029) |
 | Guest descriptor table (unbuffered POSIX `OpenFileDescription`) | **Implemented** (Phase 6) — refcounted `OpenFileDescription` supporting `dup`/`dup2`/`dup3`/`fcntl`, positional `pread64`/`pwrite64`, scatter/gather `readv`/`writev`, and `adopt()` |
 | Register allocation | **Implemented within a block** (Phase 5, D-021) — hottest guest registers kept in `x19..x23` across block bodies, memory ops, SSE2 loops, and self-loop superblocks |
@@ -224,6 +226,50 @@ status remain, which is what you want in a script or CI.
 >
 > `hyperion bench` measures the host machine, not emulation; `hyperion_tier_bench`
 > measures Tier 0 vs Tier 1 guest execution. See `BENCHMARKS.md`.
+
+### The syscall compatibility registry
+
+Some syscalls cannot be handled by copying arguments: the guest and host disagree
+about a structure layout or a flag value, so they need real translation. HYPERION
+ships those translations as **adapters** (C++ code compiled into the binary) and
+lets a **JSON registry outside the install directory** decide which syscall
+numbers they serve. The registry is configuration only: it can name a compiled-in
+adapter, never a host syscall number, a library or a command.
+
+```sh
+hyperion syscall-registry --list                  # what is active, and from where
+hyperion syscall-registry --validate              # check the file (never modifies it)
+hyperion syscall-registry --json                  # machine-readable summary
+hyperion syscall-registry --export-defaults       # the shipped rules
+hyperion run --no-syscall-registry ./prog         # ignore the file entirely
+```
+
+The default path is `$XDG_DATA_HOME/hyperion/syscalls/registry.json`, else
+`$HOME/.local/share/hyperion/syscalls/registry.json` (the same on Termux).
+`$HYPERION_SYSCALL_REGISTRY` and `--syscall-registry=FILE` override it. Writes
+are atomic and keep a `.bak`; a missing, corrupt or newer-schema file never stops
+a program from running — the built-in rules stay in force and the problem is
+reported. `--validate` exits `3` when the file parsed but a rule was rejected, so
+"my rule is not working" is never reported as success.
+
+A rule is a small object:
+
+```json
+{
+  "id": "user.custom300",
+  "name": "custom300",
+  "syscall": 300,
+  "implementation": "guest_alias",
+  "target_syscall": 39,
+  "origin": "user",
+  "rule_version": 1,
+  "enabled": true
+}
+```
+
+...which makes syscall `300` behave as `getpid(2)`. `tests/guest/syscall_compat_test.sh`
+uses exactly this rule to prove that a user rule enables a syscall the binary has
+never heard of, and that deleting the rule restores `-ENOSYS`.
 
 ### Build from source
 

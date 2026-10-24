@@ -7,9 +7,9 @@
 // Every test works inside a private temporary directory so nothing touches the
 // developer's real $HOME/.local/share/hyperion.
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <cstdio>
 #include <string>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -165,7 +165,7 @@ HYPERION_TEST("registry", "creates_defaults_with_owner_only_permissions") {
     HYPERION_CHECK(report.created);
     HYPERION_CHECK(!document.rules.empty());
 
-    struct stat info {};
+    struct stat info{};
     HYPERION_CHECK_EQ(::stat(options.explicit_path.c_str(), &info), 0);
     HYPERION_CHECK_EQ(info.st_mode & 0777, static_cast<mode_t>(0600));
 }
@@ -264,8 +264,7 @@ HYPERION_TEST("registry", "corrupt_json_is_reported_and_the_file_is_kept") {
 }
 
 HYPERION_TEST("registry", "newer_schema_is_refused_not_downgraded") {
-    const std::string text =
-        "{\"schema_version\": 99, \"guest_arch\": \"x86_64\", \"rules\": []}";
+    const std::string text = "{\"schema_version\": 99, \"guest_arch\": \"x86_64\", \"rules\": []}";
     hyperion::json::Value root;
     hyperion::json::ParseError parse_error;
     HYPERION_CHECK(hyperion::json::parse(text, root, parse_error));

@@ -340,7 +340,9 @@ fi
 
 if [ -f "${REGISTRY_PATH}" ]; then
     info "keeping the existing registry at ${REGISTRY_PATH} (user rules are preserved)"
-    if HYPERION_NO_SYSCALL_REGISTRY= "${BIN_DIR}/hyperion" syscall-registry \
+    # An empty HYPERION_NO_SYSCALL_REGISTRY= would disable the very check being
+    # run, so it is unset for this one command rather than cleared.
+    if env -u HYPERION_NO_SYSCALL_REGISTRY "${BIN_DIR}/hyperion" syscall-registry \
         --validate --registry="${REGISTRY_PATH}" >"${TMP_DIR:-/tmp}/registry.check" 2>&1; then
         info "registry validates"
     else

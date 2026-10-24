@@ -143,9 +143,8 @@ HYPERION_TEST("dispatch", "unknown_handler_id_is_rejected") {
 
     MinimalSyscallHandler handler({}, nullptr);
     std::string message;
-    HYPERION_CHECK_EQ(handler.reload_syscall_registry(options_at(dir.file("registry.json")),
-                                                      message),
-                      0);
+    HYPERION_CHECK_EQ(
+        handler.reload_syscall_registry(options_at(dir.file("registry.json")), message), 0);
     const auto& diagnostics = handler.dispatcher().diagnostics();
     bool found = false;
     for (const std::string& d : diagnostics) {
@@ -404,8 +403,8 @@ HYPERION_TEST("dispatch", "alias_rule_rewrites_arguments_and_restores_them") {
     HYPERION_CHECK(handler.dispatcher().lookup(97)->kind == DispatchKind::kGuestAlias);
 
     GuestState state;
-    state.reg(Gpr::kRax) = 97;   // getrlimit
-    state.reg(Gpr::kRdi) = 7;    // RLIMIT_NOFILE
+    state.reg(Gpr::kRax) = 97; // getrlimit
+    state.reg(Gpr::kRdi) = 7;  // RLIMIT_NOFILE
     state.reg(Gpr::kRsi) = kBase + 0x100;
     state.reg(Gpr::kRdx) = 0xdead; // must be preserved
     state.reg(Gpr::kR10) = 0xbeef;
@@ -485,8 +484,8 @@ HYPERION_TEST("dispatch", "reload_swaps_the_snapshot_atomically") {
 
     // A corrupt file must leave the previous snapshot in service.
     write_text(dir.file("registry.json"), "{ not json");
-    const int status = handler.reload_syscall_registry(options_at(dir.file("registry.json")),
-                                                       message);
+    const int status =
+        handler.reload_syscall_registry(options_at(dir.file("registry.json")), message);
     HYPERION_CHECK_EQ(status, 1);
     HYPERION_CHECK(handler.dispatcher().lookup(300) != nullptr);
     HYPERION_CHECK(handler.dispatcher().lookup(80) != nullptr);

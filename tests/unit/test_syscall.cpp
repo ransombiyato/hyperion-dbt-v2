@@ -1751,8 +1751,7 @@ HYPERION_TEST("syscall", "phase6_extended_syscalls_dup_fcntl_iov_pread_uname_clo
 namespace {
 
 // Writes a guest timespec at `addr`.
-void write_timespec(FlatMemory& memory, std::uint64_t addr, std::int64_t sec,
-                    std::int64_t nsec) {
+void write_timespec(FlatMemory& memory, std::uint64_t addr, std::int64_t sec, std::int64_t nsec) {
     std::array<std::uint8_t, 16> buf{};
     hyperion::syscall_detail::put_u64(buf.data(), 0, static_cast<std::uint64_t>(sec));
     hyperion::syscall_detail::put_u64(buf.data(), 8, static_cast<std::uint64_t>(nsec));
@@ -1812,8 +1811,7 @@ HYPERION_TEST("syscall", "linux_compat_nanosleep_rejects_bad_arguments") {
 
     // TIMER_ABSTIME is the only flag clock_nanosleep accepts.
     write_timespec(memory, kBase + 0x100, 0, 0);
-    s = syscall_state(230, {1 /*CLOCK_MONOTONIC*/, 0x40 /*not TIMER_ABSTIME*/, kBase + 0x100,
-                            0});
+    s = syscall_state(230, {1 /*CLOCK_MONOTONIC*/, 0x40 /*not TIMER_ABSTIME*/, kBase + 0x100, 0});
     handler.handle(s, memory);
     HYPERION_CHECK_EQ(s.reg(Gpr::kRax), static_cast<std::uint64_t>(-hyperion::kEinval));
 }
@@ -1827,8 +1825,8 @@ HYPERION_TEST("syscall", "linux_compat_clock_nanosleep_absolute_deadline_is_imme
     // A deadline in the past must return at once rather than sleeping until the
     // epoch rolls round again.
     write_timespec(memory, kBase + 0x100, 1, 0);
-    GuestState s = syscall_state(
-        230, {0 /*CLOCK_REALTIME*/, 1 /*TIMER_ABSTIME*/, kBase + 0x100, 0});
+    GuestState s =
+        syscall_state(230, {0 /*CLOCK_REALTIME*/, 1 /*TIMER_ABSTIME*/, kBase + 0x100, 0});
     const auto start = std::chrono::steady_clock::now();
     handler.handle(s, memory);
     const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(

@@ -36,6 +36,23 @@ python3 tools/gen_syscall_inventory.py          # validate + regenerate
 python3 tools/gen_syscall_inventory.py --check  # validate only (CI)
 ```
 
+### What `status` means
+
+| Status | Meaning | Count today |
+| --- | --- | --- |
+| `not-started` | the number returns `-ENOSYS` | 247 |
+| `stubbed` | the number returns success but does not perform the call (e.g. `madvise`, `prctl`, `clock_getres`) | 6 |
+| `implemented` | the call is performed | 122 |
+| `validated` | implemented and covered by a dedicated test that also checks the failure paths | 0 |
+
+`stubbed` exists precisely so a stub cannot be counted as support. The status is
+not a self-assessment: the validator derives it from the source in both
+directions — every `case sysno::kX:` in `handle_unguarded()`, every number in
+`is_linux_compat_syscall()` (annotated `[stub]` or `[unsupported]`), every entry
+of the compatibility layer's adapter table, and every shipped alias rule must
+agree with this file. A number cannot be claimed as implemented without a
+handler, and a handler cannot exist without being claimed.
+
 The validator fails on a missing syscall, a duplicate number or name, a number
 that disagrees with the pinned table, an x32 entry, an invalid tier or status,
 and any syscall that the pinned table lists but the inventory does not (or vice

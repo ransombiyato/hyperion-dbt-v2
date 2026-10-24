@@ -127,7 +127,14 @@ IMPLEMENTED
   - full-system AArch64 + 128-bit ARMv8 NEON + IBTC dynamic binary translator (Tier 1)
   - static ET_EXEC / static-PIE ET_DYN AND dynamically linked PT_INTERP (ld-linux-x86-64.so.2)
     ELF64 execution with file-backed mmap, MAP_FIXED, and --sysroot support
-  - Linux x86-64 user-space syscall translation layer
+  - Linux x86-64 user-space syscall translation layer: 128 of 375 syscall numbers
+    answered (122 implemented, 6 stubbed), counted from docs/syscalls/inventory.tsv
+    by tools/gen_syscall_inventory.py --check so the number cannot drift
+  - multi-layer syscall dispatch (compiled rule table -> static switch -> legacy
+    compat switch -> ENOSYS), 39 ABI adapters translating x86-64/AArch64
+    structure-layout differences (packed epoll_event, pollfd, fd_set, rusage,
+    timespec, ...), and a persistent validated JSON registry outside the install
+    directory ('hyperion syscall-registry --list')
   - process creation: fork(2), vfork(2), the process-creating subset of clone(2),
     execve(2) and wait4(2), with fd inheritance, close-on-exec and pipes, so
     shell pipelines and programs that spawn subprocesses run
@@ -142,6 +149,13 @@ LIMITATIONS
     whichever tier it was using
   - namespace-creating clone flags return ENOSYS (they need CAP_SYS_ADMIN, which
     unrooted Android does not grant)
+  - no sockets, no inotify/signalfd, no file-backed mmap, no waitid
+  - ioctl covers TIOCGWINSZ only: TCGETS/TCSETS (terminal raw mode) are missing,
+    so a TUI cannot yet drive a terminal
+  - rt_sigaction, sigaltstack, prctl, madvise, fadvise64 and clock_getres are
+    stubs: they report success without doing the work, and are listed as
+    'stubbed' (not 'implemented') in the inventory
+  - futex is implemented but not yet validated by a dedicated test
   - no AVX2 / AVX-512 yet
 EOF
 }

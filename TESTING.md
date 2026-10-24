@@ -55,10 +55,15 @@ Presets are also provided: `cmake --preset debug`, `release`, `sanitize`,
 | `tests/harness/` | dependency-free harness (`HYPERION_TEST`, `HYPERION_CHECK`) |
 | `tests/unit/` | unit tests, one file per component |
 | `tests/differential/` | interpreter vs. real x86-64 hardware |
-| `tests/cli/` | end-to-end CLI tests (`cli_smoke.sh` for the blob path, `elf_test.sh` for the ELF path, `wrapper_test.sh` for the installed `hyperion` command) |
+| `tests/cli/` | end-to-end CLI tests (`cli_smoke.sh` for the blob path, `elf_test.sh` for the ELF path, `wrapper_test.sh` for the installed `hyperion` command, `registry_cli_test.sh` for the `syscall-registry` contract) |
 | `tests/fixtures/` | small committed test inputs (`tiny-static.elf`) |
 | `tests/guest/fixtures/` | **C sources** for real x86-64 guest programs, compiled by the test itself |
 | `tests/guest/process_test.sh` | guest process regression tests (fork/exec/fd/pipe/vfork exec release/clone child stack + BusyBox pipelines) |
+| `tests/guest/syscall_compat_test.sh` | guest-level tests of the syscall compatibility layer: adapted syscalls behave as they do natively, a user registry rule enables a syscall the binary does not implement, removing the rule restores `-ENOSYS`, and a corrupt registry changes nothing and is not overwritten |
+| `tests/unit/test_syscall_adapters.cpp` | per-adapter ABI translation (epoll/poll/select/pselect6, timerfd, eventfd, memfd, rusage/tms/itimers, fs metadata, `membarrier`) including the invalid-argument paths |
+| `tests/unit/test_syscall_registry.cpp` | path precedence, JSON schema, v1 migration, atomic write + `.bak`, permissions, corrupt/newer-schema handling, user rules surviving an update |
+| `tests/unit/test_syscall_dispatch.cpp` | rule compilation and every rejection path, alias argument rewrite/restore, counters, reload snapshot swap |
+| `tests/unit/test_json.cpp` | the dependency-free JSON reader/writer, including the malformed inputs the registry has to survive |
 | `tests/run_cross_tests.cmake` | cross-arch configure/build/run driver |
 | `benchmarks/` | harness smoke tests (`bench.smoke`, `tier_bench.smoke`) |
 
@@ -75,6 +80,9 @@ Registered CTest tests:
 | `cross.aarch64_tests` | the suite passes when compiled for AArch64 and run under `qemu-user` |
 | `guest.process` | real x86-64 guests create subprocesses correctly: exit status propagates, clone honors `child_stack`, `execve` runs another image and re-execs `/proc/self/exe`, descriptors/pipes survive `fork`, `vfork` unblocks on exec, unsupported clone flags return `ENOSYS`, and an optional static BusyBox runs shell pipelines |
 | `guest.process.tier1` | the same suite on the Tier 1 JIT; registered only with `-DHYPERION_ENABLE_GUEST_TIER1_TESTS=ON` (meaningful on an AArch64 host) |
+| `guest.syscall_compat` | the compatibility layer as a guest sees it (see below) |
+| `cli.syscall_registry` | the `syscall-registry` command's observable contract: resolved path, `0600` creation, `--write` not clobbering, `--validate` never rewriting the file, a rule that shadows a static implementation being refused with an explanation, `--json` agreeing with the effective rule set, exported defaults round-tripping |
+| `syscall_bench.smoke` / `syscall_bench.rejects_single_sample` | the dispatch microbenchmark runs, emits plausible numbers, and refuses a single-sample request rather than publishing a spread it cannot compute |
 
 `tests/cli/cli_smoke.sh` writes a small x86-64 blob, runs it through tier 0 and
 tier 1, and requires the same status and step count. On a host that cannot
@@ -137,6 +145,44 @@ suitable fixture is Debian's `busybox-static` (`/bin/busybox` from that package
 is a statically linked x86-64 ELF). To include the BusyBox pipelines in the
 AArch64-under-QEMU cross pipeline, set `HYPERION_BUSYBOX` in the environment
 before running `scripts/dev.sh cross-test`.
+
+### The syscall compatibility tests
+
+Three suites cover the compatibility layer, deliberately at different levels,
+because each one has failed to catch something the others missed:
+
+- **`unit.native`** (`test_syscall_adapters.cpp`, `test_syscall_registry.cpp`,
+  `test_syscall_dispatch.cpp`, `test_json.cpp`) — the compiled logic, including
+  every rejection path. Cheap, exhaustive, and it is where a structure offset or
+  a flag mapping is pinned.
+- **`cli.syscall_registry`** — the command a user actually runs. It exists
+  because `--validate` used to exit `0` while silently dropping a rule, and
+  `--json` used to print the file's contents instead of the effective rule set:
+  both are "works as designed, misleads the user" defects that no unit test on
+  the compiler would have caught.
+- **`guest.syscall_compat`** — a real statically linked x86-64 program
+  (`tests/guest/fixtures/compat_syscalls.c`) doing 27 behavioural checks: epoll
+  round-trip with a 64-bit payload tag, poll/select readiness, timerfd, memfd,
+  `getrusage`, `times`, limits, `umask`, `mkdtemp`, truncate/fsync, symlink and
+  hard link, chdir/getcwd, sched_yield, membarrier, and a 60 ms `nanosleep` whose
+  elapsed time is measured rather than trusted. The same binary is run natively
+  first and must pass, so the test cannot be wrong about what correct behaviour
+  is.
+
+The guest suite also proves the registry *causes* the behaviour rather than merely
+accompanying it: the fixture uses syscall `300`, which does not exist on x86-64,
+and the test writes a rule mapping it to `getpid(2)`. It succeeds with the rule,
+returns `-ENOSYS` without it, and the corrupt-registry case proves a broken file
+neither changes behaviour nor gets overwritten.
+
+Two lessons worth keeping:
+
+- A stub is worse than a refusal, and only a guest can tell the difference. The
+  `nanosleep` stub returned success instantly; the fixture catches it by measuring
+  elapsed time, which no exit-status check ever would.
+- Run the sanitizer build. The `poll` adapter read eight bytes out of the
+  sixteen-bit `events` field of an eight-byte `struct pollfd`. The overrun stayed
+  inside the same stack frame, so every ordinary build passed; ASan did not.
 
 ### Diagnosing a guest that misbehaves
 
@@ -219,6 +265,62 @@ The translator manipulates raw memory and generates executable code, so
 sanitizers are expected to be central to correctness work from Phase 2 onward.
 Note: ASan interacts with custom code caches; where it must be disabled for a
 specific test, document why in the test.
+
+Measured on 2026-10-24 (GCC 14.2.0, Debian 13):
+
+```
+cmake -B build/asan -G Ninja -DCMAKE_BUILD_TYPE=Debug -DHYPERION_ENABLE_SANITIZERS=ON
+cmake --build build/asan -j8
+ctest --test-dir build/asan        # 16/16 passed
+```
+
+The first run of this build failed immediately, in the `poll` adapter: an eight
+byte read from an eight-byte `struct pollfd` buffer through a pointer four bytes
+in (`get_u64_le(raw + 4)`). The overflow landed inside the same stack frame, which
+is why no ordinary build ever noticed. It is worth running this build before
+believing any structure-layout code in the adapters.
+
+---
+
+## 5.1 Dispatch microbenchmark
+
+`benchmarks/syscall_bench.cpp` (target `hyperion_syscall_bench`, CTest
+`syscall_bench.smoke`) measures the cost of each dispatch layer, so a change to
+the hot path can be argued with a number instead of an opinion:
+
+```sh
+./build/dev/benchmarks/hyperion_syscall_bench --iterations 300000 --repeats 9
+./build/dev/benchmarks/hyperion_syscall_bench --json          # machine-readable
+```
+
+Method: one warm-up sample is discarded, the median and interquartile range of
+the remaining samples are reported, an optimisation barrier stops the loop being
+deleted, and every sample's checksum is compared so a miscompiled loop cannot
+look fast. A plausibility floor (BENCH-001) rejects results below the cost of a
+bare host syscall, and `--repeats 1` is refused outright.
+
+Measured 2026-10-24, x86-64 Debian 13, GCC 14.2.0 `-O2`, 300 000 iterations per
+sample, 9 samples (1 discarded):
+
+| Target | median ns | p25 | p75 | what it measures |
+| --- | --- | --- | --- | --- |
+| `host_getpid` | 121.0 | 120.7 | 121.7 | bare host `getpid(2)`, the floor for any handler |
+| `host_sched_yield` | 221.6 | 221.2 | 222.6 | bare host `sched_yield(2)`, the operation the adapter performs |
+| `direct_adapter` | 224.1 | 223.8 | 224.4 | the compiled adapter called directly, without dispatch |
+| `adapter_dispatch` | 237.4 | 236.8 | 237.8 | `handle()` → rule table → adapter (layer 1) |
+| `existing_dispatch` | 133.7 | 133.3 | 133.9 | `handle()` → static switch (layer 2) |
+| `unsupported` | 12.9 | 12.8 | 13.0 | `handle()` → `-ENOSYS` + counting (layer 4) |
+
+The rule table's own overhead (layer 1 minus a direct call) is **≈13 ns per
+call**, which is smaller than the noise of the syscall it dispatches to
+(`sched_yield` is ~222 ns). The refusal path is the cheapest of all, so an
+unsupported syscall cannot become a hot spot — but note that it is cheap because
+it does no I/O: it counts, and the reporting happens once, at the end of the run.
+
+**What these numbers are not.** They are host-CPU measurements of the dispatch
+layer only. They exclude guest instruction translation, and they say nothing about
+an AArch64 device — this host is x86-64 and could not run Tier 1 at all. Do not
+quote them as end-to-end performance.
 
 ---
 

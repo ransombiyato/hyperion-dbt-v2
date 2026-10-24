@@ -86,8 +86,7 @@ HYPERION_TEST("json", "floats_are_marked_non_integer") {
 }
 
 HYPERION_TEST("json", "rejects_duplicate_keys") {
-    HYPERION_CHECK_EQ(parse_error(R"({"a": 1, "a": 2})"),
-                      std::string("duplicate object key"));
+    HYPERION_CHECK_EQ(parse_error(R"({"a": 1, "a": 2})"), std::string("duplicate object key"));
 }
 
 HYPERION_TEST("json", "rejects_trailing_comma") {

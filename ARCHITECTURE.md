@@ -200,47 +200,116 @@ Still planned (Phase 5+):
 
 Guest `syscall` instructions are intercepted and translated. The layer owns:
 
-- argument register marshalling (`RDI,RSI,RDX,R10,R8,R9` → `X0..X5`, `RAX`→`X8`);
-- structure layout differences (e.g. `stat`, `epoll_event`, `iovec` where
-  widths differ);
-- memory mapping (`mmap`/`munmap`/`mprotect`) coordination with the code cache;
-- guest signal *handler invocation*, thread creation (`clone` with `CLONE_VM`/
-  `CLONE_THREAD`), futexes, and `rseq`.
+- argument register marshalling (`RDI,RSI,RDX,R10,R8,R9` → no host register at
+  all: HYPERION performs the operation itself or calls the host with translated
+  arguments);
+- structure layout differences (`stat`, `statx`, `epoll_event`, `pollfd`,
+  `rusage`, `tms`, `itimerval`, `timespec`, `fd_set`, `iovec`);
+- guest-to-host **file descriptor translation** — a guest integer never names a
+  host descriptor;
+- memory validation of every guest pointer against the `GuestAddressSpace`
+  before it is dereferenced;
+- guest signal *handler invocation*, thread creation, futexes and `rseq` (see
+  the status matrix in `docs/syscalls/`); none of these is claimed beyond what
+  the tests show.
 
-Process creation **is** implemented: `fork`/`vfork`/the process-creating subset of
-`clone`/`execve`/`wait4` live in `src/core/process.cpp`. A guest child is a real
-host process running a deep copy of the `GuestAddressSpace`, because guest pages
-are host heap storage owned by that object — a bare host `fork` would leave parent
-and child sharing the same vectors until either side `mmap`/`munmap`s and
-reallocates them, invalidating the other's cached host page pointers. Thread
-creation is refused with `-ENOSYS` rather than approximated, because a guest that
-asked for a shared address space and quietly received a private copy would corrupt
-its own memory. See COMPATIBILITY.md §5.05.
+A guest syscall number is **never** forwarded to the host kernel. There is no
+`syscall(number, ...)` passthrough anywhere in the layer: the number selects one
+of a fixed set of implementations, and an unknown number returns `-ENOSYS`.
 
-**Implemented so far.** `SyscallHandler` (`include/hyperion/syscall.hpp`) is the
-interface both tiers call. `MinimalSyscallHandler` implements `read`,
-`write`, `close`, `lseek`, `exit`/`exit_group`, and
-`mmap`/`mprotect`/`munmap`/`brk`; every other number returns `-ENOSYS`. The
-memory syscalls act on a `GuestAddressSpace`
-(`include/hyperion/address_space.hpp`) supplied by the caller, not a hidden
-global, so the same address space is shared with the interpreter or translation
-cache. The handler reads `rax` for the number, reads the argument registers,
-validates guest pointers against the address space, and writes `rax`. The guest
-never receives a raw host pointer.
+### 6.1 Dispatch pipeline
 
-The file-descriptor syscalls act on a **guest descriptor table** the handler
-owns (guest fd → host `FILE*`), not on host file descriptors. A guest fd that is
-not in the table is `-EBADF`, so a guest integer can never name an arbitrary host
-descriptor. The table starts with fd 0/1/2 on the process's stdin/stdout/stderr;
-`MinimalSyscallHandler::adopt()` attaches an already-open host stream under
-another guest fd. The handler does not own the streams and never `fclose`s them.
-`openat`(257) is implemented for `AT_FDCWD` and a bounded flag set; a real
-`dirfd` or an unhandled flag returns `-ENOSYS` and is counted as unimplemented
-(see `DECISIONS.md` D-024, D-025).
+`MinimalSyscallHandler::handle()` is the single entry point both tiers call. It
+runs four layers in a fixed order, and each layer is cheaper to ask than the next
+one is to run:
+
+| # | Layer | Cost when it answers | What it may do |
+| --- | --- | --- | --- |
+| 1 | Compiled rule table (`SyscallDispatcher::lookup`) | one bounds check + one array index | call a **whitelisted adapter** by id, or rewrite the argument registers for an alias |
+| 2 | `handle_unguarded()` switch | a jump table on the syscall number | the statically implemented syscalls |
+| 3 | Legacy `linux_compat_` switch | only reached for numbers layer 2 does not claim | the older `enable_linux_compat()` implementations |
+| 4 | Refusal | plain `-ENOSYS` | count the number as unsupported, for diagnostics only |
+
+The rule table is a `std::array` indexed by syscall number up to
+`kMaxSyscall = 512`, so layer 1 is constant time and allocation-free. There is
+**no** JSON parsing, filesystem access, lock, allocation, or string hashing on
+this path: the registry is parsed once, `reload()` compiles it into an immutable
+`CompiledRules` snapshot held in a `shared_ptr`, and dispatch only ever reads
+that snapshot. A concurrent `reload()` swaps the pointer; a syscall already in
+flight keeps using the snapshot it started with.
+
+The layers are ordered so that the static implementation always wins: a registry
+rule for a number that layer 2 or 3 implements is **rejected at compile time**
+with a diagnostic, rather than silently shadowing tested code. Rules can only
+add syscalls HYPERION does not otherwise answer.
+
+### 6.2 What an adapter is, and what it is not
+
+An adapter is a C++ function identified by a name from a fixed table
+(`kAdapterTable` in `src/core/syscall_adapters.cpp`). The registry may name an
+adapter; it may not name a host syscall number, a library, a shell command or an
+expression. A rule's `handler` field is looked up in that table and an unknown
+handler name is a validation error, so the JSON file cannot widen the set of
+things HYPERION executes — only choose among implementations that are compiled
+into the binary and covered by the test suite.
+
+Each adapter declares the argument `transforms` it performs (for example
+`packed_epoll_event`, `fd_set`, `pollfd_array`). The declaration is checked
+against the compiled list, and a mismatch between what a rule claims and what the
+adapter does is a compile error. `return_transform` must be `errno_negative`,
+because a negative-`errno` return is the only convention the guest ABI allows.
+
+### 6.3 The persistent registry
+
+`~/.local/share/hyperion/syscalls/registry.json`
+(`$XDG_DATA_HOME/hyperion/syscalls/registry.json` when set; Termux on Android
+uses the same resolution) holds the user's rules. It lives outside the install
+directory so that upgrading HYPERION cannot overwrite it, and `install.sh`
+creates it only when it is absent.
+
+- **Resolution order:** `--syscall-registry=FILE` → `$HYPERION_SYSCALL_REGISTRY`
+  → `$XDG_DATA_HOME` → `$HOME/.local/share`. The chosen path and the reason are
+  printed by `hyperion syscall-registry --list`, so there is never a question
+  about which file is in effect.
+- **Safety:** the reader caps the file at 16 MiB, validates every field, rejects
+  unknown handlers and out-of-range numbers, and writes atomically (temp file +
+  `fsync` + `rename` + directory `fsync`, previous contents kept as `.bak`,
+  files `0600`, directories `0700`).
+- **Failure is never fatal:** a missing, unreadable, corrupt or newer-schema file
+  leaves the built-in rules in force and never prevents startup. A file is never
+  rewritten as a side effect of reading it.
+- **Schema migration:** v1 documents are migrated to v2 in memory on read and
+  are not written back unless the user asks.
+- **Provenance:** every rule carries an `origin` (`builtin`, `package`, `user`)
+  so package-shipped defaults can be updated without touching user rules, and
+  the shipped defaults are merged by rule id.
+
+### 6.4 Observability
+
+`SyscallCounters` records, per run, how many calls were answered by each layer,
+how many translations failed, and the set of unsupported numbers with their
+first-seen order. The summary line is printed by `hyperion run`:
+
+```
+syscall dispatch: adapter=8 alias=0 existing=18 unsupported=1 translation_failures=0
+unsupported syscalls: 1 unique
+  232 (0xe8) <unknown>
+registry: /home/user/.local/share/hyperion/syscalls/registry.json (39 adapter rule(s), 2 alias rule(s))
+```
+
+`unsupported` counts **events**; the unique list below it counts **numbers**.
+The older `unimplemented syscalls: N` line that the interpreter and translation
+cache print has always counted events (each occurrence of a refused call), not
+distinct numbers, and it includes refusal of a syscall that a *later* layer then
+handles successfully — that is why the dispatch summary separates the two.
+`HYPERION_TRACE_SYSCALLS=1` logs every call with its number, result and host pid
+via `write(2)`, so tracing cannot corrupt the guest's own buffered output.
 
 Compatibility is claimed only via the feature matrix in
-[`COMPATIBILITY.md`](COMPATIBILITY.md) backed by integration tests. A handful
-of working programs does **not** constitute "Linux compatibility".
+[`COMPATIBILITY.md`](COMPATIBILITY.md) backed by integration tests, and the
+coverage counts in [`STATUS.md`](STATUS.md) are generated from
+`docs/syscalls/inventory.tsv` through `tools/gen_syscall_inventory.py --check`.
+A handful of working programs does **not** constitute "Linux compatibility".
 
 ---
 

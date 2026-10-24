@@ -70,12 +70,12 @@ enum AdapterFlags : std::uint32_t {
 // One entry of the compiled-in adapter whitelist. The registry selects a handler
 // by `id`; nothing else in the registry can name executable behaviour.
 struct AdapterDescriptor {
-    const char* id;           // stable registry handler id, e.g. "compat.chdir"
-    std::uint64_t syscall;    // x86-64 guest syscall number it implements
-    const char* name;         // symbolic name for diagnostics
-    AdapterFn fn;             // compiled implementation
-    std::uint32_t flags;      // AdapterFlags
-    const char* summary;      // one-line description for `hyperion syscall-registry list`
+    const char* id;        // stable registry handler id, e.g. "compat.chdir"
+    std::uint64_t syscall; // x86-64 guest syscall number it implements
+    const char* name;      // symbolic name for diagnostics
+    AdapterFn fn;          // compiled implementation
+    std::uint32_t flags;   // AdapterFlags
+    const char* summary;   // one-line description for `hyperion syscall-registry list`
     // Null-terminated list of ABI transformations this adapter performs. A
     // registry rule must declare exactly this set, so a rule can never claim a
     // transformation that is not performed nor omit one that is.
@@ -111,7 +111,7 @@ struct DispatchEntry {
 // constant or from argument `value` of the *source* syscall.
 struct CompiledAlias {
     std::uint64_t target = 0;
-    std::array<std::uint8_t, 6> from_arg{};   // 0xFF = not from an argument
+    std::array<std::uint8_t, 6> from_arg{}; // 0xFF = not from an argument
     std::array<std::int64_t, 6> constant{};
     std::uint8_t count = 0;
 };
@@ -121,7 +121,7 @@ struct CompiledAlias {
 // invalidating a concurrent reader's view.
 struct CompiledRules {
     std::array<DispatchEntry, kMaxSyscall> table{};
-    std::vector<CompiledAlias> aliases;  // index referenced by DispatchKind::kGuestAlias
+    std::vector<CompiledAlias> aliases; // index referenced by DispatchKind::kGuestAlias
     std::vector<RegistryRule> rules;
     std::string source_path;
     std::string fingerprint;
@@ -223,9 +223,7 @@ struct SyscallAccess {
     static std::vector<GuestDescriptor>& mutable_files(MinimalSyscallHandler& handler) {
         return handler.files_;
     }
-    static bool linux_compat(const MinimalSyscallHandler& handler) {
-        return handler.linux_compat_;
-    }
+    static bool linux_compat(const MinimalSyscallHandler& handler) { return handler.linux_compat_; }
     static const std::string& sysroot(const MinimalSyscallHandler& handler) {
         return handler.sysroot_;
     }
@@ -264,9 +262,15 @@ public:
         return e.kind == DispatchKind::kNone ? nullptr : &e;
     }
 
-    void note_adapter_success() noexcept { counters_.handled_adapter.fetch_add(1, std::memory_order_relaxed); }
-    void note_alias_success() noexcept { counters_.handled_alias.fetch_add(1, std::memory_order_relaxed); }
-    void note_existing_success() noexcept { counters_.handled_existing.fetch_add(1, std::memory_order_relaxed); }
+    void note_adapter_success() noexcept {
+        counters_.handled_adapter.fetch_add(1, std::memory_order_relaxed);
+    }
+    void note_alias_success() noexcept {
+        counters_.handled_alias.fetch_add(1, std::memory_order_relaxed);
+    }
+    void note_existing_success() noexcept {
+        counters_.handled_existing.fetch_add(1, std::memory_order_relaxed);
+    }
     void note_unsupported(std::uint64_t number) noexcept {
         counters_.unsupported_events.fetch_add(1, std::memory_order_relaxed);
         unsupported_.add(number);

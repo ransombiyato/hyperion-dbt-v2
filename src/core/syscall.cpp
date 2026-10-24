@@ -105,8 +105,7 @@ int underlying_host_fd(const OpenFileDescription& ofd) {
 
 // Allocate the lowest free guest descriptor >= min_fd, as the kernel does.
 std::int64_t alloc_fd(std::vector<GuestDescriptor>& files,
-                      std::shared_ptr<OpenFileDescription> desc, bool cloexec,
-                      std::size_t min_fd) {
+                      std::shared_ptr<OpenFileDescription> desc, bool cloexec, std::size_t min_fd) {
     constexpr std::size_t kMaxGuestFds = 4096;
     if (min_fd >= kMaxGuestFds) {
         return -kEinval;
@@ -384,6 +383,19 @@ std::uint64_t get_u64_le(const std::uint8_t* p) {
         v |= static_cast<std::uint64_t>(p[i]) << (8 * i);
     }
     return v;
+}
+
+std::uint32_t get_u32_le(const std::uint8_t* p) {
+    std::uint32_t v = 0;
+    for (int i = 0; i < 4; ++i) {
+        v |= static_cast<std::uint32_t>(p[i]) << (8 * i);
+    }
+    return v;
+}
+
+std::uint16_t get_u16_le(const std::uint8_t* p) {
+    return static_cast<std::uint16_t>(static_cast<std::uint16_t>(p[0]) |
+                                      (static_cast<std::uint16_t>(p[1]) << 8));
 }
 
 // readv(fd, iov, iovcnt) & writev(fd, iov, iovcnt): scatter/gather I/O over
@@ -690,6 +702,13 @@ void put_u64(std::uint8_t* buf, std::size_t off, std::uint64_t value) {
 
 void put_u32(std::uint8_t* buf, std::size_t off, std::uint32_t value) {
     for (int i = 0; i < 4; ++i) {
+        buf[off + static_cast<std::size_t>(i)] =
+            static_cast<std::uint8_t>((value >> (8 * i)) & 0xFF);
+    }
+}
+
+void put_u16(std::uint8_t* buf, std::size_t off, std::uint16_t value) {
+    for (int i = 0; i < 2; ++i) {
         buf[off + static_cast<std::size_t>(i)] =
             static_cast<std::uint8_t>((value >> (8 * i)) & 0xFF);
     }
@@ -1171,7 +1190,9 @@ int MinimalSyscallHandler::reload_syscall_registry(const RegistryOptions& option
     return report.status == RegistryReport::Status::kOk ? 0 : 1;
 }
 
-const SyscallDispatcher& MinimalSyscallHandler::dispatcher() const noexcept { return *dispatcher_; }
+const SyscallDispatcher& MinimalSyscallHandler::dispatcher() const noexcept {
+    return *dispatcher_;
+}
 
 bool MinimalSyscallHandler::adopt(int guest_fd, std::FILE* stream) {
     if (guest_fd < 0 || stream == nullptr) {
@@ -1516,10 +1537,10 @@ void apply_alias(const CompiledAlias& alias, GuestState& state, std::uint64_t (&
             continue;
         }
         const std::uint8_t source = alias.from_arg[static_cast<std::size_t>(i)];
-        state.reg(kArgRegs[i]) = (source == 0xFF)
-                                     ? static_cast<std::uint64_t>(
-                                           alias.constant[static_cast<std::size_t>(i)])
-                                     : saved[source];
+        state.reg(kArgRegs[i]) =
+            (source == 0xFF)
+                ? static_cast<std::uint64_t>(alias.constant[static_cast<std::size_t>(i)])
+                : saved[source];
     }
 }
 
@@ -2067,7 +2088,7 @@ SyscallResult MinimalSyscallHandler::handle_unguarded(GuestState& state, Memory&
             case 229: // clock_getres [stub]
                 r = 0;
                 break;
-            case 35:  // nanosleep(req, rem)
+            case 35:    // nanosleep(req, rem)
             case 230: { // clock_nanosleep(clockid, flags, req, rem)
                 // Sleeping used to be a stub that returned 0 immediately. That is
                 // not harmless: every retry/backoff loop in the guest becomes a
@@ -2112,10 +2133,8 @@ SyscallResult MinimalSyscallHandler::handle_unguarded(GuestState& state, Memory&
                     // absolute form never gets a remainder pointer written.
                     if (!absolute_form && rem_addr != 0) {
                         std::array<std::uint8_t, 16> rem{};
-                        put_u64(rem.data(), 0,
-                                static_cast<std::uint64_t>(host_rem.tv_sec));
-                        put_u64(rem.data(), 8,
-                                static_cast<std::uint64_t>(host_rem.tv_nsec));
+                        put_u64(rem.data(), 0, static_cast<std::uint64_t>(host_rem.tv_sec));
+                        put_u64(rem.data(), 8, static_cast<std::uint64_t>(host_rem.tv_nsec));
                         if (!memory.write(rem_addr, rem.data(), rem.size())) {
                             r = -kEfault;
                             break;

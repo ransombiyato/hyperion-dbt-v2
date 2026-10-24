@@ -216,17 +216,28 @@ Phase 6/7.
 
 ## 5. Linux ABI / syscall coverage
 
-Phase 6, tenth slice. The `syscall` instruction is decoded and routed through
-`SyscallHandler` in both tiers. **Twenty-seven syscalls are implemented** (`read`,
-`write`, `close`, `fstat`, `lseek`, `mmap`, `mprotect`, `munmap`, `brk`,
-`getpid`, `exit`, `getcwd`, `getuid`, `getgid`, `geteuid`, `getegid`, `getppid`,
-`gettid`, `getdents64`, `exit_group`, `openat`, `newfstatat`, `access`,
-`readlink`, `readlinkat`, `statx`, `getrandom`); every other number returns
-`-ENOSYS` explicitly (never a
-silent success) and is counted in `RunResult::unimplemented_syscalls`. Guest
-pointers are validated against the mapped region (`-EFAULT`), so a guest can
-never read host memory. Per-syscall status lives in `docs/syscalls/inventory.tsv`
-(the canonical source); this table is the summary.
+Phase 6, syscall compatibility engine. The `syscall` instruction is decoded and
+routed through `SyscallHandler` in both tiers. **128 of the 375** syscalls in the
+pinned Linux 6.12 x86-64 table are answered — 122 implemented and 6 stubbed — and
+every other number returns `-ENOSYS` explicitly (never a silent success) and is
+counted in `RunResult::unimplemented_syscalls`. Guest pointers are validated
+against the mapped region (`-EFAULT`), so a guest can never read host memory.
+Per-syscall status lives in `docs/syscalls/inventory.tsv` (the canonical source,
+enforced in both directions by `tools/gen_syscall_inventory.py --check`); this
+table is the summary and `STATUS.md` §0e is the narrative.
+
+Three layers answer a call, and which one answers matters for what is guaranteed:
+
+1. **Statically implemented** syscalls (`handle_unguarded()`), covered by unit
+   tests in `tests/unit/test_syscall.cpp`.
+2. **Compatibility adapters**, which exist for the calls whose ABIs differ
+   between x86-64 and AArch64 — the packed `epoll_event`, `struct pollfd`,
+   `fd_set`, `struct rusage`, `struct tms`, `struct itimerval` and `timespec`
+   cases — plus the calls that need the guest descriptor table. Enabled by a
+   registry rule; see §5.06.
+3. **Legacy `linux_compat_` implementations** (`open`, `stat`, `rename`, `mkdir`,
+   `ioctl`, `futex`, `utimensat`, …), which need
+   `MinimalSyscallHandler::enable_linux_compat()`.
 
 `read`/`close`/`lseek`/`openat`/`fstat` operate on a **guest descriptor table**
 owned by the handler, not on host file descriptors: the handler maps guest fd →
@@ -294,12 +305,14 @@ guest buffer from the host in 4 KiB chunks, accepting only the two defined
 | Unknown number → `-ENOSYS` | ✅ | 6 | `syscall.unknown_number_is_enosys_not_silent` |
 | `brk`(12) over the guest heap | ✅ | 6 | `syscall.brk_returns_the_new_break` |
 | `mmap`(9) anonymous, `mprotect`(10), `munmap`(11) | ✅ (anonymous only) | 6 | `syscall.mmap_*`, `syscall.mprotect_*`, `syscall.munmap_*`, `syscall.mmap_end_to_end_*` |
-| `open`(2, legacy), `openat2`(437) | ⬜ | 6 | — |
-| `stat`(4)/`lstat`(6) as distinct entry points (glibc uses `newfstatat`) | ⬜ | 6 | — |
-| `faccessat`(269)/`faccessat2`(439) | ⬜ | 6 | — |
+| `open`(2, legacy) via `linux_compat` | ✅ (scoped: `AT_FDCWD`, honoured flags) | 6 | `guest.syscall_compat` |
+| `openat2`(437) | ⬜ | 6 | — |
+| `stat`(4)/`lstat`(6) as distinct entry points (glibc uses `newfstatat`) | ✅ (guest `struct stat` layout, `linux_compat`) | 6 | `guest.syscall_compat` |
+| `faccessat`(269)/`faccessat2`(439) | ✅ | 6 | `guest.syscall_compat` |
 | `mmap` file-backed, `MAP_SHARED` | ⬜ | 6 | — |
-| `arch_prctl` (FS/GS base, TLS) | ⬜ | 6 | — |
-| `set_tid_address`, `rseq`, `prlimit64` | ⬜ | 6 | — |
+| `arch_prctl`(158) (FS base; `ARCH_SET_FS`/`ARCH_GET_FS`) | ✅ | 6 | `syscall.phase6_extended_*` |
+| `set_tid_address`(218), `set_robust_list`(273), `prlimit64`(302) | ✅ | 6 | `syscall.phase6_extended_*` |
+| `rseq`(334) | ❌ recognised, refused with a clean `-ENOSYS` (glibc proceeds without it) | 6 | `guest.syscall_compat` |
 | `fork`(57) | ✅ | 6 | `guest.process` (`fork + waitpid exit status`) |
 | `vfork`(58) | ✅ (parent suspends; address space **not** shared) | 6 | `guest.process` (`vfork`) |
 | `clone`(56) — process-creating subset | ✅ (partial; `SIGCHLD`, `child_stack`, tid/TLS flags) | 6 | `guest.process` (`process clone honors child_stack`, raw unsupported-flag check) |
@@ -309,9 +322,17 @@ guest buffer from the host in 4 KiB chunks, accepting only the two defined
 | `wait4`(61) | ✅ (`WNOHANG`/`WUNTRACED`/`WCONTINUED`, `struct rusage`) | 6 | `guest.process` (`fork + waitpid exit status`) |
 | `waitid`(247) | ⬜ (`siginfo_t` layout differs per arch; BusyBox and glibc use `wait4`) | 6 | — |
 | `pipe`(22)/`pipe2`(293) + inheritance across `fork` | ✅ | 6 | `guest.process` (`pipe + fork IPC`, `file descriptor inheritance`) |
-| `futex`, threading (multi-threaded guests) | ⬜ | 6 | — |
-| Signals: `rt_sigaction`/`rt_sigprocmask` recorded; guest handlers **not** invoked | ⚠️ partial | 6 | — |
-| `epoll`, `poll`, `select` | ⬜ | 6 | — |
+| `futex`(202) — `WAIT`/`WAKE`, `PRIVATE` variants | ✅ implemented, **not validated** (no dedicated test yet) | 6 | indirect only |
+| Thread creation (`clone` with `CLONE_THREAD`) | ❌ `-ENOSYS` by design | 6 | `guest.process` |
+| Signals: `rt_sigaction`(13) **stub**, `rt_sigprocmask`(14) tracked in a guest mask, handlers **not** invoked | ⚠️ partial (deliberate stubs, listed as such in the inventory) | 6 | — |
+| `kill`(62)/`tgkill`(234) | ✅ (signal delivery to the single guest thread) | 6 | — |
+| `epoll_create1`(291)/`epoll_ctl`(233)/`epoll_wait`(232)/`epoll_pwait`(281)/`epoll_pwait2`(441) | ✅ (packed 12-byte guest `epoll_event` converted per entry) | 6 | `syscall_adapters.*`, `guest.syscall_compat` |
+| `poll`(7)/`ppoll`(271), `select`(23)/`pselect6`(270) | ✅ (`pollfd` and `fd_set` translated, guest fds restored on write-back) | 6 | `syscall_adapters.*`, `guest.syscall_compat` |
+| `eventfd2`(290), `timerfd_create`(283)/`settime`(286)/`gettime`(287), `memfd_create`(319) | ✅ | 6 | `syscall_adapters.*`, `guest.syscall_compat` |
+| Filesystem metadata: `rename`(82)/`renameat`(264)/`renameat2`(316), `mkdir`(83)/`mkdirat`(258), `rmdir`(84), `unlink`(87)/`unlinkat`(263), `link`(86)/`linkat`(265), `symlink`(88)/`symlinkat`(266), `chmod`(90)/`fchmod`(91)/`fchmodat`(268), `truncate`(76)/`ftruncate`(77), `fsync`(74)/`fdatasync`(75)/`sync`(162)/`syncfs`(306), `chdir`(80)/`fchdir`(81), `umask`(95), `statfs`(137)/`fstatfs`(138), `utimensat`(280) | ✅ | 6 | `syscall_adapters.*`, `guest.syscall_compat` |
+| `nanosleep`(35), `clock_nanosleep`(230) | ✅ (real sleep, `-EINTR` with the unslept remainder, `TIMER_ABSTIME`) | 6 | `syscall.linux_compat_nanosleep_*`, `guest.syscall_compat` |
+| Resource/scheduling: `getrusage`(98), `times`(100), `getrlimit`(97)/`setrlimit`(160), `sched_getparam`(143)/`sched_setscheduler`(144)/`sched_getscheduler`(145)/`sched_get_priority_max`(146)/`sched_get_priority_min`(147), `sched_getaffinity`(204), `getitimer`(36)/`setitimer`(38), `setsid`(112)/`setpgid`(109)/`getpgid`(121)/`getpgrp`(111), `sched_yield`(24), `membarrier`(324) | ✅ | 6 | `syscall_adapters.*`, `guest.syscall_compat` |
+| Stubs (answer success, do nothing): `madvise`(28), `sigaltstack`(131), `prctl`(157), `fadvise64`(221), `clock_getres`(229), `rt_sigaction`(13) | ⚠️ stubbed — **not** claimed as implemented | 6 | inventory status `stubbed` |
 | `io_uring`, `rseq`, `vDSO` | ⬜ | 6/7 | — |
 
 ---
@@ -447,6 +468,35 @@ is no userspace dynamic loader, and loading it anyway would fail somewhere
 confusing. The startup `auxv` is currently a single `AT_NULL` pair, so a program
 that reads `AT_PAGESZ`/`AT_HWCAP`/… sees an empty vector — a documented gap, not
 a wrong value.
+
+---
+
+## 5.06 ABI translation done by the compatibility layer
+
+Every row below is a case where the x86-64 guest and the AArch64 host disagree
+about something other than the register convention, so a copy would be wrong.
+Each is implemented in `src/core/syscall_adapters.cpp` and covered by
+`tests/unit/test_syscall_adapters.cpp`; the guest fixture
+`tests/guest/fixtures/compat_syscalls.c` exercises the same paths from a real
+statically linked binary.
+
+| Guest structure / convention | x86-64 (what the guest sees) | Host (AArch64) | Translation |
+| --- | --- | --- | --- |
+| `struct epoll_event` | **packed, 12 bytes**: `u32 events` at 0, `u64 data` at 4 | 16 bytes, `data` at 8, 8-byte aligned | converted **per entry**, never `memcpy`'d; the guest's `data` payload is preserved bit-for-bit (verified with a 64-bit tag `0x1122334455667788`) |
+| `struct pollfd` | 8 bytes: `int fd`, `short events` (4), `short revents` (6) | same layout | guest fds translated to host fds, then **written back as guest fds**; `events` is an input and is preserved on write-back (it used to be dropped) |
+| `fd_set` | 1024 bits, word order `fd / 64`, bit `fd % 64` | same | rebuilt bit by bit from the guest's set, since the descriptor *numbers* differ |
+| `struct rusage` | 144 bytes, 18 × `s64`/`timeval` pairs | different size and field offsets | field by field |
+| `struct tms` | 4 × `clock_t` (8 bytes each on x86-64) | same width on AArch64 | copied field by field |
+| `struct itimerval` / `itimerspec` | `timeval`/`timespec` of 64-bit fields | same | validated then copied |
+| `timespec` (`nanosleep`, `clock_nanosleep`) | `s64 tv_sec`, `s64 tv_nsec` | same layout, same `CLOCK_*` ids | validated (`0 ≤ tv_nsec < 1e9`), copied, real host call; `-EINTR` writes the **unslept remainder** back for the relative form only, as Linux does |
+| Guest fd numbers | arbitrary guest integers | host descriptors | every adapter resolves through the handler's guest descriptor table; an unknown guest fd is `-EBADF` and never reaches the host |
+| `errno` conventions | errors are `-errno` in `rax` | C library sets `errno` | adapters return the negated value directly; `-ENOSYS` from an adapter means "declined to translate" and is counted as unsupported, **not** as handled |
+| `ioctl` requests (`TIOCGWINSZ`, …) | request numbers and `struct winsize` differ per arch | as host | request constants are compared against the *guest's* values and the payload is built in the guest layout |
+| `epoll` timeouts | `epoll_wait`/`epoll_pwait` take the timeout **by value**, not by pointer | same | handled as a value, which a pointer-based reading would have got wrong |
+
+Flags are translated rather than passed through where the values differ; for
+example `openat`'s `O_*` bits are mapped explicitly (`translate_open_flags`)
+instead of being assumed equal across architectures.
 
 ---
 

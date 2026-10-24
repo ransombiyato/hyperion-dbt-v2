@@ -340,9 +340,8 @@ int cmd_run(int argc, char** argv) {
         // literal `--dump` to a guest.
         const bool is_hyperion_option =
             arg.rfind("--tier=", 0) == 0 || arg.rfind("--max-steps=", 0) == 0 ||
-            arg.rfind("--sysroot=", 0) == 0 || arg == "--quiet" || arg == "-q" ||
-            arg == "--dump" || arg == "--no-syscall-registry" ||
-            arg.rfind("--syscall-registry=", 0) == 0;
+            arg.rfind("--sysroot=", 0) == 0 || arg == "--quiet" || arg == "-q" || arg == "--dump" ||
+            arg == "--no-syscall-registry" || arg.rfind("--syscall-registry=", 0) == 0;
 
         if (is_hyperion_option) {
             if (arg.rfind("--tier=", 0) == 0) {
@@ -445,7 +444,8 @@ int cmd_syscall_registry(int argc, char** argv) {
     }
 
     if (export_defaults) {
-        std::printf("%s", hyperion::document_to_text(hyperion::default_registry_document()).c_str());
+        std::printf("%s",
+                    hyperion::document_to_text(hyperion::default_registry_document()).c_str());
         return 0;
     }
 
@@ -465,7 +465,6 @@ int cmd_syscall_registry(int argc, char** argv) {
             rejected_rules.push_back(diagnostic.substr(std::strlen("rejected: ")));
         }
     }
-
 
     if (as_json) {
         // A machine-readable view of what will actually happen, not of the file's

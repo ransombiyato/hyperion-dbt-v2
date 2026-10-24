@@ -25,14 +25,18 @@ namespace hyperion {
 
 namespace {
 
-std::int64_t now_unix() { return static_cast<std::int64_t>(::time(nullptr)); }
+std::int64_t now_unix() {
+    return static_cast<std::int64_t>(::time(nullptr));
+}
 
 std::string get_env(const char* name) {
     const char* v = std::getenv(name);
     return v == nullptr ? std::string() : std::string(v);
 }
 
-bool is_absolute(const std::string& path) { return !path.empty() && path.front() == '/'; }
+bool is_absolute(const std::string& path) {
+    return !path.empty() && path.front() == '/';
+}
 
 // Join two path fragments without doubling or dropping the separator.
 std::string join_path(const std::string& a, const std::string& b) {
@@ -349,10 +353,9 @@ RegistryRule rule_from_json(const json::Value& value, std::vector<std::string>& 
     }
 
     report_unknown_fields(value,
-                          {"id", "name", "syscall", "implementation", "handler",
-                           "target_syscall", "arg_source", "transforms", "requires",
-                           "return_transform", "notes", "origin_detail", "enabled",
-                           "rule_version", "origin"},
+                          {"id", "name", "syscall", "implementation", "handler", "target_syscall",
+                           "arg_source", "transforms", "requires", "return_transform", "notes",
+                           "origin_detail", "enabled", "rule_version", "origin"},
                           warnings, context);
     return rule;
 }
@@ -367,7 +370,8 @@ json::Value rule_to_json(const RegistryRule& rule) {
         v.set("handler", json::Value::make_string(rule.handler));
     }
     if (rule.implementation == RuleImplementation::kGuestAlias) {
-        v.set("target_syscall", json::Value::make_int(static_cast<std::int64_t>(rule.target_syscall)));
+        v.set("target_syscall",
+              json::Value::make_int(static_cast<std::int64_t>(rule.target_syscall)));
         json::Value args = json::Value::make_array();
         for (const AliasArg& a : rule.arg_source) {
             json::Value entry = json::Value::make_object();
@@ -553,16 +557,14 @@ RegistryDocument document_from_json(const json::Value& root, std::vector<std::st
         // change which syscalls are claimed.
         errors.push_back("document: schema_version " + std::to_string(schema) +
                          " is newer than this build supports (" +
-                         std::to_string(kRegistrySchemaVersion) +
-                         "); the file was left untouched");
+                         std::to_string(kRegistrySchemaVersion) + "); the file was left untouched");
         return document;
     }
     document.schema_version = static_cast<int>(schema);
 
     (void)read_string_field(root, "guest_arch", document.guest_arch, false, errors, "document");
     (void)read_string_field(root, "host_arch", document.host_arch, false, errors, "document");
-    (void)read_string_field(root, "generated_by", document.generated_by, false, errors,
-                            "document");
+    (void)read_string_field(root, "generated_by", document.generated_by, false, errors, "document");
     (void)read_string_field(root, "comment", document.comment, false, errors, "document");
     (void)read_integer_field(root, "created_unix", document.created_unix, false, errors,
                              "document");
@@ -583,8 +585,8 @@ RegistryDocument document_from_json(const json::Value& root, std::vector<std::st
             rule_from_json(rules->array[i], errors, warnings, static_cast<std::size_t>(i)));
     }
     report_unknown_fields(root,
-                          {"schema_version", "guest_arch", "host_arch", "generated_by",
-                           "comment", "created_unix", "updated_unix", "rules", "metadata"},
+                          {"schema_version", "guest_arch", "host_arch", "generated_by", "comment",
+                           "created_unix", "updated_unix", "rules", "metadata"},
                           warnings, "document");
     return document;
 }
@@ -619,8 +621,8 @@ bool migrate_document(RegistryDocument& document, std::vector<std::string>& warn
     }
     if (document.schema_version > kRegistrySchemaVersion) {
         error = "registry schema_version " + std::to_string(document.schema_version) +
-                " is newer than this build supports (" +
-                std::to_string(kRegistrySchemaVersion) + "); the file was left untouched";
+                " is newer than this build supports (" + std::to_string(kRegistrySchemaVersion) +
+                "); the file was left untouched";
         return false;
     }
     // Version 1 -> 2: per-rule `origin`, `rule_version` and `arg_source` became
@@ -708,8 +710,7 @@ RegistryReport load_registry(const RegistryOptions& options, RegistryDocument& o
             return report;
         }
         report.status = RegistryReport::Status::kUnreadable;
-        report.message = "cannot read " + info.path + ": " + read_error +
-                         "; using built-in rules";
+        report.message = "cannot read " + info.path + ": " + read_error + "; using built-in rules";
         report.rules_loaded = out_document.rules.size();
         return report;
     }
@@ -761,8 +762,8 @@ RegistryReport load_registry(const RegistryOptions& options, RegistryDocument& o
     }
     out_document = std::move(parsed);
     report.status = RegistryReport::Status::kOk;
-    report.message = "loaded " + std::to_string(out_document.rules.size()) + " rule(s) from " +
-                     info.path;
+    report.message =
+        "loaded " + std::to_string(out_document.rules.size()) + " rule(s) from " + info.path;
     report.rules_loaded = out_document.rules.size();
     for (const RegistryRule& rule : out_document.rules) {
         if (rule.origin == RuleOrigin::kUser) {

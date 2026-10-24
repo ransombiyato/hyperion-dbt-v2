@@ -82,8 +82,8 @@ struct RegistryRule {
     // from the syscall number, so a rule can be retargeted without becoming a
     // different rule.
     std::string id;
-    std::string name;             // symbolic guest name, e.g. "chdir"
-    std::uint64_t syscall = 0;    // x86-64 guest syscall number
+    std::string name;          // symbolic guest name, e.g. "chdir"
+    std::uint64_t syscall = 0; // x86-64 guest syscall number
 
     RuleImplementation implementation = RuleImplementation::kBuiltinAdapter;
     std::string handler;              // adapter id when implementation == kBuiltinAdapter
@@ -122,9 +122,9 @@ struct RegistryDocument {
 
 // Where the registry lives and why.
 struct RegistryPathInfo {
-    std::string path;    // empty when no persistent location is available
-    std::string source;  // "override", "xdg", "home", or "none"
-    std::string reason;  // human-readable explanation for diagnostics
+    std::string path;   // empty when no persistent location is available
+    std::string source; // "override", "xdg", "home", or "none"
+    std::string reason; // human-readable explanation for diagnostics
 };
 
 struct RegistryOptions {
@@ -141,12 +141,12 @@ struct RegistryOptions {
 
 struct RegistryReport {
     enum class Status : std::uint8_t {
-        kOk,          // loaded (possibly after creating or migrating)
-        kNotFound,    // no file; built-in defaults in service
-        kUnreadable,  // exists but cannot be read; built-in defaults in service
-        kInvalid,     // failed validation; built-in defaults in service
-        kNoLocation,  // no writable persistent location; built-in defaults
-        kNotWritten,  // the document was valid but persistence failed
+        kOk,         // loaded (possibly after creating or migrating)
+        kNotFound,   // no file; built-in defaults in service
+        kUnreadable, // exists but cannot be read; built-in defaults in service
+        kInvalid,    // failed validation; built-in defaults in service
+        kNoLocation, // no writable persistent location; built-in defaults
+        kNotWritten, // the document was valid but persistence failed
     };
 
     Status status = Status::kNotFound;

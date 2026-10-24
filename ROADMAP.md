@@ -18,7 +18,7 @@ dynamic instructions).**
 | 3 | First native code generation | ✅ complete |
 | 4 | Basic dynamic binary translator | ✅ complete |
 | 5 | Performance measurement and optimization | ✅ complete |
-| 6 | Linux ABI and syscall compatibility | 🟡 static + dynamic ELF64, process creation, 47 syscalls complete (threads/futex remaining) |
+| 6 | Linux ABI and syscall compatibility | 🟡 static + dynamic ELF64, process creation, **128 of 375** syscalls answered (122 implemented, 6 stubbed), dispatch engine + external JSON registry complete (threads, sockets, signals remaining) |
 | 7 | Advanced CPU compatibility (baseline psABI + 128-bit SSE2) | ✅ baseline x86-64 + SSE2 complete |
 | 8 | AI optimization laboratory | ⬜ not started |
 | 9 | Real application compatibility | 🟡 5/5 static `glibc 2.41` C workloads verified |
@@ -284,7 +284,7 @@ optimization decisions.
 
 ---
 
-## Phase 6 — Linux ABI and syscall compatibility 🟡 (twelve slices implemented)
+## Phase 6 — Linux ABI and syscall compatibility 🟡 (128/375 syscalls, dispatch engine complete)
 
 **Objective.** Run real Linux guest programs.
 
@@ -371,14 +371,52 @@ file descriptors, signals, threading, futexes. Feature matrix + integration test
   `CLONE_CHILD_SETTID`/`CLEARTID`/`PARENT_SETTID`/`SETTLS` are honoured.
   Verified end-to-end against a static x86-64 BusyBox shell pipeline on x86-64
   and on AArch64 under qemu, at both tiers.
-- ⬜ Thread creation (`clone` with `CLONE_VM`/`CLONE_THREAD`), `futex`. Currently
+- ✅ **Syscall compatibility engine (thirteenth–fifteenth slices).** Four-layer
+  dispatch (compiled rule table → static switch → legacy compat switch →
+  `-ENOSYS`), 39 ABI adapters (`epoll_*`, `poll`/`ppoll`, `select`/`pselect6`,
+  `timerfd_*`, `eventfd2`, `memfd_create`, `getrusage`, `times`, `itimerval`,
+  `sched_*`, `membarrier`, filesystem metadata, …, each translating a structure
+  whose layout or flag values differ between x86-64 and AArch64), and a
+  persistent, validated JSON registry outside the install directory with atomic
+  writes, schema migration, provenance and a CLI. `nanosleep`/`clock_nanosleep`
+  were moved from stub to real implementations. `link`(86)/`symlink`(88) were
+  added after a guest fixture showed `ln` failing under translation.
+- ⬜ Thread creation (`clone` with `CLONE_VM`/`CLONE_THREAD`). Currently
   **refused with `-ENOSYS` on purpose**, not merely missing: guest pages are host
   heap storage inside `GuestAddressSpace`, so a shared guest address space would
   need that model to change first. Downgrading to a fork would hand the guest a
-  private copy it believes is shared.
-- ⬜ Guest signal *handler invocation* (`rt_sigaction` dispositions are recorded
-  but not called), `waitid`(247).
-- ⬜ Signals beyond `SIGCHLD` bookkeeping.
+  private copy it believes is shared. `futex`(202) itself is implemented but not
+  yet validated.
+- ⬜ Guest signal *handler invocation* (`rt_sigaction` is a **stub** that reports
+  success and installs nothing — it must either work or refuse), `sigaltstack`
+  (stub, and Rust's stack-overflow handling checks that it took effect),
+  `waitid`(247).
+- ⬜ Sockets (`socket`/`connect`/`bind`/`listen`): needed by an editor that talks
+  to a language server; a large, separable piece.
+- ⬜ `ioctl` coverage for terminals: `TIOCGWINSZ` works; `TCGETS`/`TCSETS`
+  (raw mode) and `TIOCSWINSZ` do not, so a TUI cannot yet put a terminal into raw
+  mode. This is the top-priority item for the stated target workload.
+- ⬜ Guest concurrency: no test runs syscalls concurrently with a registry
+  `reload()`. The design (immutable snapshot + `shared_ptr` swap) is sound; the
+  concurrency is unproven.
+
+### Phase 6 next steps, in priority order
+
+The order is set by what a terminal application (a TUI editor) actually executes,
+not by syscall number:
+
+1. `ioctl` `TCGETS`/`TCSETS`/`TIOCSWINSZ`/`FIONREAD` — raw mode is the first
+   thing a TUI does, and `struct termios` layout differs between x86-64 and
+   AArch64 (`c_cc` ordering), which is exactly what an adapter is for.
+2. `rt_sigaction` + `sigaltstack` — replace the stubs with either a real
+   implementation or an explicit refusal.
+3. `futex` validation (wait/wake bit sets, timeouts, `-EAGAIN`) before any thread
+   work begins.
+4. `select`/`poll`/`epoll` are done; `signalfd`, `inotify_*` are the next
+   event-source gaps a file-watching editor hits.
+5. Sockets.
+6. Re-run `scripts/dev.sh cross-test`: the AArch64 tree was **not** exercised for
+   this work (the development host is x86-64), so Tier 1 is unverified here.
 
 **Exit criteria.** A clearly defined set of real Linux guest programs works
 correctly. No claim of general compatibility.

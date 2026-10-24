@@ -595,8 +595,8 @@ std::string quote(std::string_view s) {
         default:
             if (static_cast<unsigned char>(c) < 0x20U) {
                 char buf[7];
-                const int n = std::snprintf(buf, sizeof(buf), "\\u%04x",
-                                            static_cast<unsigned>(c) & 0xFFU);
+                const int n =
+                    std::snprintf(buf, sizeof(buf), "\\u%04x", static_cast<unsigned>(c) & 0xFFU);
                 if (n > 0) {
                     out.append(buf, static_cast<std::size_t>(n));
                 }

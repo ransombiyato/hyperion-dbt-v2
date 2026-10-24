@@ -28,8 +28,7 @@ namespace hyperion::syscall_detail {
 
 // The x86-64 syscall argument registers, in order. r10 (not rcx) is the fourth
 // argument: the `syscall` instruction clobbers rcx with the return address.
-inline constexpr Gpr kArgRegs[6] = {Gpr::kRdi, Gpr::kRsi, Gpr::kRdx,
-                                    Gpr::kR10, Gpr::kR8,  Gpr::kR9};
+inline constexpr Gpr kArgRegs[6] = {Gpr::kRdi, Gpr::kRsi, Gpr::kRdx, Gpr::kR10, Gpr::kR8, Gpr::kR9};
 
 // AT_FDCWD as the guest's 32-bit signed value.
 inline constexpr std::int32_t kGuestAtFdcwd = -100;
@@ -86,7 +85,14 @@ OpenFlags translate_open_flags(std::uint64_t flags, bool compat = false);
 
 void put_u64(std::uint8_t* buf, std::size_t off, std::uint64_t value);
 void put_u32(std::uint8_t* buf, std::size_t off, std::uint32_t value);
+void put_u16(std::uint8_t* buf, std::size_t off, std::uint16_t value);
+// Little-endian readers. Each one reads exactly the number of bytes its type is
+// wide: reading a `short` with get_u64_le() overran an 8-byte packed buffer, which
+// only AddressSanitizer noticed, because the overrun landed in the same stack
+// frame.
 std::uint64_t get_u64_le(const std::uint8_t* p);
+std::uint32_t get_u32_le(const std::uint8_t* p);
+std::uint16_t get_u16_le(const std::uint8_t* p);
 
 // Serialise a host `struct stat` into the *guest's* 144-byte x86-64 layout.
 std::int64_t write_guest_stat(Memory& memory, std::uint64_t buf, const struct stat& st);
