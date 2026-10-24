@@ -173,7 +173,7 @@ private:
             if (out.find(key) != nullptr) {
                 return fail("duplicate object key");
             }
-            out.object.emplace_back(std::move(key), std::move(member));
+            out.object.push_back(Value::Member{std::move(key), std::move(member)});
             skip_whitespace();
             if (peek() == ',') {
                 ++pos_;
@@ -434,9 +434,9 @@ void serialize_into(const Value& value, std::string& out, int indent_width, int 
                 out.push_back(',');
             }
             newline_indent(depth + 1);
-            out.append(quote(value.object[i].first));
+            out.append(quote(value.object[i].key));
             out.append(": ");
-            serialize_into(value.object[i].second, out, indent_width, depth + 1);
+            serialize_into(value.object[i].value, out, indent_width, depth + 1);
         }
         newline_indent(depth);
         out.push_back('}');
@@ -469,8 +469,8 @@ const Value* Value::find(std::string_view key) const {
         return nullptr;
     }
     for (const auto& member : object) {
-        if (member.first == key) {
-            return &member.second;
+        if (member.key == key) {
+            return &member.value;
         }
     }
     return nullptr;
@@ -524,8 +524,8 @@ Value Value::make_null() {
 
 void Value::set(std::string key, Value value) {
     for (auto& member : object) {
-        if (member.first == key) {
-            member.second = std::move(value);
+        if (member.key == key) {
+            member.value = std::move(value);
             return;
         }
     }

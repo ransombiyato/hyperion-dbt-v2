@@ -45,6 +45,13 @@ inline constexpr bool kHostIsX86_64 = false;
 constexpr std::uint64_t kBase = 0x400000;
 constexpr std::uint64_t kRflagsBit1 = 0x2;
 
+// Everything below down to kFlagInputs exists only to compare the interpreter
+// against real x86-64 hardware. On a non-x86-64 host there is no native
+// execution to compare against - every test takes its (reported) skip path - so
+// these helpers are compiled out rather than left defined-but-unused, which
+// -Wunused-function would (rightly) reject.
+#if defined(__x86_64__)
+
 // Mask a captured RFLAGS down to the six flags this project models, so a
 // comparison is not defeated by bits the model deliberately ignores.
 std::uint64_t model_flags(std::uint64_t rflags) {
@@ -175,6 +182,8 @@ constexpr std::uint64_t kFlagInputs[] = {
     kRflagsBit1 | 0x40, // ZF set
     kRflagsBit1 | 0x1 | 0x40,
 };
+
+#endif // defined(__x86_64__)
 
 } // namespace
 

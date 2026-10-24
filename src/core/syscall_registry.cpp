@@ -247,9 +247,9 @@ void report_unknown_fields(const json::Value& object, const std::vector<std::str
                            std::vector<std::string>& warnings, const std::string& context) {
     for (const auto& member : object.object) {
         const bool is_known =
-            std::find(known.begin(), known.end(), std::string_view(member.first)) != known.end();
+            std::find(known.begin(), known.end(), std::string_view(member.key)) != known.end();
         if (!is_known) {
-            warnings.push_back(context + ": ignoring unknown field '" + member.first +
+            warnings.push_back(context + ": ignoring unknown field '" + member.key +
                                "' (kept for forward compatibility, not interpreted)");
         }
     }

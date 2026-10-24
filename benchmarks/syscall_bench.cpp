@@ -60,10 +60,6 @@ inline void optimization_barrier(const void* p) {
 constexpr std::uint64_t kBase = 0x400000;
 constexpr std::size_t kMemSize = 4096;
 
-// Writing a 0 to a sink whose address the compiler cannot reason about keeps the
-// measured value live without touching guest memory.
-volatile std::uint64_t g_sink = 0;
-
 struct Options {
     std::uint64_t iterations = 200000;
     std::uint32_t repeats = 5;

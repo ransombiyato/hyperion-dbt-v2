@@ -19,6 +19,7 @@
 #include <vector>
 
 #include "harness/test_harness.hpp"
+#include "harness/test_tempdir.hpp"
 #include "hyperion/guest_state.hpp"
 #include "hyperion/interpreter.hpp"
 #include "hyperion/syscall.hpp"
@@ -46,6 +47,7 @@ constexpr std::uint64_t kSysGetitimer = 36;
 constexpr std::uint64_t kSysSetitimer = 38;
 constexpr std::uint64_t kSysFsync = 74;
 constexpr std::uint64_t kSysFtruncate = 77;
+constexpr std::uint64_t kSysOpenat = 257;
 constexpr std::uint64_t kSysChdir = 80;
 constexpr std::uint64_t kSysFchdir = 81;
 constexpr std::uint64_t kSysUmask = 95;
@@ -122,19 +124,18 @@ HYPERION_TEST("adapters", "invalid_flag_bits_are_einval") {
 // --- files -------------------------------------------------------------------
 
 HYPERION_TEST("adapters", "ftruncate_truncates_and_reports_errors") {
-    char pattern[] = "/tmp/hyperion-adapter-XXXXXX";
-    const int fd = ::mkstemp(pattern);
-    HYPERION_CHECK(fd >= 0);
-    HYPERION_CHECK_EQ(::write(fd, "0123456789", 10), 10);
+    // A private directory, not "/tmp": Termux has no /tmp (see
+    // tests/harness/test_tempdir.hpp).
+    hyperion::test::TempDir dir;
+    const std::string path = dir.file("ftruncate.bin");
 
-    Fixture f;
-    f.handler.adopt(3, nullptr); // no-op guard: guest fd 3 is free
-    // Put the host descriptor into the guest table under fd 3.
+    std::FILE* stream = std::fopen(path.c_str(), "w+b");
+    HYPERION_CHECK(stream != nullptr);
+    HYPERION_CHECK_EQ(std::fwrite("0123456789", 1, 10, stream), std::size_t{10});
+    HYPERION_CHECK_EQ(std::fflush(stream), 0);
+
     hyperion::GuestAddressSpace space;
     MinimalSyscallHandler handler({}, &space);
-    // adopt() takes a FILE*; open a stream on the same file instead.
-    std::FILE* stream = std::fopen(pattern, "r+b");
-    HYPERION_CHECK(stream != nullptr);
     HYPERION_CHECK(handler.adopt(3, stream));
 
     GuestState state;
@@ -150,40 +151,89 @@ HYPERION_TEST("adapters", "ftruncate_truncates_and_reports_errors") {
     HYPERION_CHECK_EQ(::fstat(fileno(stream), &info), 0);
     HYPERION_CHECK_EQ(static_cast<long>(info.st_size), 4L);
 
+    // A negative length is refused, and a descriptor that is not open reports
+    // EBADF rather than pretending to have truncated anything.
+    state.reg(Gpr::kRax) = kSysFtruncate;
+    state.reg(Gpr::kRdi) = 3;
+    state.reg(Gpr::kRsi) = static_cast<std::uint64_t>(-1);
+    (void)handler.handle(state, memory);
+    HYPERION_CHECK_EQ(static_cast<std::int64_t>(state.reg(Gpr::kRax)),
+                      -static_cast<std::int64_t>(kEinval));
+
+    state.reg(Gpr::kRax) = kSysFtruncate;
+    state.reg(Gpr::kRdi) = 99;
+    state.reg(Gpr::kRsi) = 0;
+    (void)handler.handle(state, memory);
+    HYPERION_CHECK_EQ(static_cast<std::int64_t>(state.reg(Gpr::kRax)),
+                      -static_cast<std::int64_t>(kEbadf));
+
     std::fclose(stream);
-    ::close(fd);
-    (void)::unlink(pattern);
 }
 
 HYPERION_TEST("adapters", "chdir_and_fchdir_change_the_working_directory") {
-    char original[4096];
-    HYPERION_CHECK(::getcwd(original, sizeof(original)) != nullptr);
-
-    char directory[] = "/tmp/hyperion-chdir-XXXXXX";
-    const char* made = ::mkdtemp(directory);
-    HYPERION_CHECK(made != nullptr);
+    // ScopedCwd restores the working directory even if an assertion below
+    // throws: a test that fails must not leave the rest of the binary running
+    // inside a temporary directory that is about to be deleted.
+    hyperion::test::ScopedCwd cwd_guard;
+    hyperion::test::TempDir dir;
 
     Fixture f;
-    f.put_string(kBase + 0x100, directory);
+    f.put_string(kBase + 0x100, dir.path());
     const auto r = f.call(kSysChdir, {kBase + 0x100});
     HYPERION_CHECK(r.status == SyscallStatus::kHandled);
     HYPERION_CHECK_EQ(f.result(), std::int64_t{0});
 
     char now[4096];
     HYPERION_CHECK(::getcwd(now, sizeof(now)) != nullptr);
-    HYPERION_CHECK_EQ(std::string(now), std::string(directory));
+    HYPERION_CHECK_EQ(std::string(now), dir.path());
 
-    HYPERION_CHECK_EQ(::chdir(original), 0);
-    (void)::rmdir(directory);
+    // fchdir goes through the guest descriptor table: open the *original*
+    // directory as a guest descriptor, then fchdir to it. This is the half of
+    // the pair the test is named for; asserting only on chdir would leave
+    // adapter_fchdir unverified.
+    f.put_string(kBase + 0x200, cwd_guard.saved());
+    const auto opened = f.call(kSysOpenat, {static_cast<std::uint64_t>(-100), kBase + 0x200,
+                                            static_cast<std::uint64_t>(O_RDONLY | O_DIRECTORY), 0});
+    HYPERION_CHECK(opened.status == SyscallStatus::kHandled);
+    const std::int64_t guest_dir_fd = f.result();
+    HYPERION_CHECK(guest_dir_fd >= 0);
+
+    const auto back = f.call(kSysFchdir, {static_cast<std::uint64_t>(guest_dir_fd)});
+    HYPERION_CHECK(back.status == SyscallStatus::kHandled);
+    HYPERION_CHECK_EQ(f.result(), std::int64_t{0});
+    HYPERION_CHECK(::getcwd(now, sizeof(now)) != nullptr);
+    HYPERION_CHECK_EQ(std::string(now), std::string(cwd_guard.saved()));
+
+    // An unknown guest descriptor is EBADF, not a silent success.
+    const auto bad = f.call(kSysFchdir, {77});
+    HYPERION_CHECK(bad.status == SyscallStatus::kHandled);
+    HYPERION_CHECK_EQ(f.result(), -static_cast<std::int64_t>(kEbadf));
 }
 
 HYPERION_TEST("adapters", "umask_sets_and_returns_the_previous_mask") {
-    const mode_t before = ::umask(0022);
+    // The process mask is global state shared with every later test, so it is
+    // restored from a destructor rather than at the end of the function body.
+    //
+    // The mask the test expects back is the one *it* installed (0022), not
+    // whatever the host happened to start with: the previous version recorded
+    // the ambient mask and then asserted the adapter returned it, which only
+    // held on hosts whose ambient mask is already 0022. Termux starts at 0077,
+    // which is how this test came to report "18 != 63".
+    hyperion::test::ScopedUmask guard(0022);
+
     Fixture f;
     const auto r = f.call(kSysUmask, {0077});
     HYPERION_CHECK(r.status == SyscallStatus::kHandled);
-    HYPERION_CHECK_EQ(f.result(), static_cast<std::int64_t>(before));
-    HYPERION_CHECK_EQ(static_cast<int>(::umask(before)), 0077);
+    HYPERION_CHECK_EQ(f.result(), std::int64_t{0022}); // the mask it replaced
+
+    // The new mask is really in effect: umask() is documented to return the
+    // previous value, so asking for it back must report 0077.
+    HYPERION_CHECK_EQ(static_cast<int>(::umask(0022)), 0077);
+    // The adapter masks the requested value to 0777, as the kernel does, and
+    // still reports the mask it replaced.
+    const auto again = f.call(kSysUmask, {0777});
+    HYPERION_CHECK(again.status == SyscallStatus::kHandled);
+    HYPERION_CHECK_EQ(f.result(), std::int64_t{0022});
 }
 
 // --- descriptor-backed event sources ----------------------------------------
@@ -260,11 +310,13 @@ HYPERION_TEST("adapters", "timerfd_is_created_and_armed") {
 }
 
 HYPERION_TEST("adapters", "fsync_on_a_regular_file_succeeds_and_bad_fd_fails") {
-    char pattern[] = "/tmp/hyperion-fsync-XXXXXX";
-    const int fd = ::mkstemp(pattern);
-    HYPERION_CHECK(fd >= 0);
-    std::FILE* stream = std::fopen(pattern, "r+b");
+    hyperion::test::TempDir dir;
+    const std::string path = dir.file("fsync.bin");
+
+    std::FILE* stream = std::fopen(path.c_str(), "w+b");
     HYPERION_CHECK(stream != nullptr);
+    HYPERION_CHECK_EQ(std::fwrite("data", 1, 4, stream), std::size_t{4});
+    HYPERION_CHECK_EQ(std::fflush(stream), 0);
 
     MinimalSyscallHandler handler({}, nullptr);
     HYPERION_CHECK(handler.adopt(3, stream));
@@ -283,8 +335,6 @@ HYPERION_TEST("adapters", "fsync_on_a_regular_file_succeeds_and_bad_fd_fails") {
                       -static_cast<std::int64_t>(kEbadf));
 
     std::fclose(stream);
-    ::close(fd);
-    (void)::unlink(pattern);
 }
 
 // --- polling -----------------------------------------------------------------

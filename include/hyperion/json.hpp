@@ -49,8 +49,17 @@ struct Value {
     bool is_integer = false;
     std::string string;
     std::vector<Value> array;
-    // Insertion order is preserved so a rewritten file stays diffable.
-    std::vector<std::pair<std::string, Value>> object;
+    // Object members, in insertion order so a rewritten file stays diffable.
+    //
+    // `Member` is only *declared* here and defined right after `Value`. An
+    // object member is stored as a vector element rather than a
+    // std::pair<std::string, Value>: std::vector explicitly supports an
+    // incomplete element type, whereas instantiating std::pair<std::string,
+    // Value> while Value is still incomplete is ill-formed and is rejected
+    // outright by libstdc++ when compiling with Clang. Keeping the pair out of
+    // the declaration makes the header build with libstdc++ and libc++ alike.
+    struct Member;
+    std::vector<Member> object;
 
     bool is_null() const noexcept { return type == Type::kNull; }
     bool is_bool() const noexcept { return type == Type::kBool; }
@@ -72,6 +81,12 @@ struct Value {
 
     void set(std::string key, Value value); // object insert or replace
     void push(Value value);                 // array append
+};
+
+// One key/value pair of an object, in insertion order.
+struct Value::Member {
+    std::string key;
+    Value value;
 };
 
 struct ParseError {

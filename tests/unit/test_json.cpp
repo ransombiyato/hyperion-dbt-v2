@@ -63,9 +63,9 @@ HYPERION_TEST("json", "parses_scalars_and_nesting") {
 HYPERION_TEST("json", "preserves_object_order") {
     Value root;
     HYPERION_CHECK(parses(R"({"z": 1, "a": 2, "m": 3})", root));
-    HYPERION_CHECK_EQ(root.object[0].first, std::string("z"));
-    HYPERION_CHECK_EQ(root.object[1].first, std::string("a"));
-    HYPERION_CHECK_EQ(root.object[2].first, std::string("m"));
+    HYPERION_CHECK_EQ(root.object[0].key, std::string("z"));
+    HYPERION_CHECK_EQ(root.object[1].key, std::string("a"));
+    HYPERION_CHECK_EQ(root.object[2].key, std::string("m"));
 }
 
 HYPERION_TEST("json", "negative_and_large_integers_stay_exact") {
