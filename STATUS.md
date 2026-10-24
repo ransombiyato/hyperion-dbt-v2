@@ -1,6 +1,6 @@
 # STATUS
 
-**Last updated:** 2026-10-23
+**Last updated:** 2026-10-24
 **Current phase:** Phase 5 (performance measurement and optimization) — active;
 Phase 6 (Linux ABI, ELF64 loading, and syscall compatibility) — twelfth slice
 implemented: **guest process creation** (`fork`/`vfork`/`clone` subset/`execve`/`wait4`)
@@ -16,7 +16,7 @@ static-PIE `ET_DYN` with a System V AMD64 `argc/argv/envp/auxv` initial stack)
 and raw blobs inspect and execute via `hyperion info <exe>` and
 `hyperion run <exe>`. Phase 6's syscall inventory is validated bidirectionally
 against C++ handler code (`tools/gen_syscall_inventory.py --check`), with
-**47 syscalls across twelve slices implemented** (`read`, `write`, `close`,
+**128 of 375 syscall numbers answered - 127 implemented, 1 stubbed** (`read`, `write`, `close`,
 `fstat`, `lseek`, `mmap`, `mprotect`, `munmap`, `brk`, `pread64`, `pwrite64`,
 `readv`, `writev`, `access`, `dup`, `dup2`, `getpid`, `exit`, `uname`, `fcntl`,
 `getcwd`, `readlink`, `gettimeofday`, `getuid`, `getgid`, `geteuid`, `getegid`,
@@ -28,6 +28,23 @@ numbers return `-ENOSYS` explicitly. See `COMPATIBILITY.md` for exact ISA scope,
 and its §5.05 for exactly which process semantics are honoured and which are
 refused. **Programs that create subprocesses now run**, including shell pipelines
 under a real static x86-64 BusyBox.
+
+### Last verified (2026-10-24)
+
+The full measured table is in **§2 Last successful verification** below; in
+summary, on this host today: strict Clang 19 `-Werror` build of x86-64, GCC 14
+`-Werror` build of AArch64, CTest **17/17**, unit **335 passed / 0 failed / 24
+skipped** (of 359), the same suite in `HYPERION_PORTABLE_SYSCALLS=1` mode,
+ASan+UBSan **17/17** with no report, AArch64 unit **360 / 0 / 3** (of 363) under
+`qemu-user`, the installer regression **28/28**, a real `install.sh` run from the
+checkout with every CLI command exercised, and `clang-format-19`/`shellcheck`
+clean.
+
+**Not verified, and therefore not claimed:** anything on the reference Android
+device itself. The AArch64 results above are `qemu-user` results on a Debian
+host; they exercise the same generated AArch64 code, but they are not hardware
+timings and they are not Android's seccomp policy (which is why
+`tests/unit/test_host_syscalls.cpp` reproduces that policy explicitly).
 
 This is the first file a returning agent should read. It records exactly what
 works, what was last verified, and what to do next.
@@ -60,7 +77,7 @@ works, what was last verified, and what to do next.
 | 13. `access`(21) + `readlink`(89) (seventh slice) | **Implemented & tested** — `access` forwards to the host with mode restricted to `F_OK`/`R_OK`/`W_OK`/`X_OK` (any other bit is `-EINVAL`); `readlink` copies a symlink target without a NUL terminator, truncating to `bufsiz` (not an error) and rejecting `bufsiz == 0` with `-EINVAL`. Both read the path with the shared bounded `read_guest_cstr` |
 | 14. `readlinkat`(267) (eighth slice) | **Implemented & tested** — glibc's modern `readlink` entry point. Shares the `readlink` body (no NUL terminator, silent truncation, `bufsiz == 0` is `-EINVAL`); `AT_FDCWD` only, any other `dirfd` is `-ENOSYS` and counted as unimplemented |
 | 15. `getdents64`(217) (ninth slice) | **Implemented & tested** — directory listing, the highest-frequency implementable syscall in the trace sample (3941 calls). The `linux_dirent64` record is a fixed UAPI layout identical on x86-64 and AArch64, so host entries are forwarded verbatim (D-030); the kernel's own `-EBADF`/`-ENOTDIR`/`-EINVAL` come through unchanged. `openat` now honours `O_DIRECTORY`/`O_NONBLOCK`/`O_CLOEXEC` (glibc's `opendir` flags) |
-| 16. `statx`(332) (tenth slice) | **Implemented & tested** — the modern, extensible stat (950 calls). `struct statx` is built only from fixed-width `__u32`/`__u64` fields, so its layout is identical on x86-64 and AArch64 and the host's bytes are copied into the guest verbatim (the `linux_dirent64` reasoning, D-030); `AT_FDCWD` only, `AT_SYMLINK_NOFOLLOW` the sole honoured flag |
+| 16. `statx`(332) (tenth slice) | **Implemented & tested** — the modern, extensible stat (950 calls). `struct statx` is built only from fixed-width `__u32`/`__u64` fields, so its layout is identical on x86-64 and AArch64 and the host's bytes are copied into the guest verbatim (the `linux_dirent64` reasoning, D-030); `AT_FDCWD` only, `AT_SYMLINK_NOFOLLOW` the sole honoured flag. **On Android before API 30 the syscall itself is trapped by seccomp**, so the struct is synthesized from `fstatat` there, reporting `STATX_BTIME`/`stx_attributes` as absent instead of guessing (`COMPATIBILITY.md` §5.07) |
 | 17. Static ELF64 loader + SysV AMD64 stack + unbuffered POSIX descriptors | **Implemented & tested** — `elf_loader.{hpp,cpp}` loads `ET_EXEC` and static-PIE `ET_DYN` with W^X `PT_LOAD` mappings, BSS zeroing, and 16-byte aligned `argc`/`argv`/`envp`/`auxv` (`AT_PHDR`/`AT_PHENT`/`AT_PHNUM`/`AT_PAGESZ`/`AT_ENTRY`/`AT_RANDOM`); `OpenFileDescription` replaces buffered `FILE*` fd entries |
 | 18. Startup, TLS, clock, resource, dup/fcntl, and scatter/positional I/O (eleventh slice) | **Implemented & tested** — adds `pread64`(17), `pwrite64`(18), `readv`(19), `writev`(20), `dup`(32), `dup2`(33), `dup3`(292), `fcntl`(72), `uname`(63, always advertising `"x86_64"`), `gettimeofday`(96), `clock_gettime`(228), `arch_prctl`(158, `ARCH_SET_FS`/`ARCH_GET_FS`), `set_tid_address`(218), `set_robust_list`(273), and `prlimit64`(302); **42 implemented syscalls total** |
 | 19. Guest process creation (twelfth slice) | **Implemented & tested** — adds `fork`(57), `vfork`(58), the process-creating subset of `clone`(56), `execve`(59) and `wait4`(61) in `src/core/process.cpp`; **47 implemented syscalls total**. A guest child is a real host process running a *deep copy* of the `GuestAddressSpace` (guest pages are host heap storage, so a bare host `fork` would leave both sides sharing vectors that a later `mmap` reallocates). Process clone now honors `child_stack`; thread-creating and namespace-creating flags return `-ENOSYS` rather than being downgraded. A vfork child releases its parent on successful guest exec (not merely host exec), and a forked child can re-exec its image through `/proc/self/exe`. Verified against static x86-64 BusyBox: `sh -c 'printf "9\\n2\\n5\\n1\\n" \| sort -n'` → `1 2 5 9`, and `sh -c 'echo benchmark \| wc -c'` → `10`, matching native output on x86-64 and under AArch64 QEMU at both tiers |
@@ -453,36 +470,36 @@ main path, and Phases 2-5 still build it.
 
 ## 2. Last successful verification
 
-Re-verified on **2026-10-24** after the syscall compatibility engine (multi-layer
-dispatch, ABI adapters, persistent registry, tests, benchmark, docs). Host:
-x86-64, Debian 13, kernel 6.1.158, GCC 14.2.0, CMake 4.4.4, Ninja 1.13.2, plus
-`aarch64-linux-gnu-g++` 14.2.0 and the cached `qemu-aarch64-static` for the cross
-tree., persistent registry, tests, benchmark, docs). Host:
-x86-64, Debian 13, kernel 6.1.158, GCC 14.2.0, CMake 4.4.4, Ninja 1.13.2.
-**AArch64 execution was not available on this host**, so Tier 1 and the qemu
-cross tree were not re-run in this session — that is the one gap in the table
-below, and it is a host limitation, not a passing claim:
+Re-verified on **2026-10-24** (Clang 19.1.7 and GCC 14.2.0, CMake 4.4.4,
+x86-64 Debian, kernel 6.1.158; plus `aarch64-linux-gnu-g++` 14.2.0 and the
+repo-cached `qemu-aarch64-static` for the cross tree):
 
 | Suite | Command | Result (measured) |
 | --- | --- | --- |
-| Native unit tests | `./build/dev/tests/hyperion_unit_tests` | **311 passed, 0 failed, 24 skipped** (of 335) |
-| Full CTest tree | `ctest --test-dir build/dev` | **17/17 passed** (unit, differential, 4 CLI, 2 guest, inventory, 7 bench) |
-| ASan + UBSan | `cmake -B build/asan -DHYPERION_ENABLE_SANITIZERS=ON` + `ctest` | **17/17 passed**, no sanitizer report |
+| Native unit tests | `build-strict/tests/hyperion_unit_tests` | **335 passed, 0 failed, 24 skipped** (of 359) |
+| Full CTest tree | `ctest --test-dir build-strict` | **17/17 passed** (unit, differential, 4 CLI, 2 guest, inventory, 7 bench) |
+| Android syscall paths | `HYPERION_PORTABLE_SYSCALLS=1 ctest --test-dir build-strict -E '^cli\.install_sigsys$'` | **16/16 passed** |
+| ASan + UBSan | `cmake -B build-asan -DHYPERION_ENABLE_SANITIZERS=ON` + `ctest` | **17/17 passed**, no sanitizer report |
 | Guest compat suite | `guest.syscall_compat` | 11/11 checks (43 guest-side ABI assertions) |
 | Registry CLI suite | `cli.syscall_registry` | 11/11 checks |
 | Syscall inventory | `python3 tools/gen_syscall_inventory.py --check` | OK (0 errors, 0 warnings) |
+| Installer regression | `bash tests/cli/install_sigsys_test.sh install.sh` | 28/28 checks (also with `ninja` hidden) |
 | Dispatch microbenchmark | `benchmarks/hyperion_syscall_bench --iterations 300000 --repeats 9` | see `TESTING.md` §6 |
-| Cross (qemu-user) | `scripts/dev.sh cross-test` | **10/10 passed** (see below) |
-| AArch64 unit tests | cross build + `qemu-aarch64-static` | **344 passed, 0 failed, 2 skipped** (of 346) |
-| AArch64 syscall compat, both tiers | `cross.aarch64_tests` | 11/11 checks per tier |
+| AArch64 unit tests | cross build + `qemu-aarch64-static` | **360 passed, 0 failed, 3 skipped** (of 363) |
+| AArch64 differential | same | 0 passed, 0 failed, 11 skipped — correct, no x86-64 oracle on AArch64 |
+| AArch64 syscall compat, both tiers | `cross.aarch64_tests` | 11/11 checks per tier, 43 guest assertions each |
 | AArch64 tier-1 JIT evidence | compat guest at `--tier=1` | `tier 1: 1412 basic block(s) translated`, `failures 0`, 170 308 steps — same as tier 0 |
 
-The cross tree was run with a cross compiler installed for this session
-(`apt-get install g++-aarch64-linux-gnu`) against the repo-cached
-`tools/cache/bin/qemu-aarch64-static`. It previously did **not** cover the new
-compatibility layer; `tests/run_cross_tests.cmake` now runs the guest compat suite
-at both tiers, asserts that tier 1 really translated and executed generated code
-(and did not fall back), and runs the registry CLI under qemu.
+The cross tree runs against the repo-cached `tools/cache/bin/qemu-aarch64-static`.
+`tests/run_cross_tests.cmake` runs the guest compat suite at both tiers, asserts
+that tier 1 really translated and executed generated code (and did not fall back),
+and runs the registry CLI under qemu. `qemu-user` validates correctness, not
+performance; no throughput number in this repository comes from it.
+
+**What this host cannot verify, and therefore what is not claimed:** anything on
+the reference Android/Termux device - ARM64 `PROT_EXEC` under SELinux, 16 KB page
+support, the real API-29 seccomp policy (reproduced here with an explicit
+`SECCOMP_RET_TRAP` filter instead), and native AArch64 timings.
 
 The ASan run earned its keep immediately: it found a stack buffer overflow in the
 `poll` adapter that no ordinary build could see (`get_u64_le(raw + 4)` reading
@@ -791,8 +808,10 @@ stable-vs-noisy discrimination case).
     a host toolchain problem that also blocks stock x86-64 UML. Not measured on
     the reference device either. See `docs/prior-art.md` §6 and
     `docs/architecture-feasibility.md` §9.
-  - Whether Android 10's seccomp/SELinux policy permits the `ptrace`/mmap
-    behaviour the kernel-as-process tier needs is unmeasured (R2).
+  - Android 10's seccomp policy **is** now known where it matters: `statx` and
+    `memfd_create` are outside it and are avoided (see §1 item 16 and
+    `COMPATIBILITY.md` §5.07). Whether the same policy permits the `ptrace`/mmap
+    behaviour the kernel-as-process tier needs is still unmeasured (R2).
   - No measurement exists on the reference device (Snapdragon 855, Android 10).
     Everything recorded so far is from the x86-64 development host, except the
     AArch64 code paths, which run under `qemu-user`, not on real ARM hardware.

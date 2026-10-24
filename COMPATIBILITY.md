@@ -509,6 +509,47 @@ instead of being assumed equal across architectures.
 
 ---
 
+## 5.07 Host syscalls HYPERION refuses to issue on Android
+
+Android installs a seccomp-BPF filter on every app process, Termux included. The
+filter is built from that *device release's* bionic syscall list and, crucially,
+is compiled with `SECCOMP_RET_TRAP`: a syscall outside the allowlist raises
+`SIGSYS` ("Bad system call", exit status 159) and the process dies. There is no
+errno to inspect and no way to fall back after the fact - the translator itself
+is gone, so no guest can even be told.
+
+Two syscalls HYPERION used to issue are not on Android 10's list. Both were added
+to bionic's `SYSCALLS.TXT` - the source the policy is generated from - in the
+Android 11 tree:
+
+| Syscall | Android 10 (API 29) | Android 11 (API 30)+ | HYPERION's action |
+| --- | --- | --- | --- |
+| `statx` (332/291) | absent -> `SIGSYS` | present | synthesized from `fstatat(2)`/`fstat(2)` |
+| `memfd_create` (319/279) | absent -> `SIGSYS` | present | `O_TMPFILE` anonymous file, else `-ENOSYS` |
+
+`src/core/host_syscalls.cpp` makes the decision at run time from
+`ro.build.version.sdk`, not from the API level this binary was compiled against,
+because the filter belongs to the device. An unreadable API level on Android is
+treated as "not allowed": a wrong "yes" is fatal, a wrong "no" only costs a
+synthesized `statx`.
+
+What the substitutes do and do not provide:
+
+| Guest-visible field / flag | Native `statx` | Synthesized from `fstatat` |
+| --- | --- | --- |
+| `STATX_BASIC_STATS` (mode, nlink, uid, gid, ino, size, blocks, atime/mtime/ctime, blksize) | yes | yes - identical values, checked field-by-field against the kernel in `tests/unit/test_host_syscalls.cpp` |
+| `STATX_BTIME` (creation time) | yes | **reported absent** (mask bit clear, field zero) - `fstatat` does not expose it |
+| `stx_attributes` / `stx_attributes_mask` | yes | zero, meaning "nothing claimed" |
+| `stx_mnt_id`, direct-I/O alignment fields | yes | zero (not requested by `STATX_BASIC_STATS`) |
+| `memfd_create` name / `MFD_CLOEXEC` | yes | yes |
+| `memfd_create` `MFD_ALLOW_SEALING` (`F_ADD_SEALS`) | yes | **not honoured** - the `O_TMPFILE` substitute is anonymous and unlinked, but not sealable |
+| anonymous file with `read`/`write`/`mmap` semantics | yes | yes |
+
+`HYPERION_PORTABLE_SYSCALLS=1` forces the portable paths on any host, and
+`hyperion probe` reports which path is actually in use.
+
+---
+
 ## 6. Host forwarding
 
 | Capability | Status | Phase |

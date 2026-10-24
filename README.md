@@ -193,11 +193,28 @@ hyperion test          # run the test suite
 hyperion help          # every command
 ```
 
-On Android/Termux, a seccomp filter or SELinux policy can kill the `unit.native`
-test with `SIGSYS`: the device refusing a system call, not a broken build. The
-installer detects exactly that case (one failing test, reason `SIGSYS`), explains
-it, and asks whether to skip that single test and continue. The default is **no**,
-the skipped test is reported as skipped rather than passed, every other test still
+#### Android, seccomp and `SIGSYS`
+
+Android installs a seccomp filter on every app process, Termux included, and it
+is built with `SECCOMP_RET_TRAP`: a syscall outside the device's allowlist raises
+`SIGSYS` and the process dies, with no errno to inspect. `statx(2)` and
+`memfd_create(2)` are outside Android 10's allowlist (both were added in Android
+11), and older versions of HYPERION issued them directly, which is what killed
+the `unit.native` test on Android 10.
+
+That is fixed: both syscalls are now avoided on devices that trap them, `statx`
+is synthesized from `fstatat(2)` and `memfd_create` falls back to an `O_TMPFILE`
+anonymous file. `hyperion probe` reports which path is in use, and
+`COMPATIBILITY.md` §5.07 lists exactly which `statx` fields the substitute
+provides. `HYPERION_PORTABLE_SYSCALLS=1` forces those paths on any host, and CI
+runs the whole suite in that mode.
+
+If some *other* syscall is trapped on a particular device, a `SIGSYS` is now
+reported with the syscall number and name instead of dying silently. The
+installer still treats a suite in which the *only* failure is `unit.native`
+killed by `SIGSYS` as a decision for you rather than for itself: it explains the
+situation and asks whether to skip that single test. The default is **no**, the
+skipped test is reported as skipped rather than passed, every other test still
 has to pass, and `--skip-sigsys-test` answers the question in advance for
 unattended installs.
 

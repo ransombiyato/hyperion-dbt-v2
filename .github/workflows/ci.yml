@@ -65,6 +65,52 @@ jobs:
           ./build/hyperion version
           ./build/hyperion probe
 
+      - name: Installer regression test (SIGSYS handling)
+        run: bash tests/cli/install_sigsys_test.sh "$PWD/install.sh"
+
+  android-syscall-paths:
+    # Android 10's app seccomp allowlist has no statx(2) and no memfd_create(2),
+    # and answers them with SIGSYS (SECCOMP_RET_TRAP) rather than an errno. Those
+    # portable paths are selected on the device from ro.build.version.sdk; here
+    # they are forced with HYPERION_PORTABLE_SYSCALLS=1 so a regression is caught
+    # on a normal Linux runner instead of on somebody's phone.
+    #
+    # tests/unit/test_host_syscalls.cpp also installs a real SECCOMP_RET_TRAP
+    # filter, so the suite fails if HYPERION starts issuing statx(2)
+    # unconditionally again.
+    name: Android syscall policy paths (statx/memfd portable)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq cmake ninja-build clang
+
+      - name: Configure
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_COMPILER=clang++ \
+            -DHYPERION_WARNINGS_AS_ERRORS=ON \
+            -DHYPERION_BUILD_BENCHMARKS=OFF
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Test (portable syscall paths)
+        run: |
+          HYPERION_PORTABLE_SYSCALLS=1 ctest --test-dir build --output-on-failure \
+            -E '^cli\.install_sigsys$'
+
+      - name: Probe reports the portable paths
+        run: |
+          HYPERION_PORTABLE_SYSCALLS=1 ./build/hyperion probe \
+            | tee probe.txt
+          grep -q 'statx(2):        not issued' probe.txt
+          grep -q 'memfd_create(2): not issued' probe.txt
+
   cross-tests:
     name: AArch64 cross tests (qemu-user)
     runs-on: ubuntu-24.04

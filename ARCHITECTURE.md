@@ -243,6 +243,44 @@ rule for a number that layer 2 or 3 implements is **rejected at compile time**
 with a diagnostic, rather than silently shadowing tested code. Rules can only
 add syscalls HYPERION does not otherwise answer.
 
+### 6.1a Host syscalls: what HYPERION is allowed to ask the kernel for
+
+The layer above deals with *guest* syscall numbers. Separately, the
+implementations themselves call the *host* kernel, and on Android that is a
+policy decision rather than a free choice: the app seccomp filter is built with
+`SECCOMP_RET_TRAP`, so a syscall outside the device's allowlist raises `SIGSYS`
+and the whole translator dies.
+
+`include/hyperion/host_syscalls.hpp` and `src/core/host_syscalls.cpp` own that
+decision. They answer two questions - may `statx(2)` be issued, may
+`memfd_create(2)` be issued - from the device's API level
+(`ro.build.version.sdk`), because the allowlist ships with the device's bionic,
+not with the compiler that built HYPERION. Both syscalls entered bionic's
+`SYSCALLS.TXT` in Android 11 (API 30). On older devices HYPERION therefore
+
+* synthesizes the guest `struct statx` from `fstatat(2)`/`fstat(2)`, filling
+  exactly the fields that call provides and reporting `STATX_BTIME` and
+  `stx_attributes` as absent rather than inventing them, and
+* emulates `memfd_create(2)` with an `O_TMPFILE` anonymous file, falling back to
+  `-ENOSYS` when even that is unavailable (sealing is not supported on the
+  substitute, which is documented rather than hidden).
+
+A kernel that simply lacks `statx` (`ENOSYS`) takes the same synthesized path, so
+no guest ever sees an artificial failure for a stat that `fstatat` could answer.
+`COMPATIBILITY.md` §5.07 records exactly which `statx` fields are and are not
+provided.
+
+### 6.1b Diagnosing a `SIGSYS`
+
+`src/core/sigsys_diagnostics.cpp` installs a `SIGSYS` handler in both the CLI and
+the test binary that prints the refused syscall's number, name and `si_code`, and
+then restores `SIG_DFL` and re-raises. The process still dies from `SIGSYS`; the
+exit status and the CTest verdict are unchanged. What changes is that the failure
+names itself instead of looking like a silent disappearance - the behaviour that
+made the Android 10 `statx` bug hard to see in the first place. The test harness
+additionally prints and flushes `[ RUN  ] <suite>.<test>` before each test, since
+buffered output is lost when a process dies from a signal.
+
 ### 6.2 What an adapter is, and what it is not
 
 An adapter is a C++ function identified by a name from a fixed table

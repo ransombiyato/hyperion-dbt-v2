@@ -123,8 +123,13 @@ Project HYPERION - status
 
 IMPLEMENTED
   - CMake build, CI, unit tests, cross tests, sanitizers, static tarballs ('hyperion package')
-  - full baseline x86-64 + 128-bit SSE2 decoder and reference interpreter (Tier 0, ~60 MIPS)
-  - full-system AArch64 + 128-bit ARMv8 NEON + IBTC dynamic binary translator (Tier 1)
+  - baseline x86-64 + 128-bit SSE2 decoder and reference interpreter (Tier 0).
+    Throughput is host- and workload-dependent and is not claimed here: measure
+    it with 'hyperion_tier_bench' on your own device rather than trusting a
+    number from somebody else's hardware.
+  - user-mode AArch64 + 128-bit ARMv8 NEON + IBTC dynamic binary translator
+    (Tier 1). 'User-mode' is meant literally: this is not a full-system or
+    kernel-level emulator, and it does not run privileged guests.
   - static ET_EXEC / static-PIE ET_DYN AND dynamically linked PT_INTERP (ld-linux-x86-64.so.2)
     ELF64 execution with file-backed mmap, MAP_FIXED, and --sysroot support
   - Linux x86-64 user-space syscall translation layer: 128 of 375 syscall numbers
@@ -162,6 +167,11 @@ LIMITATIONS
     to block without one (ENOSYS): a guest thread cannot exist, so no waiter
     could ever be woken; it is the one entry still listed as 'stubbed'
   - no AVX2 / AVX-512 yet
+  - Android: the app seccomp policy answers syscalls outside its allowlist with
+    SIGSYS (SECCOMP_RET_TRAP), which is fatal. Before API 30 that list has no
+    statx(2) and no memfd_create(2), so HYPERION synthesizes statx from
+    fstatat(2) and emulates memfd_create with O_TMPFILE there instead of issuing
+    them ('hyperion probe' says which path is in use)
 EOF
 }
 

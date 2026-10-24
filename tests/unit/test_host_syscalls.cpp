@@ -105,8 +105,10 @@ HYPERION_TEST("host_syscalls", "native_linux_reports_statx_and_memfd_usable") {
         "Android decides these from ro.build.version.sdk, tested through the child cases");
 #else
     // Not Android, no override: the raw syscalls are usable, so the full-fidelity
-    // paths are taken.
+    // paths are taken. The variable is cleared explicitly because this test also
+    // runs in the suite's HYPERION_PORTABLE_SYSCALLS=1 mode (CI runs both).
     const ChildOutcome outcome = run_child([] {
+        ::unsetenv("HYPERION_PORTABLE_SYSCALLS");
         return (hyperion::host_statx_syscall_usable() &&
                 hyperion::host_memfd_create_syscall_usable() &&
                 hyperion::host_android_api_level() == 0)
@@ -140,6 +142,7 @@ HYPERION_TEST("host_syscalls", "an_android_api_level_below_30_disables_both") {
     HYPERION_SKIP("the API level is read from the device; covered by the Android build itself");
 #else
     const ChildOutcome outcome = run_child([] {
+        ::unsetenv("HYPERION_PORTABLE_SYSCALLS");
         // Recreate the Android decision without being on Android: the portable
         // path must be selected when the device reports an old API level.
         return (hyperion::host_android_api_level() == 0 && hyperion::host_statx_syscall_usable())

@@ -211,6 +211,59 @@ Test binaries accept `--filter=substring` and `--list`.
 
 ---
 
+### The Android syscall-policy tests
+
+`tests/unit/test_host_syscalls.cpp` (suite `host_syscalls`) covers the
+`SIGSYS`-avoidance described in `COMPATIBILITY.md` §5.07. It does not merely
+assert that a branch was taken: it installs a real `SECCOMP_RET_TRAP` filter -
+the action Android's app policy uses - on a forked child, and requires both
+
+* the native path to die from `SIGSYS` with the trap installed (the Android 10
+  failure, reproduced on an ordinary Linux host), and
+* the portable path to answer the guest's `statx` correctly with the same trap
+  installed.
+
+If HYPERION ever goes back to issuing `statx(2)` unconditionally, the second half
+fails. The rest of the suite also runs in the portable mode in CI:
+
+```bash
+HYPERION_PORTABLE_SYSCALLS=1 ctest --test-dir build --output-on-failure -E '^cli\.install_sigsys$'
+```
+
+Run the whole suite in that mode locally too after touching
+`src/core/syscall.cpp` or `src/core/syscall_adapters.cpp`.
+
+### Platform skips
+
+A test whose precondition genuinely cannot be met calls `HYPERION_SKIP(reason)`.
+The harness reports it as `[ SKIP ] name (reason)`, counts it separately, and
+never counts it as a pass. Skips in use today:
+
+| Test | Skipped when | Why it is a platform limit, not a bug |
+| --- | --- | --- |
+| `host_syscalls.native_linux_reports_statx_and_memfd_usable`, `host_syscalls.an_android_api_level_below_30_disables_both` | the binary is built for Android | the API level then comes from the device (`ro.build.version.sdk`); the child-process cases exercise the same decision function everywhere |
+| `host_syscalls.trapped_statx_kills_the_native_path_and_not_the_portable_one` | the host refuses `PR_SET_SECCOMP` (seen under `qemu-user`) | the reproduction needs a filter that can be installed; the portable alternative is still covered by the `HYPERION_PORTABLE_SYSCALLS` cases |
+| `translator.*`, `exec_mem.*`, `translation_cache.*` AArch64 cases (24 in total on x86-64) | the host is not AArch64 | the generated code *is* AArch64; the cross build runs them under `qemu-user` |
+| `interpreter.run_program_matches_hardware_for_a_loop` | the host is not x86-64 | the reference is real hardware execution of the same bytes |
+| `translation_cache.refuses_to_run_without_exec_support` | the host *can* execute generated code | it asserts the refusal path of a host that cannot |
+| `differential.*` | the host is not x86-64 | same reason as the hardware differential |
+
+None of these is a "the feature is broken" skip, and each one names its reason in
+the test output. `HYPERION_SKIP` throws, so a skipped test can never fall through
+into its assertions.
+
+### Temporary files
+
+Tests never hardcode `/tmp`: Termux on Android has no `/tmp` at all, and its only
+writable temporary directory is `$TMPDIR`. `tests/harness/test_tempdir.hpp`
+provides `TempDir` (a private directory under the first usable base of
+`$TMPDIR`, `/tmp`, `$HOME/.cache`, `$PREFIX/tmp`, the current directory,
+removed recursively afterwards), plus `ScopedCwd` and `ScopedUmask` so a failed
+assertion cannot leave the rest of the binary in a changed working directory or
+with a changed file-mode mask. The shell tests do the same with `mktemp -d` and
+point `XDG_DATA_HOME`/`HOME` at their own tree so they neither read nor write the
+user's real syscall registry.
+
 ## 4. Cross-architecture validation
 
 The reference target is AArch64; development hosts are often x86-64. Generated
@@ -240,13 +293,15 @@ The same driver also runs, against the **AArch64-built** binary at both tiers:
 - `tests/cli/registry_cli_test.sh` — path resolution and permissions on the
   AArch64 build.
 
-Measured 2026-10-24 (aarch64-linux-gnu-g++ 14.2.0, `qemu-aarch64-static`
-from `tools/cache`):
+Re-measured 2026-10-24 (aarch64-linux-gnu-g++ 14.2.0, `qemu-aarch64-static`
+from `tools/cache`). The unit and differential rows were re-run at the end of the
+Android-syscall work; the guest-process, compat and CLI rows are from the same
+toolchain and were not re-run afterwards:
 
 | Run | Result |
 | --- | --- |
-| AArch64 unit tests | **352 passed, 0 failed, 2 skipped** (of 354 registered) |
-| AArch64 differential suite | 0 passed (correct: no x86-64 oracle on AArch64, every case SKIPs) |
+| AArch64 unit tests | **360 passed, 0 failed, 3 skipped** (of 363 registered) |
+| AArch64 differential suite | 0 passed, 0 failed, 11 skipped (correct: no x86-64 oracle on AArch64, every case SKIPs) |
 | AArch64 guest process, tier 0 / tier 1 | passed / passed |
 | AArch64 syscall compat, tier 0 / tier 1 | 11/11 checks, 43 guest assertions each |
 | AArch64 tier-1 JIT evidence | `tier 1: 1412 basic block(s) translated`, `failures 0`, 170 308 guest steps — identical to tier 0 |

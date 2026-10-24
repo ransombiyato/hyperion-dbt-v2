@@ -99,6 +99,31 @@ Meaningful changes by milestone. Format loosely follows
   at work that was already done.
 
 ### Fixed
+- **`unit.native` could be killed by `SIGSYS` on Android 10, and worse, so could
+  any guest that called `statx`.** Android builds its app seccomp policy from the
+  *device's* bionic syscall list and compiles it with `SECCOMP_RET_TRAP`, so a
+  syscall outside it is not refused with an errno - the process dies from
+  `SIGSYS` (exit status 159). `statx(2)` and `memfd_create(2)` are not on Android
+  10's list; both entered bionic's `SYSCALLS.TXT` in Android 11. Both are now
+  avoided at run time, decided from `ro.build.version.sdk` rather than from the
+  API level HYPERION was compiled against: the guest's `struct statx` is
+  synthesized from `fstatat(2)`/`fstat(2)` (identical `STATX_BASIC_STATS`
+  values, `STATX_BTIME` and `stx_attributes` reported *absent* rather than
+  invented), and `memfd_create` becomes an `O_TMPFILE` anonymous file that
+  reports it cannot seal instead of pretending. A kernel that merely lacks
+  `statx` takes the same path, so no guest sees an artificial failure for a
+  stat that `fstatat` can answer. `HYPERION_PORTABLE_SYSCALLS=1` forces both
+  paths anywhere, `hyperion probe` names the one in use, and the new
+  `host_syscalls` unit suite reproduces the Android trap with a real
+  `SECCOMP_RET_TRAP` filter: the native path must die from `SIGSYS` under it,
+  and the portable path must answer correctly under the same filter.
+- **A `SIGSYS` no longer dies silently.** The CLI and the test binary install a
+  handler that prints the refused syscall's number, name and `si_code`, then
+  restores `SIG_DFL` and re-raises, so the exit status and CTest verdict are
+  unchanged but the failure names itself. The harness also flushes
+  `[ RUN  ] <suite>.<test>` before each test, because buffered output is lost
+  when a process dies from a signal - the reason the original Android failure
+  looked like a silent disappearance.
 - **`madvise` did nothing, including the one mode where doing nothing is wrong.**
   `MADV_DONTNEED` on anonymous private memory is *defined* as "the pages read as
   zero afterwards", and guest memory here is always anonymous private host-heap
