@@ -54,6 +54,7 @@ add_library(hyperion_core
     src/core/json.cpp
     src/core/host_probe.cpp
     src/core/host_syscalls.cpp
+    src/core/sigsys_diagnostics.cpp
     src/core/bench_stats.cpp
     src/core/guest_state.cpp
     src/core/decoder.cpp
@@ -78,6 +79,12 @@ target_include_directories(hyperion_core
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
         $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
 target_link_libraries(hyperion_core PRIVATE hyperion_warnings)
+
+# One source of truth for the version: the project() call above.
+target_compile_definitions(hyperion_core PUBLIC
+    HYPERION_VERSION_MAJOR=${PROJECT_VERSION_MAJOR}
+    HYPERION_VERSION_MINOR=${PROJECT_VERSION_MINOR}
+    HYPERION_VERSION_PATCH=${PROJECT_VERSION_PATCH})
 
 # --- CLI --------------------------------------------------------------------
 add_executable(hyperion src/cli/main.cpp)

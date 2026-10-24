@@ -21,6 +21,20 @@ HYPERION_TEST("version", "version_string_is_semver") {
     }));
 }
 
+HYPERION_TEST("version", "version_string_matches_the_cmake_project_version") {
+    // The header used to hardcode 0.1.0 while CMake said 0.2.0. The numbers now
+    // come from the CMake project() call through compile definitions.
+    const std::string expected = std::to_string(hyperion::kVersionMajor) + "." +
+                                 std::to_string(hyperion::kVersionMinor) + "." +
+                                 std::to_string(hyperion::kVersionPatch);
+    HYPERION_CHECK_EQ(version_string(), expected);
+#ifdef HYPERION_VERSION_MAJOR
+    HYPERION_CHECK_EQ(hyperion::kVersionMajor, HYPERION_VERSION_MAJOR);
+    HYPERION_CHECK_EQ(hyperion::kVersionMinor, HYPERION_VERSION_MINOR);
+    HYPERION_CHECK_EQ(hyperion::kVersionPatch, HYPERION_VERSION_PATCH);
+#endif
+}
+
 HYPERION_TEST("version", "build_summary_mentions_version") {
     const std::string s = build_summary();
     HYPERION_CHECK(s.find(version_string()) != std::string::npos);

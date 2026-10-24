@@ -9,11 +9,25 @@
 
 namespace hyperion {
 
-inline constexpr int kVersionMajor = 0;
-inline constexpr int kVersionMinor = 1;
-inline constexpr int kVersionPatch = 0;
+// The version comes from CMakeLists.txt (project(... VERSION ...)) through the
+// HYPERION_VERSION_* compile definitions below, so the CLI, `hyperion version`
+// and the packaging metadata cannot drift apart. The fallback values only apply
+// to a translation unit compiled outside CMake.
+#ifndef HYPERION_VERSION_MAJOR
+#define HYPERION_VERSION_MAJOR 0
+#endif
+#ifndef HYPERION_VERSION_MINOR
+#define HYPERION_VERSION_MINOR 2
+#endif
+#ifndef HYPERION_VERSION_PATCH
+#define HYPERION_VERSION_PATCH 0
+#endif
 
-// Semantic version string, e.g. "0.1.0".
+inline constexpr int kVersionMajor = HYPERION_VERSION_MAJOR;
+inline constexpr int kVersionMinor = HYPERION_VERSION_MINOR;
+inline constexpr int kVersionPatch = HYPERION_VERSION_PATCH;
+
+// Semantic version string, e.g. "0.2.0".
 std::string version_string();
 
 // Human-readable one-line build identity including compiler and build type.

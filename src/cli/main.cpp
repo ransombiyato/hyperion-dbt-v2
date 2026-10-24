@@ -17,6 +17,8 @@
 
 #include <unistd.h>
 
+#include "hyperion/host_syscalls.hpp"
+#include "hyperion/sigsys_diagnostics.hpp"
 #include "hyperion/address_space.hpp"
 #include "hyperion/elf.hpp"
 #include "hyperion/elf_loader.hpp"
@@ -80,6 +82,23 @@ void print_usage(const char* argv0) {
 int cmd_probe() {
     const hyperion::HostInfo info = hyperion::probe_host();
     std::printf("%s", hyperion::format_host_info(info).c_str());
+    // Which host syscalls HYPERION is willing to issue, and why. On Android this
+    // is what decides whether statx/memfd_create are used directly or
+    // synthesized; see include/hyperion/host_syscalls.hpp.
+    const int api = hyperion::host_android_api_level();
+    std::printf("android api:     %d%s\n", api,
+                api == 0 ? " (not Android, or unreadable)" : "");
+    std::printf("statx(2):        %s\n",
+                hyperion::host_statx_syscall_usable()
+                    ? "used directly"
+                    : "not issued; statx() synthesized from fstatat(2)");
+    std::printf("memfd_create(2): %s\n",
+                hyperion::host_memfd_create_syscall_usable()
+                    ? "used directly"
+                    : "not issued; O_TMPFILE fallback or -ENOSYS");
+    if (hyperion::host_portable_syscalls_forced()) {
+        std::printf("                 (HYPERION_PORTABLE_SYSCALLS is set)\n");
+    }
     return 0;
 }
 
@@ -580,6 +599,9 @@ int cmd_syscall_registry(int argc, char** argv) {
 } // namespace
 
 int main(int argc, char** argv) {
+    // Report (but never swallow) a SIGSYS from the platform's seccomp policy:
+    // see hyperion/sigsys_diagnostics.hpp. The exit status is unchanged.
+    hyperion::install_sigsys_diagnostics("hyperion");
     if (argc < 2) {
         print_usage(argv[0]);
         return 2;
