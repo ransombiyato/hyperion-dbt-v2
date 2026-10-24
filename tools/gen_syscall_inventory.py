@@ -106,6 +106,29 @@ def read_inventory():
     return rows, errors
 
 
+def scan_legacy_compat(cpp_text):
+    """Numbers handled by the nested linux-compat switch, per its own list.
+
+    `is_linux_compat_syscall()` is the authoritative enumeration of that layer
+    (the registry validator uses it to refuse rules for numbers this layer
+    claims), so it is parsed rather than the switch body: one list, one meaning.
+    A `[stub]` annotation marks a number that answers success without doing the
+    work; `[unsupported]` marks one that is only recognised in order to be
+    rejected with a clean -ENOSYS, and is skipped.
+    """
+    match = re.search(r"bool is_linux_compat_syscall\(std::uint64_t number\)\s*\{(.*?)\n\}",
+                      cpp_text, re.S)
+    if not match:
+        return {}
+    found = {}
+    for m in re.finditer(r"case (\d+):\s*//\s*([a-z0-9_]+)([^\n]*)", match.group(1)):
+        comment = m.group(3)
+        if "[unsupported]" in comment:
+            continue  # recognised only so it can be rejected; not an implementation
+        found[int(m.group(1))] = (m.group(2), "[stub]" in comment)
+    return found
+
+
 def validate(rows, kernel, verbose=True):
     errors = []
     warnings = []
@@ -163,6 +186,7 @@ def validate(rows, kernel, verbose=True):
     #     inventory.
     adapter_nrs = set()
     alias_nrs = set()
+    legacy_nrs = set()
     if SYSCALL_ADAPTERS_CPP.exists():
         adapters_text = SYSCALL_ADAPTERS_CPP.read_text()
         # Contract with src/core/syscall_adapters.cpp: every row of
@@ -172,9 +196,33 @@ def validate(rows, kernel, verbose=True):
             r'\{"(compat\.[a-z0-9_]+)",\s*(\d+),', adapters_text)}
         alias_nrs = {int(m.group(1)) for m in re.finditer(
             r"rule\.syscall = (\d+);", adapters_text)}
+        legacy_nrs = set(scan_legacy_compat(SYSCALL_CPP.read_text()))
         if not adapter_nrs:
             errors.append("C++ sync: no adapters found in src/core/syscall_adapters.cpp "
                           "(the scanner and the table have drifted apart)")
+
+    # 4c. the legacy linux-compat layer: every number in
+    #     is_linux_compat_syscall() is a real answer to the guest, so the
+    #     inventory must not still call it `not-started`. Numbers annotated
+    #     `[stub]` return success without performing the call and must be
+    #     `stubbed`.
+    if SYSCALL_CPP.exists():
+        legacy = scan_legacy_compat(SYSCALL_CPP.read_text())
+        if not legacy:
+            errors.append("C++ sync: could not find is_linux_compat_syscall() in "
+                          "src/core/syscall.cpp (the scanner and the source have drifted apart)")
+        by_nr_status = {r.nr: r.status for r in rows}
+        for nr, (name, is_stub) in sorted(legacy.items()):
+            want = ("stubbed",) if is_stub else ("implemented", "validated")
+            have = by_nr_status.get(nr)
+            if have is None:
+                errors.append(f"C++ sync: syscall {nr} ({name}) is in the linux-compat switch "
+                              f"but absent from {INVENTORY}")
+            elif have not in want:
+                errors.append(
+                    f"C++ sync: syscall {nr} ({name}) is "
+                    f"{'a stub' if is_stub else 'implemented'} in the linux-compat switch "
+                    f"but marked {have!r} in inventory.tsv")
 
     # 5. bidirectional C++ implementation sync: every `case sysno::kX:` handled
     #    in MinimalSyscallHandler::handle() and listed in is_minimal_syscall()
@@ -212,6 +260,7 @@ def validate(rows, kernel, verbose=True):
                 )
             cpp_implemented_nrs = {sysno_map[s] for s in handled_syms if s in sysno_map}
             cpp_implemented_nrs |= adapter_nrs | alias_nrs
+            cpp_implemented_nrs |= set(legacy_nrs)
             tsv_implemented_nrs = {r.nr for r in rows if r.status != "not-started"}
             for nr in sorted(cpp_implemented_nrs - tsv_implemented_nrs):
                 errors.append(

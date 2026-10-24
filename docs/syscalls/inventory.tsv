@@ -32,40 +32,40 @@
 # nr	name	tier	status	purpose	evidence
 0	read	U4	implemented	Read bytes from a file descriptor.	trace:1062
 1	write	U4	implemented	Write bytes to a file descriptor.	trace:134
-2	open	U1	not-started	Open a file (legacy, no O_* flags in the syscall).	trace:1
+2	open	U1	implemented	Open a file (legacy, no O_* flags in the syscall).	trace:1
 3	close	U4	implemented	Close a file descriptor.	trace:7757
-4	stat	U2	not-started	Stat a path (legacy struct stat layout).	provisional
+4	stat	U2	implemented	Stat a path (legacy struct stat layout).	provisional
 5	fstat	U4	implemented	Stat an open file descriptor.	trace:4697
-6	lstat	U2	not-started	Stat a path without following the final symlink.	provisional
+6	lstat	U2	implemented	Stat a path without following the final symlink.	provisional
 7	poll	U2	implemented	Wait for events on a set of file descriptors.	provisional
 8	lseek	U3	implemented	Reposition the file offset of a descriptor.	trace:35
 9	mmap	U4	implemented	Map files or anonymous memory into the address space.	trace:426
 10	mprotect	U4	implemented	Change protection on a memory region.	trace:77
 11	munmap	U4	implemented	Unmap a memory region.	trace:9
 12	brk	U4	implemented	Set the end of the data segment (heap).	trace:84
-13	rt_sigaction	U4	not-started	Install or query a signal handler.	trace:154
-14	rt_sigprocmask	U4	not-started	Change or query the signal mask.	trace:22
+13	rt_sigaction	U4	stubbed	Install or query a signal handler.	trace:154
+14	rt_sigprocmask	U4	implemented	Change or query the signal mask.	trace:22
 15	rt_sigreturn	E1	not-started	Return from a signal handler (kernel-issued trampoline).	trace:2
-16	ioctl	U3	not-started	Device-specific control operation.	trace:34
+16	ioctl	U3	implemented	Device-specific control operation.	trace:34
 17	pread64	U3	implemented	Read at an offset without moving the file offset.	trace:34
 18	pwrite64	U3	implemented	Write at an offset without moving the file offset.	provisional
 19	readv	U3	implemented	Scatter read into multiple buffers.	provisional
 20	writev	U3	implemented	Gather write from multiple buffers.	provisional
 21	access	U3	implemented	Check file accessibility (legacy).	trace:45
-22	pipe	U2	not-started	Create an unnamed pipe.	provisional
+22	pipe	U2	implemented	Create an unnamed pipe.	provisional
 23	select	U2	implemented	Wait for readiness on a descriptor set (legacy).	provisional
 24	sched_yield	U3	implemented	Yield the processor.	provisional
-25	mremap	U2	not-started	Resize or move a mapping.	trace:1
+25	mremap	U2	implemented	Resize or move a mapping.	trace:1
 26	msync	U2	not-started	Flush a memory mapping to backing store.	provisional
 27	mincore	U1	not-started	Query which pages of a mapping are resident.	provisional
-28	madvise	U3	not-started	Advise the kernel about memory usage.	provisional
+28	madvise	U3	stubbed	Advise the kernel about memory usage.	provisional
 29	shmget	E2	not-started	System V shared memory segment.	provisional
 30	shmat	E2	not-started	Attach a System V shared memory segment.	provisional
 31	shmctl	E2	not-started	System V shared memory control.	provisional
 32	dup	U4	implemented	Duplicate a file descriptor.	provisional
 33	dup2	U3	implemented	Duplicate a descriptor to a specific number.	trace:1
 34	pause	U1	not-started	Wait for a signal (legacy).	provisional
-35	nanosleep	U4	not-started	High-resolution sleep.	provisional
+35	nanosleep	U4	stubbed	High-resolution sleep.	provisional
 36	getitimer	U1	implemented	Query an interval timer (legacy).	provisional
 37	alarm	U1	not-started	Set an alarm clock (legacy).	provisional
 38	setitimer	U1	implemented	Set an interval timer (legacy).	provisional
@@ -92,7 +92,7 @@
 59	execve	U4	implemented	Replace the guest image; non-destructive on every error path.	trace:17
 60	exit	U4	implemented	Terminate the calling thread.	provisional
 61	wait4	U3	implemented	Wait for a child process; WNOHANG/WUNTRACED/WCONTINUED and struct rusage are honoured.	trace:4
-62	kill	U3	not-started	Send a signal to a process.	provisional
+62	kill	U3	implemented	Send a signal to a process.	provisional
 63	uname	U4	implemented	Query the kernel name and version.	trace:4
 64	semget	E2	not-started	System V semaphore set.	provisional
 65	semop	E2	not-started	System V semaphore operations.	provisional
@@ -112,16 +112,16 @@
 79	getcwd	U4	implemented	Return the current working directory.	trace:1
 80	chdir	U3	implemented	Change the current working directory.	provisional
 81	fchdir	U2	implemented	Change directory to a descriptor.	trace:1
-82	rename	U3	not-started	Rename a file.	provisional
-83	mkdir	U3	not-started	Create a directory.	provisional
-84	rmdir	U3	not-started	Remove a directory.	provisional
+82	rename	U3	implemented	Rename a file.	provisional
+83	mkdir	U3	implemented	Create a directory.	provisional
+84	rmdir	U3	implemented	Remove a directory.	provisional
 85	creat	U1	not-started	Create a file (legacy open with O_CREAT).	trace:1
-86	link	U2	not-started	Create a hard link.	provisional
-87	unlink	U4	not-started	Remove a file.	provisional
-88	symlink	U2	not-started	Create a symbolic link.	provisional
+86	link	U2	implemented	Create a hard link.	provisional
+87	unlink	U4	implemented	Remove a file.	provisional
+88	symlink	U2	implemented	Create a symbolic link.	provisional
 89	readlink	U4	implemented	Read a symbolic link target.	trace:392
-90	chmod	U3	not-started	Change a file's mode.	provisional
-91	fchmod	U3	not-started	Change a descriptor's mode.	provisional
+90	chmod	U3	implemented	Change a file's mode.	provisional
+91	fchmod	U3	implemented	Change a descriptor's mode.	provisional
 92	chown	U2	not-started	Change a file's owner.	provisional
 93	fchown	U2	not-started	Change a descriptor's owner.	provisional
 94	lchown	U1	not-started	Change a symlink's owner.	provisional
@@ -129,7 +129,7 @@
 96	gettimeofday	U3	implemented	Query wall-clock time (legacy).	provisional
 97	getrlimit	U3	implemented	Query a resource limit (legacy).	provisional
 98	getrusage	U3	implemented	Query resource usage.	provisional
-99	sysinfo	U2	not-started	Query system statistics.	trace:2
+99	sysinfo	U2	implemented	Query system statistics.	trace:2
 100	times	U1	implemented	Query process times (legacy).	provisional
 101	ptrace	E3	not-started	Trace another process (privileged/needs care).	provisional
 102	getuid	U4	implemented	Return the real user ID.	trace:11
@@ -161,14 +161,14 @@
 128	rt_sigtimedwait	E2	not-started	Wait for a signal synchronously.	provisional
 129	rt_sigqueueinfo	E2	not-started	Queue a signal with data.	provisional
 130	rt_sigsuspend	E2	not-started	Replace the mask and suspend.	provisional
-131	sigaltstack	U3	not-started	Set or query the alternate signal stack.	trace:1
+131	sigaltstack	U3	stubbed	Set or query the alternate signal stack.	trace:1
 132	utime	U1	not-started	Set file times (legacy).	provisional
 133	mknod	E3	not-started	Create a device or FIFO node.	provisional
 134	uselib	E3	not-started	Load a shared library (obsolete).	provisional
 135	personality	E1	not-started	Set the execution domain (needed for some ABIs/emulators).	provisional
 136	ustat	E3	not-started	Query filesystem statistics (obsolete).	provisional
-137	statfs	U3	not-started	Query filesystem statistics.	trace:10
-138	fstatfs	U2	not-started	Query filesystem statistics by descriptor.	trace:2
+137	statfs	U3	implemented	Query filesystem statistics.	trace:10
+138	fstatfs	U2	implemented	Query filesystem statistics by descriptor.	trace:2
 139	sysfs	E3	not-started	Obsolete filesystem information call.	provisional
 140	getpriority	U2	not-started	Query a scheduling priority.	provisional
 141	setpriority	U2	not-started	Set a scheduling priority.	provisional
@@ -187,7 +187,7 @@
 154	modify_ldt	E1	not-started	Modify the local descriptor table (x86 compatibility).	provisional
 155	pivot_root	E3	not-started	Change the root filesystem (privileged).	provisional
 156	_sysctl	E3	not-started	Legacy kernel parameter control (obsolete).	provisional
-157	prctl	U3	not-started	Process control (names, dumpability, etc.).	trace:12
+157	prctl	U3	stubbed	Process control (names, dumpability, etc.).	trace:12
 158	arch_prctl	E1	implemented	x86-64 arch control: TLS, FS/GS base (process startup).	trace:17
 159	adjtimex	E3	not-started	Adjust the kernel clock.	provisional
 160	setrlimit	U3	implemented	Set a resource limit.	provisional
@@ -232,9 +232,9 @@
 199	fremovexattr	E2	not-started	Remove an xattr by descriptor.	provisional
 200	tkill	E3	not-started	Send a signal to a thread (legacy).	provisional
 201	time	U1	not-started	Query time in seconds (legacy).	provisional
-202	futex	U4	not-started	Fast userspace mutex (threading primitive).	trace:16
+202	futex	U4	implemented	Fast userspace mutex (threading primitive).	trace:16
 203	sched_setaffinity	U2	not-started	Set a thread's CPU affinity.	provisional
-204	sched_getaffinity	U3	not-started	Query a thread's CPU affinity.	trace:1
+204	sched_getaffinity	U3	implemented	Query a thread's CPU affinity.	trace:1
 205	set_thread_area	E1	not-started	Set a TLS entry (x86 compatibility).	provisional
 206	io_setup	E2	not-started	Create an asynchronous I/O context.	provisional
 207	io_destroy	E2	not-started	Destroy an AIO context.	provisional
@@ -251,7 +251,7 @@
 218	set_tid_address	U4	implemented	Register a clear_child_tid address.	trace:17
 219	restart_syscall	E1	not-started	Restart an interrupted syscall (kernel-issued).	provisional
 220	semtimedop	E2	not-started	System V semaphore op with timeout.	provisional
-221	fadvise64	U3	not-started	Advise the kernel about file access patterns.	trace:3
+221	fadvise64	U3	stubbed	Advise the kernel about file access patterns.	trace:3
 222	timer_create	E2	not-started	Create a POSIX timer.	provisional
 223	timer_settime	E2	not-started	Arm a POSIX timer.	provisional
 224	timer_gettime	E2	not-started	Query a POSIX timer.	provisional
@@ -259,12 +259,12 @@
 226	timer_delete	E2	not-started	Delete a POSIX timer.	provisional
 227	clock_settime	E3	not-started	Set a clock (privileged).	provisional
 228	clock_gettime	U4	implemented	Query a clock (monotonic, realtime, ...).	provisional
-229	clock_getres	U2	not-started	Query a clock's resolution.	provisional
-230	clock_nanosleep	U3	not-started	Sleep on a specific clock.	provisional
+229	clock_getres	U2	stubbed	Query a clock's resolution.	provisional
+230	clock_nanosleep	U3	stubbed	Sleep on a specific clock.	provisional
 231	exit_group	U4	implemented	Terminate all threads in the process.	trace:16
 232	epoll_wait	U3	implemented	Wait for epoll events (legacy).	provisional
 233	epoll_ctl	U3	implemented	Add/modify/remove an epoll interest.	provisional
-234	tgkill	U3	not-started	Send a signal to a specific thread.	provisional
+234	tgkill	U3	implemented	Send a signal to a specific thread.	provisional
 235	utimes	U1	not-started	Set file times (legacy).	provisional
 236	vserver	E3	not-started	Reserved (unused).	provisional
 237	mbind	E2	not-started	Set memory policy for a range.	provisional
@@ -288,18 +288,18 @@
 255	inotify_rm_watch	E2	not-started	Remove an inotify watch.	provisional
 256	migrate_pages	E3	not-started	Move pages to another NUMA node.	provisional
 257	openat	U4	implemented	Open a file relative to a directory descriptor.	trace:3708
-258	mkdirat	U3	not-started	Create a directory relative to a descriptor.	provisional
+258	mkdirat	U3	implemented	Create a directory relative to a descriptor.	provisional
 259	mknodat	E3	not-started	Create a node relative to a descriptor.	provisional
 260	fchownat	E2	not-started	Change owner relative to a descriptor.	provisional
 261	futimesat	E3	not-started	Set file times relative to a descriptor (legacy).	provisional
 262	newfstatat	U4	implemented	Stat relative to a descriptor (fstatat).	trace:2302
-263	unlinkat	U3	not-started	Remove a file relative to a descriptor.	provisional
-264	renameat	U2	not-started	Rename relative to descriptors.	provisional
+263	unlinkat	U3	implemented	Remove a file relative to a descriptor.	provisional
+264	renameat	U2	implemented	Rename relative to descriptors.	provisional
 265	linkat	U2	implemented	Create a hard link relative to descriptors.	provisional
 266	symlinkat	U2	implemented	Create a symlink relative to a descriptor.	provisional
 267	readlinkat	U3	implemented	Read a symlink relative to a descriptor.	trace:1
-268	fchmodat	U3	not-started	Change mode relative to a descriptor.	provisional
-269	faccessat	U3	not-started	Check access relative to a descriptor.	provisional
+268	fchmodat	U3	implemented	Change mode relative to a descriptor.	provisional
+269	faccessat	U3	implemented	Check access relative to a descriptor.	provisional
 270	pselect6	U2	implemented	select with a signal mask.	provisional
 271	ppoll	U2	implemented	poll with a signal mask.	provisional
 272	unshare	E3	not-started	Disassociate parts of the execution context.	provisional
@@ -310,7 +310,7 @@
 277	sync_file_range	E2	not-started	Flush a file range.	provisional
 278	vmsplice	E3	not-started	Splice user pages into a pipe.	provisional
 279	move_pages	E3	not-started	Move pages of a process to a node.	provisional
-280	utimensat	U3	not-started	Set file times (modern).	provisional
+280	utimensat	U3	implemented	Set file times (modern).	provisional
 281	epoll_pwait	U3	implemented	epoll_wait with a signal mask.	provisional
 282	signalfd	E2	not-started	Create a signal-accepting descriptor (legacy).	provisional
 283	timerfd_create	E2	implemented	Create a timer descriptor.	provisional
@@ -323,7 +323,7 @@
 290	eventfd2	U3	implemented	Create an event descriptor (modern).	provisional
 291	epoll_create1	U3	implemented	Create an epoll instance (modern).	provisional
 292	dup3	U2	implemented	Duplicate a descriptor with flags.	provisional
-293	pipe2	U3	not-started	Create a pipe with flags.	trace:1
+293	pipe2	U3	implemented	Create a pipe with flags.	trace:1
 294	inotify_init1	E2	not-started	Create an inotify instance with flags.	provisional
 295	preadv	E2	not-started	Scatter read at an offset.	provisional
 296	pwritev	E2	not-started	Gather write at an offset.	provisional
@@ -346,7 +346,7 @@
 313	finit_module	E3	not-started	Load a module from a descriptor (privileged).	provisional
 314	sched_setattr	E2	not-started	Set scheduling attributes (modern).	provisional
 315	sched_getattr	E2	not-started	Query scheduling attributes (modern).	provisional
-316	renameat2	U2	not-started	Rename with flags relative to descriptors.	provisional
+316	renameat2	U2	implemented	Rename with flags relative to descriptors.	provisional
 317	seccomp	E2	not-started	Restrict syscalls with a filter.	provisional
 318	getrandom	U4	implemented	Obtain random bytes.	trace:19
 319	memfd_create	E2	implemented	Create an anonymous memory-backed file.	provisional
@@ -381,7 +381,7 @@
 436	close_range	U3	not-started	Close a range of descriptors.	provisional
 437	openat2	U3	not-started	openat with an extensible structure.	provisional
 438	pidfd_getfd	E2	not-started	Duplicate another process's descriptor.	provisional
-439	faccessat2	U3	not-started	faccessat with flags.	provisional
+439	faccessat2	U3	implemented	faccessat with flags.	provisional
 440	process_madvise	E3	not-started	Advise on another process's memory.	provisional
 441	epoll_pwait2	E2	implemented	epoll_pwait with a timespec.	provisional
 442	mount_setattr	E3	not-started	Change mount attributes (privileged).	provisional

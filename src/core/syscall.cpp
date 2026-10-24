@@ -2048,13 +2048,13 @@ SyscallResult MinimalSyscallHandler::handle_unguarded(GuestState& state, Memory&
                 }
                 break;
             }
-            case 28:  // madvise
-            case 131: // sigaltstack
-            case 157: // prctl
-            case 221: // fadvise64
-            case 229: // clock_getres
-            case 35:  // nanosleep
-            case 230: // clock_nanosleep
+            case 28:  // madvise [stub]
+            case 131: // sigaltstack [stub]
+            case 157: // prctl [stub]
+            case 221: // fadvise64 [stub]
+            case 229: // clock_getres [stub]
+            case 35:  // nanosleep [stub]
+            case 230: // clock_nanosleep [stub]
                 r = 0;
                 break;
             case 82:   // rename
@@ -2263,18 +2263,27 @@ SyscallResult MinimalSyscallHandler::handle_unguarded(GuestState& state, Memory&
 // once enable_linux_compat() has been called. Keeping the list here, next to the
 // switch itself, is what lets the registry validator refuse to let a JSON rule
 // take over a number this layer already claims.
+//
+// Two per-number annotations are read by tools/gen_syscall_inventory.py, which
+// keeps docs/syscalls/inventory.tsv honest:
+//   [stub]        the number is accepted and answers success, but does not
+//                 perform the call (nanosleep returns 0 immediately, prctl is a
+//                 no-op, and so on).
+//   [unsupported] the number is recognised only so that it can be rejected with
+//                 a clean -ENOSYS instead of being counted as a fault. It is not
+//                 an implementation and stays `not-started` in the inventory.
 bool is_linux_compat_syscall(std::uint64_t number) {
     switch (number) {
     case 2:   // open
     case 4:   // stat
     case 6:   // lstat
-    case 13:  // rt_sigaction
+    case 13:  // rt_sigaction [stub]
     case 14:  // rt_sigprocmask
     case 16:  // ioctl
     case 22:  // pipe
     case 25:  // mremap
-    case 28:  // madvise
-    case 35:  // nanosleep
+    case 28:  // madvise [stub]
+    case 35:  // nanosleep [stub]
     case 62:  // kill
     case 82:  // rename
     case 83:  // mkdir
@@ -2285,15 +2294,15 @@ bool is_linux_compat_syscall(std::uint64_t number) {
     case 90:  // chmod
     case 91:  // fchmod
     case 99:  // sysinfo
-    case 131: // sigaltstack
+    case 131: // sigaltstack [stub]
     case 137: // statfs
     case 138: // fstatfs
-    case 157: // prctl
+    case 157: // prctl [stub]
     case 202: // futex
     case 204: // sched_getaffinity
-    case 221: // fadvise64
-    case 229: // clock_getres
-    case 230: // clock_nanosleep
+    case 221: // fadvise64 [stub]
+    case 229: // clock_getres [stub]
+    case 230: // clock_nanosleep [stub]
     case 234: // tgkill
     case 258: // mkdirat
     case 263: // unlinkat
@@ -2303,7 +2312,7 @@ bool is_linux_compat_syscall(std::uint64_t number) {
     case 280: // utimensat
     case 293: // pipe2
     case 316: // renameat2
-    case 334: // rseq
+    case 334: // rseq [unsupported]
     case 439: // faccessat2
         return true;
     default:
