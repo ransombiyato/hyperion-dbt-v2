@@ -2241,10 +2241,78 @@ SyscallResult MinimalSyscallHandler::handle_unguarded(GuestState& state, Memory&
             }
             case 28:  // madvise [stub]
             case 157: // prctl [stub]
-            case 221: // fadvise64 [stub]
-            case 229: // clock_getres [stub]
+                // Still stubs, and honestly labelled as such in the inventory.
+                // `madvise` cannot be honoured here: guest memory is backed by
+                // host heap pages owned by GuestAddressSpace, not by mmap, so
+                // MADV_DONTNEED/MADV_FREE would free nothing and the pages would
+                // not read back as zero - the observable half of the call would
+                // be a lie. `prctl` covers process and thread control surface
+                // that does not exist in this execution model (no guest threads,
+                // no core dumps, no dumpable flag). Both are refused rather than
+                // faked.
                 r = 0;
                 break;
+            case 221: { // fadvise64(fd, offset, len, advice)
+                // Advisory only, so the translation is real rather than an
+                // approximation: hand it to the host for descriptors that have a
+                // real host file underneath, and report success for the
+                // emulator's own in-memory streams, where there is no page cache
+                // to advise.
+                const std::int32_t guest_fd = arg_i32(state, 0);
+                const std::int64_t offset = static_cast<std::int64_t>(arg(state, 1));
+                const std::int64_t length = static_cast<std::int64_t>(arg(state, 2));
+                const std::int32_t advice = arg_i32(state, 3);
+                constexpr std::int32_t kPosixFadvNoreuse = 5;
+                if (advice < 0 || advice > kPosixFadvNoreuse) {
+                    r = -kEinval;
+                    break;
+                }
+                const OpenFileDescription* ofd = lookup_ofd(files_, guest_fd);
+                if (ofd == nullptr) {
+                    r = -kEbadf;
+                    break;
+                }
+                const int host_fd = underlying_host_fd(*ofd);
+                if (host_fd < 0) {
+                    // A stream or sink owned by the embedder: no page cache is
+                    // involved, so the hint has nothing to act on. Success is
+                    // truthful because the call is advisory.
+                    r = 0;
+                    break;
+                }
+                // posix_fadvise returns the errno value itself (it does not set
+                // errno), so this maps straight through.
+                const int hrc = ::posix_fadvise(host_fd, static_cast<off_t>(offset),
+                                                static_cast<off_t>(length), advice);
+                r = (hrc == 0) ? 0 : -static_cast<std::int64_t>(hrc);
+                break;
+            }
+            case 229: { // clock_getres(clockid, res)
+                // The guest and host clock identifiers agree (0..11 are the same
+                // values on x86-64 and AArch64), so this is a real query, not a
+                // made-up answer. Returning a fabricated 1ns or 0 would make a
+                // guest that sizes its timers from this get it wrong.
+                const std::int32_t clock_id = arg_i32(state, 0);
+                if (clock_id < 0 || clock_id > 11 /*CLOCK_TAI*/) {
+                    r = -kEinval;
+                    break;
+                }
+                std::array<std::uint8_t, 16> ts{};
+                struct timespec host_ts{};
+                if (::clock_getres(clock_id, &host_ts) != 0) {
+                    r = -static_cast<std::int64_t>(errno == 0 ? kEinval : errno);
+                    break;
+                }
+                const std::uint64_t res_addr = arg(state, 1);
+                if (res_addr == 0) {
+                    r = 0; // NULL res: the kernel only validates the clock id
+                    break;
+                }
+                put_u64(ts.data(), 0, static_cast<std::uint64_t>(host_ts.tv_sec));
+                put_u64(ts.data(), 8, static_cast<std::uint64_t>(host_ts.tv_nsec));
+                r = memory.write(res_addr, ts.data(), ts.size()) ? 0 : -kEfault;
+                break;
+            }
             case 35:    // nanosleep(req, rem)
             case 230: { // clock_nanosleep(clockid, flags, req, rem)
                 // Sleeping used to be a stub that returned 0 immediately. That is
@@ -2570,8 +2638,8 @@ bool is_linux_compat_syscall(std::uint64_t number) {
     case 157: // prctl [stub]
     case 202: // futex [stub]
     case 204: // sched_getaffinity
-    case 221: // fadvise64 [stub]
-    case 229: // clock_getres [stub]
+    case 221: // fadvise64
+    case 229: // clock_getres
     case 230: // clock_nanosleep
     case 234: // tgkill
     case 258: // mkdirat

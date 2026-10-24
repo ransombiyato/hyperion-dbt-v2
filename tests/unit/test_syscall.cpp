@@ -2289,3 +2289,107 @@ HYPERION_TEST("syscall", "linux_compat_sigaltstack_records_the_alternate_stack")
     HYPERION_CHECK(memory.read(kBase + 0x700, out.data(), out.size()));
     HYPERION_CHECK_EQ(hyperion::syscall_detail::get_u32_le(out.data() + 8), std::uint32_t{2});
 }
+
+// --- linux-compat layer: advisory hints and clock resolution ----------------
+//
+// Both used to be stubs that answered success without asking the host anything:
+// `clock_getres` invented no answer at all (it wrote nothing), and `fadvise64`
+// claimed to have advised a file it never looked at. Neither is authoritative
+// state, so they are cheap to translate for real - and a guest that sizes its
+// timers from a made-up clock resolution gets it wrong.
+
+HYPERION_TEST("syscall", "linux_compat_clock_getres_asks_the_host") {
+    GuestAddressSpace as;
+    MinimalSyscallHandler handler({}, &as);
+    handler.enable_linux_compat();
+    FlatMemory memory(kBase, kMemSize);
+
+    GuestState s = syscall_state(229, {0 /*CLOCK_REALTIME*/, kBase + 0x100});
+    handler.handle(s, memory);
+    HYPERION_CHECK_EQ(s.reg(Gpr::kRax), std::uint64_t{0});
+    std::array<std::uint8_t, 16> ts{};
+    HYPERION_CHECK(memory.read(kBase + 0x100, ts.data(), ts.size()));
+    const std::uint64_t secs = hyperion::syscall_detail::get_u64_le(ts.data());
+    const std::uint64_t nanos = hyperion::syscall_detail::get_u64_le(ts.data() + 8);
+    // The host's own answer, and a sane one: under a second, sub-second part
+    // below 1e9. A stub leaves the buffer untouched (zeros), which this rejects.
+    struct timespec host_ts{};
+    HYPERION_CHECK_EQ(::clock_getres(CLOCK_REALTIME, &host_ts), 0);
+    HYPERION_CHECK_EQ(secs, static_cast<std::uint64_t>(host_ts.tv_sec));
+    HYPERION_CHECK_EQ(nanos, static_cast<std::uint64_t>(host_ts.tv_nsec));
+    HYPERION_CHECK(nanos < 1000000000ULL);
+
+    // Every clock identifier the kernel accepts resolves without a fault.
+    for (std::uint64_t clock_id = 0; clock_id <= 11; ++clock_id) {
+        s = syscall_state(229, {clock_id, kBase + 0x200});
+        handler.handle(s, memory);
+        const auto rc = static_cast<std::int64_t>(s.reg(Gpr::kRax));
+        HYPERION_CHECK(rc == 0 || rc == -hyperion::kEinval); // some are host-rejected
+    }
+
+    // NULL is legal (validation only), an unknown clock id and a bad pointer are
+    // not.
+    s = syscall_state(229, {0, 0});
+    handler.handle(s, memory);
+    HYPERION_CHECK_EQ(s.reg(Gpr::kRax), std::uint64_t{0});
+    s = syscall_state(229, {99, kBase + 0x300});
+    handler.handle(s, memory);
+    HYPERION_CHECK_EQ(s.reg(Gpr::kRax), static_cast<std::uint64_t>(-hyperion::kEinval));
+    s = syscall_state(229, {0, 0xDEAD0000ULL});
+    handler.handle(s, memory);
+    HYPERION_CHECK_EQ(s.reg(Gpr::kRax), static_cast<std::uint64_t>(-hyperion::kEfault));
+}
+
+HYPERION_TEST("syscall", "linux_compat_fadvise64_translates_the_hint") {
+    TempFile tf;
+    HYPERION_CHECK(tf.fd >= 0);
+    HYPERION_CHECK(::write(tf.fd, "0123456789", 10) == 10);
+
+    GuestAddressSpace as;
+    MinimalSyscallHandler handler({}, &as);
+    handler.enable_linux_compat();
+    FlatMemory memory(kBase, kMemSize);
+    put_cstr(memory, kBase + 0x400, tf.path.c_str());
+
+    GuestState open_s =
+        syscall_state(hyperion::sysno::kOpenat, {hyperion::kAtFdcwd, kBase + 0x400, 0, 0});
+    handler.handle(open_s, memory);
+    const auto gfd = static_cast<std::int64_t>(open_s.reg(Gpr::kRax));
+    HYPERION_CHECK(gfd >= 3);
+
+    // Real file: POSIX_FADV_SEQUENTIAL over the whole file succeeds.
+    GuestState s =
+        syscall_state(221, {static_cast<std::uint64_t>(gfd), 0, static_cast<std::uint64_t>(10), 2});
+    handler.handle(s, memory);
+    HYPERION_CHECK_EQ(s.reg(Gpr::kRax), std::uint64_t{0});
+
+    // Advice values past POSIX_FADV_NOREUSE(5) are EINVAL, as in the kernel.
+    s = syscall_state(221, {static_cast<std::uint64_t>(gfd), 0, 10, 6});
+    handler.handle(s, memory);
+    HYPERION_CHECK_EQ(s.reg(Gpr::kRax), static_cast<std::uint64_t>(-hyperion::kEinval));
+
+    // An unmapped descriptor is EBADF - the old stub returned success without
+    // even looking at `fd`.
+    s = syscall_state(221, {900, 0, 10, 0});
+    handler.handle(s, memory);
+    HYPERION_CHECK_EQ(s.reg(Gpr::kRax), static_cast<std::uint64_t>(-hyperion::kEbadf));
+
+    // An embedder-adopted in-memory stream has no host file and therefore no page
+    // cache to advise: success is the truthful answer because the call is a hint.
+    char buf[64] = {};
+    std::FILE* mem = ::fmemopen(buf, sizeof buf, "r+");
+    HYPERION_CHECK(mem != nullptr);
+    HYPERION_CHECK(handler.adopt(5, mem));
+    s = syscall_state(221, {5, 0, 0, 1 /*POSIX_FADV_RANDOM*/});
+    handler.handle(s, memory);
+    HYPERION_CHECK_EQ(s.reg(Gpr::kRax), std::uint64_t{0});
+
+    // fd 1 is the process's own stdout. If the host gave it a real descriptor the
+    // answer is the kernel's (0 for a regular file or /dev/null, ESPIPE for a
+    // pipe - which is what ctest's captured stdout is); either way it is not the
+    // unconditional success the stub returned.
+    s = syscall_state(221, {1, 0, 0, 0});
+    handler.handle(s, memory);
+    const auto stdout_rc = static_cast<std::int64_t>(s.reg(Gpr::kRax));
+    HYPERION_CHECK(stdout_rc == 0 || stdout_rc == -hyperion::kEspipe);
+}

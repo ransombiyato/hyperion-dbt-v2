@@ -83,6 +83,14 @@ Meaningful changes by milestone. Format loosely follows
   at work that was already done.
 
 ### Fixed
+- **`clock_getres` and `fadvise64` answered success without asking anything.**
+  `clock_getres`(229) now returns the host's real clock resolution in the guest's
+  16-byte `timespec` (`-EINVAL` for an unknown clock id, `-EFAULT` for an unmapped
+  `res`); `fadvise64`(221) validates the descriptor (`-EBADF`), rejects
+  out-of-range advice (`-EINVAL`) and forwards to host `posix_fadvise`. `madvise`
+  and `prctl` remain stubs with the reason written in the source: guest memory is
+  host heap storage rather than `mmap`, so the observable half of `MADV_DONTNEED`
+  cannot be honoured, and `prctl` has no process/thread surface to act on here.
 - **`rt_sigaction` fabricated the guest's signal dispositions.** The syscall wrote
   32 zero bytes into the caller's `oldact` and returned 0 regardless of what the
   guest had installed, so a program that installed `SIGSEGV` and read it back was
@@ -151,8 +159,8 @@ Meaningful changes by milestone. Format loosely follows
   against the AArch64-built binary, runs the registry CLI under qemu, and fails
   if tier 1 falls back to the interpreter. Measured with
   `g++-aarch64-linux-gnu` 14.2.0 and the cached `qemu-aarch64-static`:
-  `scripts/dev.sh cross-test` **10/10**, AArch64 unit suite **347 passed / 0
-  failed / 2 skipped** of 349, and the compat guest at `--tier=1` reports
+  `scripts/dev.sh cross-test` **10/10**, AArch64 unit suite **349 passed / 0
+  failed / 2 skipped** of 351, and the compat guest at `--tier=1` reports
   `1412 basic block(s) translated`, `failures 0` and **the same 170 308 guest
   steps as tier 0**. `tests/guest/syscall_compat_test.sh` and
   `tests/cli/registry_cli_test.sh` grew an optional emulator argument so both can

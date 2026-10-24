@@ -71,7 +71,7 @@ works, what was last verified, and what to do next.
 
 **Implemented-syscall status (verified automatically by
 `tools/gen_syscall_inventory.py --check`).** 128 numbers are answered
-today — 123 implemented and 5 stubbed — of the 375 in the pinned kernel
+today — 125 implemented and 3 stubbed — of the 375 in the pinned kernel
 table. The validator now cross-checks three sources in both directions:
 `MinimalSyscallHandler::handle()`, `is_linux_compat_syscall()` (whose numbers carry
 a `[stub]` or `[unsupported]` annotation that decides the expected status), and the
@@ -79,8 +79,7 @@ compatibility layer's adapter table and alias rules. A syscall cannot be counted
 as implemented in the inventory without a handler somewhere, and a handler cannot
 exist without the inventory saying so.
 
-The 5 stubs are `madvise`(28), `prctl`(157), `fadvise64`(221),
-`clock_getres`(229) and `futex`(202). They answer success without performing the
+The 3 stubs are `madvise`(28), `prctl`(157) and `futex`(202). They answer success without performing the
 call, or — for `futex` — perform the value comparison and then refuse to block,
 and are listed as `stubbed` rather than
 `implemented` because claiming them would be a lie a roadmap could be built on. `rseq`(334) is
@@ -466,7 +465,7 @@ below, and it is a host limitation, not a passing claim:
 | Native unit tests | `./build/dev/tests/hyperion_unit_tests` | **311 passed, 0 failed, 24 skipped** (of 335) |
 | Full CTest tree | `ctest --test-dir build/dev` | **16/16 passed** (unit, differential, 3 CLI, 2 guest, inventory, 7 bench) |
 | ASan + UBSan | `cmake -B build/asan -DHYPERION_ENABLE_SANITIZERS=ON` + `ctest` | **16/16 passed**, no sanitizer report |
-| Guest compat suite | `guest.syscall_compat` | 9/9 checks (27 guest-side ABI assertions) |
+| Guest compat suite | `guest.syscall_compat` | 11/11 checks (37 guest-side ABI assertions) |
 | Registry CLI suite | `cli.syscall_registry` | 11/11 checks |
 | Syscall inventory | `python3 tools/gen_syscall_inventory.py --check` | OK (0 errors, 0 warnings) |
 | Dispatch microbenchmark | `benchmarks/hyperion_syscall_bench --iterations 300000 --repeats 9` | see `TESTING.md` §6 |
@@ -806,7 +805,7 @@ stable-vs-noisy discrimination case).
 
 **The syscall compatibility engine is in place** — four-layer dispatch, 40 ABI
 adapters, an external validated registry, a CLI, an installer step and tests at
-three levels (unit, CLI, real-guest). 130 of 375 syscall numbers are
+three levels (unit, CLI, real-guest). 128 of 375 syscall numbers are
 answered.
 
 The next work is ordered by what a real terminal application (the stated target:

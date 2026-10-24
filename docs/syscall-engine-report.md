@@ -138,7 +138,7 @@ deleting it restores `-ENOSYS`:
 Counts are generated from `docs/syscalls/inventory.tsv` and enforced in both
 directions by `tools/gen_syscall_inventory.py --check`.
 
-**130 of 375** numbers are answered: **123 implemented, 5 stubbed**. Before this
+**128 of 375** numbers are answered: **125 implemented, 3 stubbed**. Before this
 work the inventory claimed 47.
 
 Newly `implemented` in this work (42 numbers):
@@ -167,10 +167,10 @@ in the inventory (`open`, `stat`, `lstat`, `rt_sigprocmask`, `ioctl`, `pipe`,
 pointed at work that was already done.
 
 - **Moved from stub to real:** `nanosleep`(35), `clock_nanosleep`(230),
-  `rt_sigaction`(13), `sigaltstack`(131).
+  `rt_sigaction`(13), `sigaltstack`(131), `clock_getres`(229), `fadvise64`(221).
 - **Still stubbed, and labelled `stubbed` rather than `implemented`:**
-  `madvise`(28), `prctl`(157), `fadvise64`(221), `clock_getres`(229), and
-  `futex`(202).
+  `madvise`(28), `prctl`(157) and `futex`(202) — and each says *why* in the
+  source, instead of the call quietly returning 0.
 - **`futex` was corrected *downwards* in this work.** It had been counted as
   implemented while returning success from `FUTEX_WAIT` without blocking — i.e.
   telling callers they had been woken when nothing had happened. It now does the
@@ -245,6 +245,24 @@ fixture gained `sigaltstack`, `sigaction`, `sigaction_per_signal` and
 dispatch path at both tiers. Non-vacuity was checked the same way as before: with
 the store removed the round-trip assertion fails.
 
+## 6c. Two more stubs replaced with real translations
+
+`clock_getres`(229) and `fadvise64`(221) also answered success while doing
+nothing. Neither needs a wait queue or a signal frame, so both are now real:
+
+| Call | Behaviour |
+| --- | --- |
+| `clock_getres(clockid, res)` | Asks the **host** `clock_getres` and writes the 16-byte guest `timespec`. x86-64 and AArch64 share clock identifiers 0..11, so this is a query, not a guess. Unknown id → `-EINVAL`; `res == NULL` validates the id only (as the kernel does); unmapped `res` → `-EFAULT` |
+| `fadvise64(fd, offset, len, advice)` | Validates the descriptor (`-EBADF`), rejects `advice > POSIX_FADV_NOREUSE` (`-EINVAL`), and forwards to host `posix_fadvise`, whose return value *is* an errno, mapped straight through. For an embedder-adopted in-memory stream there is no host page cache to advise, so it returns 0 — truthful because the call is a hint |
+
+`madvise`(28) and `prctl`(157) stay stubs **on purpose**, and the source says
+why: guest memory is backed by host heap pages owned by `GuestAddressSpace`, not
+by `mmap`, so `MADV_DONTNEED`/`MADV_FREE` would free nothing and the pages would
+not read back as zero — the observable half of the call would be a lie; and
+`prctl` addresses process/thread control surface that does not exist in this
+execution model. Refusing is better than faking, but the inventory still says
+`stubbed` for both rather than claiming them.
+
 ## 6a. AArch64 / Tier 1 verification (measured)
 
 ```
@@ -254,11 +272,11 @@ scripts/dev.sh cross-test        # 10/10 passed
 
 | Run | Result |
 | --- | --- |
-| AArch64 unit suite (`qemu-aarch64-static`) | **347 passed, 0 failed, 2 skipped** (of 349 registered) |
+| AArch64 unit suite (`qemu-aarch64-static`) | **349 passed, 0 failed, 2 skipped** (of 351 registered) |
 | AArch64 differential suite | 0 passed — correct: no x86-64 oracle on AArch64, so every case SKIPs |
 | `cross.aarch64_tests` (whole pipeline) | passed, 18–61 s |
 | AArch64 guest **process** tests, tier 0 / tier 1 | passed / passed |
-| AArch64 **syscall compat** suite, tier 0 / tier 1 | all checks passed (now 25 guest assertions incl. `sigaction`/`sigaltstack`) |
+| AArch64 **syscall compat** suite, tier 0 / tier 1 | 11/11 checks, 37 guest assertions each |
 | AArch64 registry CLI | 11/11 checks |
 | Tier 1 JIT evidence | `tier 1: 1412 basic block(s) translated`, `failures 0`, **170 308 guest steps — identical to tier 0** |
 
@@ -278,16 +296,16 @@ Without that assertion a silent fallback would pass every behavioural check.
 cmake -B build/dev -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
 cmake --build build/dev -j8            # clean, no warnings
 ctest --test-dir build/dev             # 16/16 passed
-./build/dev/tests/hyperion_unit_tests  # 321 passed, 0 failed, 24 skipped (of 345)
+./build/dev/tests/hyperion_unit_tests  # 323 passed, 0 failed, 24 skipped (of 347)
 python3 tools/gen_syscall_inventory.py --check   # 0 errors, 0 warnings
 ```
 
 | Suite | Command | Result |
 | --- | --- | --- |
-| Native unit | `./build/dev/tests/hyperion_unit_tests` | **321 passed, 0 failed, 24 skipped** (of 345) |
+| Native unit | `./build/dev/tests/hyperion_unit_tests` | **323 passed, 0 failed, 24 skipped** (of 347) |
 | Full CTest tree | `ctest --test-dir build/dev` | **16/16 passed** |
 | ASan + UBSan | `cmake -B build/asan -DHYPERION_ENABLE_SANITIZERS=ON` + build + `ctest` | **16/16 passed**, no report |
-| Guest compatibility | `ctest -R guest.syscall_compat` | 11 checks, 27 guest-side assertions |
+| Guest compatibility | `ctest -R guest.syscall_compat` | 11 checks, 37 guest-side assertions |
 | Registry CLI contract | `ctest -R cli.syscall_registry` | 11 checks |
 | Formatting | clang-format 19.1.7 `--dry-run --Werror` | clean |
 | Lint | `shellcheck` on all touched scripts | clean |

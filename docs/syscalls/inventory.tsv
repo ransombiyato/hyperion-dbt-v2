@@ -251,7 +251,7 @@
 218	set_tid_address	U4	implemented	Register a clear_child_tid address.	trace:17
 219	restart_syscall	E1	not-started	Restart an interrupted syscall (kernel-issued).	provisional
 220	semtimedop	E2	not-started	System V semaphore op with timeout.	provisional
-221	fadvise64	U3	stubbed	Advise the kernel about file access patterns.	trace:3
+221	fadvise64	U3	implemented	Advise the kernel about file access patterns.	trace:3
 222	timer_create	E2	not-started	Create a POSIX timer.	provisional
 223	timer_settime	E2	not-started	Arm a POSIX timer.	provisional
 224	timer_gettime	E2	not-started	Query a POSIX timer.	provisional
@@ -259,7 +259,7 @@
 226	timer_delete	E2	not-started	Delete a POSIX timer.	provisional
 227	clock_settime	E3	not-started	Set a clock (privileged).	provisional
 228	clock_gettime	U4	implemented	Query a clock (monotonic, realtime, ...).	provisional
-229	clock_getres	U2	stubbed	Query a clock's resolution.	provisional
+229	clock_getres	U2	implemented	Query a clock's resolution.	provisional
 230	clock_nanosleep	U3	implemented	Sleep on a specific clock.	provisional
 231	exit_group	U4	implemented	Terminate all threads in the process.	trace:16
 232	epoll_wait	U3	implemented	Wait for epoll events (legacy).	provisional

@@ -245,10 +245,10 @@ from `tools/cache`):
 
 | Run | Result |
 | --- | --- |
-| AArch64 unit tests | **347 passed, 0 failed, 2 skipped** (of 349 registered) |
+| AArch64 unit tests | **349 passed, 0 failed, 2 skipped** (of 351 registered) |
 | AArch64 differential suite | 0 passed (correct: no x86-64 oracle on AArch64, every case SKIPs) |
 | AArch64 guest process, tier 0 / tier 1 | passed / passed |
-| AArch64 syscall compat, tier 0 / tier 1 | all checks passed, 25 guest assertions each |
+| AArch64 syscall compat, tier 0 / tier 1 | 11/11 checks, 37 guest assertions each |
 | AArch64 tier-1 JIT evidence | `tier 1: 1412 basic block(s) translated`, `failures 0`, 170 308 guest steps — identical to tier 0 |
 | AArch64 registry CLI | 11/11 checks |
 

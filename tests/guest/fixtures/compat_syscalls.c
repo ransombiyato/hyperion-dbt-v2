@@ -278,6 +278,28 @@ int main(void) {
               sigaction(SIGKILL, &act, NULL) == -1 && errno == EINVAL);
     }
 
+    /* --- advisory hints and clocks ---------------------------------------- */
+    {
+        struct timespec res;
+        memset(&res, 0, sizeof res);
+        const int got = clock_getres(CLOCK_REALTIME, &res) == 0;
+        check("clock_getres", got && res.tv_nsec < 1000000000L);
+        check("clock_getres_einval", clock_getres((clockid_t)99, &res) == -1 && errno == EINVAL);
+        /* fadvise64 is advisory; a real file must accept it, and an unopened
+         * descriptor must be EBADF rather than a silent success. */
+        char name[] = "/tmp/hyperion_advise_XXXXXX";
+        const int fd = mkstemp(name);
+        if (fd >= 0) {
+            unlink(name);
+            (void)write(fd, "0123456789", 10);
+            check("fadvise64",
+                  posix_fadvise(fd, 0, 10, POSIX_FADV_SEQUENTIAL) == 0 &&
+                      posix_fadvise(fd, 0, 10, (int)99) == EINVAL);
+            close(fd);
+        }
+        check("fadvise64_ebadf", posix_fadvise(900, 0, 0, POSIX_FADV_NORMAL) == EBADF);
+    }
+
     /* --- process and scheduling ------------------------------------------- */
     check("sched_yield", sched_yield() == 0);
     /* MEMBARRIER_CMD_QUERY. A kernel answers with the command mask; HYPERION
