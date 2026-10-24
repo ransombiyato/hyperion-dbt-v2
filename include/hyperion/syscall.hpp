@@ -300,6 +300,7 @@ inline constexpr std::int64_t kEloop = 40;
 inline constexpr std::int64_t kEnametoolong = 36;
 inline constexpr std::int64_t kErange = 34;
 inline constexpr std::int64_t kEintr = 4;
+inline constexpr std::int64_t kEnotty = 25;
 
 // What the handler did with a syscall.
 enum class SyscallStatus : std::uint8_t {

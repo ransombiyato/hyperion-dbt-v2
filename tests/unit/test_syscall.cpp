@@ -9,6 +9,7 @@
 // tests that require executing generated AArch64 code are guarded on
 // __aarch64__, matching the rest of the suite.
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -16,6 +17,7 @@
 #include <cstring>
 #include <fcntl.h>
 #include <string>
+#include <sys/ioctl.h>
 #include <unistd.h>
 #include <vector>
 
@@ -1834,4 +1836,196 @@ HYPERION_TEST("syscall", "linux_compat_clock_nanosleep_absolute_deadline_is_imme
                              .count();
     HYPERION_CHECK_EQ(s.reg(Gpr::kRax), std::uint64_t{0});
     HYPERION_CHECK(elapsed < 1000);
+}
+
+// --- linux-compat layer: terminal ioctl -------------------------------------
+//
+// Raw mode is the first thing a terminal application does, and it is a TCSETS
+// ioctl. These tests drive the ioctl path over a real pseudo-terminal, because
+// that is the only way to know the translated request numbers and the 36-byte
+// kernel `struct termios` actually line up.
+
+namespace {
+
+// A pseudo-terminal pair, or nothing if the host cannot provide one.
+struct PtyPair {
+    int master = -1;
+    int slave = -1;
+    bool ok() const { return master >= 0 && slave >= 0; }
+    ~PtyPair() {
+        if (slave >= 0) {
+            ::close(slave);
+        }
+        if (master >= 0) {
+            ::close(master);
+        }
+    }
+};
+
+PtyPair open_pty() {
+    PtyPair pty;
+    pty.master = ::posix_openpt(O_RDWR | O_NOCTTY);
+    if (pty.master < 0) {
+        return pty;
+    }
+    if (::grantpt(pty.master) != 0 || ::unlockpt(pty.master) != 0) {
+        return pty;
+    }
+    const char* name = ::ptsname(pty.master);
+    if (name == nullptr) {
+        return pty;
+    }
+    pty.slave = ::open(name, O_RDWR | O_NOCTTY);
+    return pty;
+}
+
+// The guest's view of the kernel termios: 4 flag words, c_line, c_cc[19].
+constexpr std::size_t kTermiosBytes = 36;
+constexpr std::uint64_t kIoctlTcgets = 0x5401;
+constexpr std::uint64_t kIoctlTcsets = 0x5402;
+constexpr std::uint64_t kIoctlTcsetsw = 0x5403;
+constexpr std::uint64_t kIoctlTcsetsf = 0x5404;
+constexpr std::uint64_t kIoctlTiocswinsz = 0x5414;
+constexpr std::uint64_t kIoctlFionread = 0x541B;
+
+} // namespace
+
+HYPERION_TEST("syscall", "linux_compat_ioctl_tcgets_then_tcsets_round_trips") {
+    PtyPair pty = open_pty();
+    if (!pty.ok()) {
+        HYPERION_SKIP("host has no pseudo-terminal");
+    }
+    GuestAddressSpace as;
+    MinimalSyscallHandler handler({}, &as);
+    handler.enable_linux_compat();
+    handler.adopt(3, ::fdopen(pty.slave, "r+"));
+    pty.slave = -1; // now owned by the handler
+
+    FlatMemory memory(kBase, kMemSize);
+
+    // TCGETS: the guest asks for the current terminal attributes.
+    GuestState s = syscall_state(16 /* ioctl */, {3, kIoctlTcgets, kBase + 0x100});
+    handler.handle(s, memory);
+    HYPERION_CHECK_EQ(s.reg(Gpr::kRax), std::uint64_t{0});
+    std::array<std::uint8_t, kTermiosBytes> original{};
+    HYPERION_CHECK(memory.read(kBase + 0x100, original.data(), original.size()));
+    // A fresh pty has ECHO set in c_lflag (word 3). If this were zero the test
+    // would pass whatever the handler did.
+    std::uint32_t lflag = 0;
+    std::memcpy(&lflag, original.data() + 12, 4);
+    HYPERION_CHECK((lflag & 0x8U) != 0); // ECHO
+
+    // TCSETS with ECHO and ICANON cleared: raw mode, the call a TUI makes.
+    std::array<std::uint8_t, kTermiosBytes> raw = original;
+    std::uint32_t iflag = 0;
+    std::memcpy(&iflag, raw.data(), 4);
+    std::memcpy(raw.data(), &iflag, 4);
+    lflag &= ~0x8U; // ECHO
+    lflag &= ~0x2U; // ICANON
+    std::memcpy(raw.data() + 12, &lflag, 4);
+    HYPERION_CHECK(memory.write(kBase + 0x200, raw.data(), raw.size()));
+
+    s = syscall_state(16, {3, kIoctlTcsets, kBase + 0x200});
+    handler.handle(s, memory);
+    HYPERION_CHECK_EQ(s.reg(Gpr::kRax), std::uint64_t{0});
+
+    // Read back through the handler: the change must have reached the host.
+    std::array<std::uint8_t, kTermiosBytes> after{};
+    HYPERION_CHECK(memory.write(kBase + 0x100, after.data(), after.size()));
+    s = syscall_state(16, {3, kIoctlTcgets, kBase + 0x100});
+    handler.handle(s, memory);
+    HYPERION_CHECK_EQ(s.reg(Gpr::kRax), std::uint64_t{0});
+    std::uint32_t lflag_after = 0;
+    HYPERION_CHECK(memory.read(kBase + 0x100, after.data(), after.size()));
+    std::memcpy(&lflag_after, after.data() + 12, 4);
+    HYPERION_CHECK((lflag_after & 0x8U) == 0); // ECHO cleared
+    HYPERION_CHECK((lflag_after & 0x2U) == 0); // ICANON cleared
+
+    // TCSETSW and TCSETSF are the same request with a different wait point.
+    s = syscall_state(16, {3, kIoctlTcsetsw, kBase + 0x100});
+    handler.handle(s, memory);
+    HYPERION_CHECK_EQ(s.reg(Gpr::kRax), std::uint64_t{0});
+    s = syscall_state(16, {3, kIoctlTcsetsf, kBase + 0x100});
+    handler.handle(s, memory);
+    HYPERION_CHECK_EQ(s.reg(Gpr::kRax), std::uint64_t{0});
+}
+
+HYPERION_TEST("syscall", "linux_compat_ioctl_tiocswinsz_and_fionread") {
+    PtyPair pty = open_pty();
+    if (!pty.ok()) {
+        HYPERION_SKIP("host has no pseudo-terminal");
+    }
+    GuestAddressSpace as;
+    MinimalSyscallHandler handler({}, &as);
+    handler.enable_linux_compat();
+    handler.adopt(3, ::fdopen(pty.slave, "r+"));
+    pty.slave = -1;
+    FlatMemory memory(kBase, kMemSize);
+
+    // TIOCSWINSZ: the guest sets the window size (a resize the TUI asked for).
+    std::array<std::uint8_t, 8> ws{};
+    hyperion::syscall_detail::put_u16(ws.data(), 0, 40);  // ws_row
+    hyperion::syscall_detail::put_u16(ws.data(), 2, 100); // ws_col
+    HYPERION_CHECK(memory.write(kBase + 0x100, ws.data(), ws.size()));
+    GuestState s = syscall_state(16, {3, kIoctlTiocswinsz, kBase + 0x100});
+    handler.handle(s, memory);
+    HYPERION_CHECK_EQ(s.reg(Gpr::kRax), std::uint64_t{0});
+
+    // Read it back with TIOCGWINSZ: the handler's existing case must see it.
+    std::array<std::uint8_t, 8> back{};
+    HYPERION_CHECK(memory.write(kBase + 0x200, back.data(), back.size()));
+    s = syscall_state(16, {3, 0x5413 /*TIOCGWINSZ*/, kBase + 0x200});
+    handler.handle(s, memory);
+    HYPERION_CHECK_EQ(s.reg(Gpr::kRax), std::uint64_t{0});
+    HYPERION_CHECK(memory.read(kBase + 0x200, back.data(), back.size()));
+    HYPERION_CHECK_EQ(hyperion::syscall_detail::get_u16_le(back.data()), std::uint16_t{40});
+    HYPERION_CHECK_EQ(hyperion::syscall_detail::get_u16_le(back.data() + 2), std::uint16_t{100});
+
+    // FIONREAD: bytes waiting to be read. Measured on a pipe rather than through
+    // the pty, because a pty's answer depends on the line discipline and on the
+    // host kernel's buffer accounting - `ioctl(FIONREAD)` on this host's pty
+    // reports 0 even while a read returns data. A pipe is exact, so the number can
+    // be asserted instead of merely the return code.
+    int pipe_fds[2] = {-1, -1};
+    HYPERION_CHECK_EQ(::pipe(pipe_fds), 0);
+    HYPERION_CHECK_EQ(::write(pipe_fds[1], "abc", 3), ssize_t{3});
+    // adopt() takes ownership of the stream, which owns the descriptor.
+    HYPERION_CHECK(handler.adopt(4, ::fdopen(pipe_fds[0], "r")));
+    s = syscall_state(16, {4, kIoctlFionread, kBase + 0x300});
+    handler.handle(s, memory);
+    HYPERION_CHECK_EQ(s.reg(Gpr::kRax), std::uint64_t{0});
+    std::array<std::uint8_t, 4> count{};
+    HYPERION_CHECK(memory.read(kBase + 0x300, count.data(), count.size()));
+    HYPERION_CHECK_EQ(hyperion::syscall_detail::get_u32_le(count.data()), std::uint32_t{3});
+    HYPERION_CHECK_EQ(::close(pipe_fds[1]), 0);
+
+    // On a terminal whose buffer the host reports as empty, the translating path
+    // must still succeed and report what the host reported rather than inventing
+    // a number.
+    s = syscall_state(16, {3, kIoctlFionread, kBase + 0x300});
+    handler.handle(s, memory);
+    HYPERION_CHECK_EQ(s.reg(Gpr::kRax), std::uint64_t{0});
+}
+
+HYPERION_TEST("syscall", "linux_compat_ioctl_rejects_bad_pointers_and_unknown_requests") {
+    GuestAddressSpace as;
+    MinimalSyscallHandler handler({}, &as);
+    handler.enable_linux_compat();
+    FlatMemory memory(kBase, kMemSize);
+
+    // A bad fd is EBADF; an unhandled request on a valid fd is ENOTTY, which is
+    // what a real kernel answers - not ENOSYS, which would tell a caller the
+    // translator is unfinished rather than the device does not support it.
+    GuestState s = syscall_state(16, {9, kIoctlTcgets, kBase + 0x100});
+    handler.handle(s, memory);
+    HYPERION_CHECK_EQ(s.reg(Gpr::kRax), static_cast<std::uint64_t>(-hyperion::kEbadf));
+
+    s = syscall_state(16, {1, 0xDEADBEEFULL, kBase + 0x100});
+    handler.handle(s, memory);
+    HYPERION_CHECK_EQ(s.reg(Gpr::kRax), static_cast<std::uint64_t>(-hyperion::kEnotty));
+
+    // A TCSETS whose buffer is outside the guest's memory is EFAULT, not a crash.
+    s = syscall_state(16, {1, kIoctlTcsets, 0xDEAD0000ULL});
+    handler.handle(s, memory);
+    HYPERION_CHECK_EQ(s.reg(Gpr::kRax), static_cast<std::uint64_t>(-hyperion::kEfault));
 }

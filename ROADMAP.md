@@ -393,9 +393,11 @@ file descriptors, signals, threading, futexes. Feature matrix + integration test
   `waitid`(247).
 - ⬜ Sockets (`socket`/`connect`/`bind`/`listen`): needed by an editor that talks
   to a language server; a large, separable piece.
-- ⬜ `ioctl` coverage for terminals: `TIOCGWINSZ` works; `TCGETS`/`TCSETS`
-  (raw mode) and `TIOCSWINSZ` do not, so a TUI cannot yet put a terminal into raw
-  mode. This is the top-priority item for the stated target workload.
+- ✅ **Terminal `ioctl` coverage** — `TCGETS`/`TCSETS`/`TCSETSW`/`TCSETSF`,
+  `TIOCSWINSZ` and `FIONREAD` on top of the existing `TIOCGWINSZ`, so a TUI can
+  put a terminal into raw mode and size its window. Verified on a real
+  pseudo-terminal: natively, in a unit test, and through a guest fixture under
+  `script(1)`.
 - ⬜ Guest concurrency: no test runs syscalls concurrently with a registry
   `reload()`. The design (immutable snapshot + `shared_ptr` swap) is sound; the
   concurrency is unproven.
@@ -405,16 +407,14 @@ file descriptors, signals, threading, futexes. Feature matrix + integration test
 The order is set by what a terminal application (a TUI editor) actually executes,
 not by syscall number:
 
-1. `ioctl` `TCGETS`/`TCSETS`/`TIOCSWINSZ`/`FIONREAD` — raw mode is the first
-   thing a TUI does, and `struct termios` layout differs between x86-64 and
-   AArch64 (`c_cc` ordering), which is exactly what an adapter is for.
-2. `rt_sigaction` + `sigaltstack` — replace the stubs with either a real
+1. `rt_sigaction` + `sigaltstack` — replace the stubs with either a real
    implementation or an explicit refusal.
-3. `futex` validation (wait/wake bit sets, timeouts, `-EAGAIN`) before any thread
+2. `futex` validation (wait/wake bit sets, timeouts, `-EAGAIN`) before any thread
    work begins.
-4. `select`/`poll`/`epoll` are done; `signalfd`, `inotify_*` are the next
+3. `select`/`poll`/`epoll` are done; `signalfd`, `inotify_*` are the next
    event-source gaps a file-watching editor hits.
-5. Sockets.
+4. Sockets.
+5. Remaining terminal ioctls (`TIOCGPGRP`/`TIOCSPGRP`) and `TIOCLINUX` are `-ENOTTY`.
 6. Re-run `scripts/dev.sh cross-test`: the AArch64 tree was **not** exercised for
    this work (the development host is x86-64), so Tier 1 is unverified here.
 

@@ -19,6 +19,8 @@
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
 #include <sys/poll.h>
+#include <sys/ioctl.h>
+#include <termios.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/select.h>
@@ -198,6 +200,38 @@ int main(void) {
     bad.tv_sec = 0;
     bad.tv_nsec = 1000000000; /* the kernel rejects 1e9 rather than normalising */
     check("nanosleep_einval", nanosleep(&bad, NULL) == -1 && errno == EINVAL);
+
+    /* --- terminal --------------------------------------------------------- */
+    /* Raw mode is the first thing a terminal application does, and every one of
+     * them reaches it through TCGETS/TCSETS. Without a controlling terminal
+     * there is nothing to put into raw mode, so this group is skipped rather
+     * than failed when stdin is not a tty. */
+    if (isatty(STDIN_FILENO)) {
+        struct termios original;
+        if (tcgetattr(STDIN_FILENO, &original) == 0) {
+            struct termios raw = original;
+            cfmakeraw(&raw);
+            const int set = tcsetattr(STDIN_FILENO, TCSANOW, &raw) == 0;
+            struct termios after;
+            const int got = tcgetattr(STDIN_FILENO, &after) == 0;
+            check("tcgetattr/tcsetattr", set && got);
+            /* cfmakeraw clears ECHO and ICANON in c_lflag. */
+            check("raw_mode_flags", (after.c_lflag & (ECHO | ICANON)) == 0);
+            (void)tcsetattr(STDIN_FILENO, TCSANOW, &original);
+            struct winsize ws;
+            memset(&ws, 0, sizeof ws);
+            ws.ws_row = 33;
+            ws.ws_col = 111;
+            check("tiocswinsz", ioctl(STDIN_FILENO, TIOCSWINSZ, &ws) == 0);
+            struct winsize back;
+            memset(&back, 0, sizeof back);
+            check("tiocgwinsz",
+                  ioctl(STDIN_FILENO, TIOCGWINSZ, &back) == 0 && back.ws_row == 33 &&
+                      back.ws_col == 111);
+        }
+    } else {
+        printf("%-22s %s\n", "terminal", "skip (stdin is not a tty)");
+    }
 
     /* --- process and scheduling ------------------------------------------- */
     check("sched_yield", sched_yield() == 0);

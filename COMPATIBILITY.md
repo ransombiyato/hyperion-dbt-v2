@@ -491,7 +491,7 @@ statically linked binary.
 | `timespec` (`nanosleep`, `clock_nanosleep`) | `s64 tv_sec`, `s64 tv_nsec` | same layout, same `CLOCK_*` ids | validated (`0 ≤ tv_nsec < 1e9`), copied, real host call; `-EINTR` writes the **unslept remainder** back for the relative form only, as Linux does |
 | Guest fd numbers | arbitrary guest integers | host descriptors | every adapter resolves through the handler's guest descriptor table; an unknown guest fd is `-EBADF` and never reaches the host |
 | `errno` conventions | errors are `-errno` in `rax` | C library sets `errno` | adapters return the negated value directly; `-ENOSYS` from an adapter means "declined to translate" and is counted as unsupported, **not** as handled |
-| `ioctl` requests (`TIOCGWINSZ`, …) | request numbers and `struct winsize` differ per arch | as host | request constants are compared against the *guest's* values and the payload is built in the guest layout |
+| `ioctl` requests | request *numbers* are architecture-specific and the payload layouts differ | as host | request constants are compared against the guest's values; `struct winsize` is built in the guest layout; `struct termios` uses the 36-byte asm-generic kernel layout shared by both architectures (the 60-byte *userspace* struct never crosses the ABI, because glibc converts before issuing the ioctl) — `TCGETS`/`TCSETS`/`TCSETSW`/`TCSETSF`, `TIOCGWINSZ`/`TIOCSWINSZ` and `FIONREAD` are implemented, anything else is `-ENOTTY` |
 | `epoll` timeouts | `epoll_wait`/`epoll_pwait` take the timeout **by value**, not by pointer | same | handled as a value, which a pointer-based reading would have got wrong |
 
 The compiled rule table is inherited across `fork(2)`/`vfork(2)`/`clone(2)`: a

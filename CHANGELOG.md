@@ -83,6 +83,16 @@ Meaningful changes by milestone. Format loosely follows
   at work that was already done.
 
 ### Fixed
+- **A terminal application could not enter raw mode.** `ioctl` handled
+  `TIOCGWINSZ` only, so `cfmakeraw()` — the first thing every TUI does — failed
+  and the application either exited or drove the terminal in cooked mode.
+  `TCGETS`, `TCSETS`, `TCSETSW`, `TCSETSF`, `TIOCSWINSZ` and `FIONREAD` are now
+  implemented over the 36-byte asm-generic `struct termios` (the layout shared by
+  x86-64 and AArch64; glibc converts the 60-byte userspace struct before issuing
+  the ioctl). Unknown requests return `-ENOTTY`, not `-ENOSYS`. Verified against a
+  real pseudo-terminal in three places: natively, in
+  `syscall.linux_compat_ioctl_tcgets_then_tcsets_round_trips`, and by the guest
+  fixture run under `script(1)` in `guest.syscall_compat`.
 - **Real registry rules could be silently dropped while `--validate` exited 0.**
   A rule for a syscall HYPERION implements statically, or with an unknown
   handler, was rejected during compilation and reported only as a warning. A user

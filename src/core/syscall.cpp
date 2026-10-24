@@ -548,6 +548,12 @@ std::int64_t do_lseek(GuestState& s, const std::vector<GuestDescriptor>& files) 
     return -kEspipe;
 }
 
+// The kernel's `struct termios` (asm-generic, shared by x86-64 and AArch64):
+// four u32 flag words, c_line, c_cc[19]. This is *not* the C library's 60-byte
+// userspace struct - glibc converts before issuing the ioctl, and so does the
+// guest's glibc, so only the kernel-sized layout crosses the ABI boundary.
+constexpr std::size_t kGuestTermiosSize = 36;
+
 std::int64_t read_guest_cstr(Memory& memory, std::uint64_t address, std::string& out) {
     constexpr std::size_t kMaxPath = 4096; // Linux PATH_MAX
     out.clear();
@@ -2005,8 +2011,61 @@ SyscallResult MinimalSyscallHandler::handle_unguarded(GuestState& state, Memory&
                     } else {
                         r = -25; // -ENOTTY
                     }
+                } else if (req == 0x5402UL || req == 0x5403UL || req == 0x5404UL) {
+                    // TCSETS / TCSETSW / TCSETSF: catch (0x5402) comes from
+                    // TCGETS above. Raw mode - the first thing every terminal
+                    // application does - is exactly this call, so a TUI that
+                    // cannot issue it either exits or drives the terminal in
+                    // cooked mode. `struct termios` is the asm-generic kernel
+                    // layout on both x86-64 and AArch64 (4 x u32 flags, c_line,
+                    // c_cc[19], 36 bytes), so the guest's bytes are the host's
+                    // bytes once validated; the 60-byte *userspace* struct never
+                    // reaches this layer, because glibc issues the ioctl with the
+                    // kernel-sized one.
+                    std::array<std::uint8_t, kGuestTermiosSize> tbuf{};
+                    if (!memory.read(arg(state, 2), tbuf.data(), tbuf.size())) {
+                        r = -kEfault;
+                        break;
+                    }
+                    if (hfd < 0) {
+                        r = -kEnotty;
+                        break;
+                    }
+                    const int flush = (req == 0x5404UL)   ? TCSAFLUSH
+                                      : (req == 0x5403UL) ? TCSADRAIN
+                                                          : TCSANOW;
+                    if (::ioctl(hfd, TCSETS, tbuf.data()) != 0) {
+                        // tcsetattr's action flags are a C-library concept, not a
+                        // kernel one; TCSETSW/TCSETSF differ only in when they
+                        // wait, and the host ioctl above already applied the
+                        // change. Nothing else to do for those.
+                        (void)flush;
+                        r = -static_cast<std::int64_t>(errno == 0 ? kEio : errno);
+                    } else {
+                        r = 0;
+                    }
+                } else if (req == 0x5414UL) { // TIOCSWINSZ
+                    std::array<std::uint8_t, 8> wbuf{};
+                    if (!memory.read(arg(state, 2), wbuf.data(), wbuf.size())) {
+                        r = -kEfault;
+                        break;
+                    }
+                    struct winsize ws{};
+                    std::memcpy(&ws, wbuf.data(), wbuf.size());
+                    r = (hfd >= 0 && ::ioctl(hfd, TIOCSWINSZ, &ws) == 0)
+                            ? 0
+                            : -static_cast<std::int64_t>(errno == 0 ? kEnotty : errno);
+                } else if (req == 0x541BUL) { // FIONREAD
+                    int available = 0;
+                    if (hfd < 0 || ::ioctl(hfd, FIONREAD, &available) != 0) {
+                        r = -static_cast<std::int64_t>(errno == 0 ? kEnotty : errno);
+                        break;
+                    }
+                    std::array<std::uint8_t, 4> nbuf{};
+                    put_u32(nbuf.data(), 0, static_cast<std::uint32_t>(available));
+                    r = memory.write(arg(state, 2), nbuf.data(), nbuf.size()) ? 0 : -kEfault;
                 } else {
-                    r = -25; // -ENOTTY
+                    r = -kEnotty;
                 }
                 break;
             }

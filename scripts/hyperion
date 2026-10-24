@@ -150,8 +150,8 @@ LIMITATIONS
   - namespace-creating clone flags return ENOSYS (they need CAP_SYS_ADMIN, which
     unrooted Android does not grant)
   - no sockets, no inotify/signalfd, no file-backed mmap, no waitid
-  - ioctl covers TIOCGWINSZ only: TCGETS/TCSETS (terminal raw mode) are missing,
-    so a TUI cannot yet drive a terminal
+  - ioctl covers TCGETS/TCSETS/TCSETSW/TCSETSF, TIOCGWINSZ/TIOCSWINSZ and
+    FIONREAD (enough for terminal raw mode); other device requests are ENOTTY
   - rt_sigaction, sigaltstack, prctl, madvise, fadvise64 and clock_getres are
     stubs: they report success without doing the work, and are listed as
     'stubbed' (not 'implemented') in the inventory

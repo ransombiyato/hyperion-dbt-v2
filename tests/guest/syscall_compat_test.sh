@@ -81,6 +81,32 @@ if [ "${native}" != "failures 0" ]; then
 fi
 pass "fixture passes natively"
 
+# --- 1b. terminal raw mode, which needs a real terminal ----------------------
+#
+# Raw mode is the first thing a terminal application does, and it is a TCSETS
+# ioctl. Without a tty the fixture skips that group, so the case is run again
+# under `script(1)`, which gives the guest a pseudo-terminal. The native run
+# happens first for the same reason as above: the test must not be the thing that
+# is wrong about what a terminal should do.
+if command -v script >/dev/null 2>&1; then
+    tty_native="$(script -qec "${WORK}/compat_syscalls" /dev/null 2>&1 | tr -d '\r')"
+    if ! printf '%s\n' "${tty_native}" | grep -q "raw_mode_flags *ok"; then
+        fail "the fixture cannot put a pty into raw mode natively; the test is broken"
+        printf '%s\n' "${tty_native}" | tail -5 | sed 's/^/  native: /' >&2
+    else
+        tty_out="$(script -qec "${BIN} run --quiet --tier=${HYPERION_TIER:-0} \
+            ${WORK}/compat_syscalls" /dev/null 2>&1 | tr -d '\r')"
+        if printf '%s\n' "${tty_out}" | grep -q "^failures 0"; then
+            pass "terminal attributes and window size work under HYPERION"
+        else
+            fail "terminal ioctls failed under HYPERION"
+            printf '%s\n' "${tty_out}" | grep -E "FAIL|failures" | sed 's/^/  guest: /' >&2
+        fi
+    fi
+else
+    echo "skip terminal raw mode (no script(1) on this host)"
+fi
+
 # --- 2. with the compatibility registry enabled ------------------------------
 if ! out="$(run "${WORK}/compat_syscalls" 2>"${WORK}/err")"; then
     fail "compat_syscalls exited non-zero under HYPERION"
