@@ -91,23 +91,25 @@ void write_stderr(const char* text, std::size_t length) {
     }
 }
 
-void write_cstr(const char* text) { write_stderr(text, std::strlen(text)); }
+void write_cstr(const char* text) {
+    write_stderr(text, std::strlen(text));
+}
 
 // Async-signal-safe: write(2) and snprintf over stack buffers only. stdio is
 // deliberately avoided - a signal can arrive while stdio holds its lock.
 extern "C" void report_sigsys(int signal_number, siginfo_t* info, void* /*context*/) {
     char buffer[512];
     const char* const context = g_context;
-    const int len = std::snprintf(
-        buffer, sizeof(buffer),
-        "\n%s: SIGSYS (bad system call)%s%s\n"
-        "  si_code=%d%s\n"
-        "  syscall=%ld (%s)\n",
-        g_program_name, context != nullptr ? " while running " : "",
-        context != nullptr ? context : "", info != nullptr ? info->si_code : -1,
-        (info != nullptr && info->si_code == SYS_SECCOMP) ? " SYS_SECCOMP" : "",
-        (info != nullptr) ? static_cast<long>(info->si_syscall) : -1L,
-        (info != nullptr) ? syscall_name(static_cast<long>(info->si_syscall)) : "?");
+    const int len =
+        std::snprintf(buffer, sizeof(buffer),
+                      "\n%s: SIGSYS (bad system call)%s%s\n"
+                      "  si_code=%d%s\n"
+                      "  syscall=%ld (%s)\n",
+                      g_program_name, context != nullptr ? " while running " : "",
+                      context != nullptr ? context : "", info != nullptr ? info->si_code : -1,
+                      (info != nullptr && info->si_code == SYS_SECCOMP) ? " SYS_SECCOMP" : "",
+                      (info != nullptr) ? static_cast<long>(info->si_syscall) : -1L,
+                      (info != nullptr) ? syscall_name(static_cast<long>(info->si_syscall)) : "?");
     if (len > 0) {
         const auto length = static_cast<std::size_t>(len);
         write_stderr(buffer, length < sizeof(buffer) ? length : sizeof(buffer) - 1);
@@ -139,6 +141,8 @@ void install_sigsys_diagnostics(const char* program_name) {
 #endif
 }
 
-void set_sigsys_context(const char* context) { g_context = context; }
+void set_sigsys_context(const char* context) {
+    g_context = context;
+}
 
 } // namespace hyperion

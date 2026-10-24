@@ -209,9 +209,10 @@ need_tool() {
 }
 
 missing=""
-for tool in cmake ninja; do
-    need_tool "$tool" || missing="${missing} ${tool}"
-done
+# CMake and a C++ compiler are required. Ninja is preferred but not required:
+# CMake's Unix Makefiles generator produces the same build, and a minimal Termux
+# install may not have ninja (it is a separate package from cmake).
+need_tool cmake || missing="${missing} cmake"
 if ! need_tool c++ && ! need_tool g++ && ! need_tool clang++; then
     missing="${missing} c++"
 fi
@@ -229,6 +230,14 @@ if [ -n "$missing" ]; then
     say "Or run the project's own bootstrap (it also fetches test tooling):"
     say "  bash scripts/bootstrap.sh"
     die "cannot continue without a toolchain"
+fi
+
+if need_tool ninja; then
+    GENERATOR="Ninja"
+else
+    GENERATOR="Unix Makefiles"
+    warn "ninja not found; using CMake's Unix Makefiles generator instead"
+    warn "(install it with 'pkg install ninja' on Termux for faster builds)"
 fi
 
 # --- fetch ------------------------------------------------------------------
@@ -394,7 +403,7 @@ BUILD_DIR="${SRC_DIR}/build/install"
 
 if [ "$DO_BUILD" -eq 1 ]; then
     say "Configuring (Release)"
-    cmake -S "${SRC_DIR}" -B "${BUILD_DIR}" -G Ninja \
+    cmake -S "${SRC_DIR}" -B "${BUILD_DIR}" -G "${GENERATOR}" \
         -DCMAKE_BUILD_TYPE=Release \
         -DHYPERION_WARNINGS_AS_ERRORS=ON >/dev/null \
         || die "configure failed (see ${BUILD_DIR}/CMakeFiles/CMakeConfigureLog.yaml)"
@@ -464,16 +473,29 @@ fi
 
 if [ -f "${REGISTRY_PATH}" ]; then
     info "keeping the existing registry at ${REGISTRY_PATH} (user rules are preserved)"
+    # The check output goes to a real temporary file. It used to be written to
+    # "${TMP_DIR:-/tmp}", and TMP_DIR is never set: on Termux, which has no /tmp,
+    # the redirection failed, the check was reported as unvalidated, and the
+    # "details" could not be shown either. mktemp honours $TMPDIR, which is what
+    # Termux provides.
+    REGISTRY_CHECK="$(mktemp "${TMPDIR:-/tmp}/hyperion-registry-check.XXXXXX" 2>/dev/null \
+                      || mktemp "${PREFIX}/tmp/hyperion-registry-check.XXXXXX" 2>/dev/null \
+                      || echo "")"
+    if [ -z "${REGISTRY_CHECK}" ]; then
+        warn "no writable temporary directory for the registry check output"
+        REGISTRY_CHECK="/dev/null"
+    fi
     # An empty HYPERION_NO_SYSCALL_REGISTRY= would disable the very check being
     # run, so it is unset for this one command rather than cleared.
     if env -u HYPERION_NO_SYSCALL_REGISTRY "${BIN_DIR}/hyperion" syscall-registry \
-        --validate --registry="${REGISTRY_PATH}" >"${TMP_DIR:-/tmp}/registry.check" 2>&1; then
+        --validate --registry="${REGISTRY_PATH}" >"${REGISTRY_CHECK}" 2>&1; then
         info "registry validates"
     else
         warn "the registry did not validate; HYPERION will fall back to its built-in"
         warn "rules at run time rather than refusing to start. Details:"
-        sed 's/^/  /' "${TMP_DIR:-/tmp}/registry.check" >&2 || true
+        sed 's/^/  /' "${REGISTRY_CHECK}" >&2 || true
     fi
+    rm -f "${REGISTRY_CHECK}" 2>/dev/null || true
 else
     if "${BIN_DIR}/hyperion" syscall-registry --write --registry="${REGISTRY_PATH}" \
         >/dev/null 2>&1; then

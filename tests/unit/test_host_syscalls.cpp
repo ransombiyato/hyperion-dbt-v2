@@ -86,8 +86,7 @@ ChildOutcome wait_for(pid_t pid) {
 // cached host-capability decision: HYPERION_PORTABLE_SYSCALLS is read once per
 // process, so a test that only set it in its own address space would be testing
 // a value that had already been decided.
-template<typename Fn>
-ChildOutcome run_child(Fn fn) {
+template<typename Fn> ChildOutcome run_child(Fn fn) {
     const pid_t pid = ::fork();
     HYPERION_CHECK(pid >= 0);
     if (pid == 0) {
@@ -102,7 +101,8 @@ ChildOutcome run_child(Fn fn) {
 
 HYPERION_TEST("host_syscalls", "native_linux_reports_statx_and_memfd_usable") {
 #if defined(__ANDROID__)
-    HYPERION_SKIP("Android decides these from ro.build.version.sdk, tested through the child cases");
+    HYPERION_SKIP(
+        "Android decides these from ro.build.version.sdk, tested through the child cases");
 #else
     // Not Android, no override: the raw syscalls are usable, so the full-fidelity
     // paths are taken.
@@ -142,8 +142,9 @@ HYPERION_TEST("host_syscalls", "an_android_api_level_below_30_disables_both") {
     const ChildOutcome outcome = run_child([] {
         // Recreate the Android decision without being on Android: the portable
         // path must be selected when the device reports an old API level.
-        return (hyperion::host_android_api_level() == 0 && hyperion::host_statx_syscall_usable()) ? 0
-                                                                                                 : 1;
+        return (hyperion::host_android_api_level() == 0 && hyperion::host_statx_syscall_usable())
+                   ? 0
+                   : 1;
     });
     HYPERION_CHECK(outcome.exited);
     HYPERION_CHECK_EQ(outcome.exit_code, 0);
@@ -297,8 +298,7 @@ HYPERION_TEST("host_syscalls", "portable_statx_reports_the_same_basic_fields_as_
                 ::unsetenv("HYPERION_PORTABLE_SYSCALLS");
             }
             FlatMemory memory(kBase, kMemSize);
-            if (!memory.write(kBase + 0x100,
-                              reinterpret_cast<const std::uint8_t*>(path.c_str()),
+            if (!memory.write(kBase + 0x100, reinterpret_cast<const std::uint8_t*>(path.c_str()),
                               path.size() + 1)) {
                 return false;
             }

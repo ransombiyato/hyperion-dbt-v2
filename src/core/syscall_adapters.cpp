@@ -23,9 +23,9 @@
 // counts as an unsupported syscall rather than a silent success.
 #include <atomic>
 #include <cerrno>
-#include <cstdlib>
 #include <climits>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <fcntl.h>
@@ -45,8 +45,8 @@
 #include <unistd.h>
 #include <vector>
 
-#include "hyperion/syscall_detail.hpp"
 #include "hyperion/host_syscalls.hpp"
+#include "hyperion/syscall_detail.hpp"
 #include "hyperion/syscall_dispatch.hpp"
 
 namespace hyperion {
@@ -587,7 +587,8 @@ std::int64_t adapter_memfd_create(SyscallContext& ctx) {
     if ((flags & kMfdAllowSealing) != 0) {
         host_flags |= static_cast<unsigned int>(MFD_ALLOW_SEALING);
     }
-    const std::int64_t created = create_anonymous_file(name, host_flags, (flags & kMfdCloexec) != 0);
+    const std::int64_t created =
+        create_anonymous_file(name, host_flags, (flags & kMfdCloexec) != 0);
     if (created < 0) {
         return created;
     }

@@ -5,9 +5,9 @@
 // the error convention.
 #include "hyperion/syscall.hpp"
 
+#include "hyperion/host_syscalls.hpp"
 #include "hyperion/process.hpp"
 #include "hyperion/syscall_detail.hpp"
-#include "hyperion/host_syscalls.hpp"
 #include "hyperion/syscall_dispatch.hpp"
 
 #include <array>
@@ -23,9 +23,9 @@
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/statfs.h>
-#include <sys/sysmacros.h>
 #include <sys/syscall.h>
 #include <sys/sysinfo.h>
+#include <sys/sysmacros.h>
 #include <sys/utsname.h>
 #include <termios.h>
 #include <unistd.h>
@@ -833,8 +833,8 @@ std::int64_t do_newfstatat(GuestState& s, Memory& memory, const std::vector<Gues
 //     clear in stx_mask and the field is zero.
 //   - stx_attributes / stx_attributes_mask: only statx(2) reports them; both
 //     stay zero, which means "no attributes are claimed to be known".
-std::int64_t write_guest_statx_from_stat(Memory& memory, std::uint64_t buf,
-                                         const struct ::stat& st, unsigned requested_mask) {
+std::int64_t write_guest_statx_from_stat(Memory& memory, std::uint64_t buf, const struct ::stat& st,
+                                         unsigned requested_mask) {
     std::array<std::uint8_t, guest_statx::kSize> out{};
     const auto s64 = [](std::int64_t v) { return static_cast<std::uint64_t>(v); };
 

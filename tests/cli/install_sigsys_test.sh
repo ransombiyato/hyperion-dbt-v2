@@ -82,6 +82,12 @@ make_tree() { # <dir> <unit.native body> <extra test cmake lines or empty>
     mkdir -p "${dir}/scripts"
     cat > "${dir}/CMakeLists.txt" <<EOF
 cmake_minimum_required(VERSION 3.20)
+# Pin the target before project(): Termux's CMake otherwise decides it is
+# building for Android and looks for \$PREFIX/include/android/api-level.h in the
+# temporary directory, which does not exist there, and configuration fails for a
+# reason that has nothing to do with what this test checks.
+set(CMAKE_SYSTEM_NAME Linux)
+set(CMAKE_SYSTEM_VERSION 29)
 project(install_sigsys_fixture NONE)
 enable_testing()
 add_test(NAME unit.native COMMAND bash -c "${native_body}")

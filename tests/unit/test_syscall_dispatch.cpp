@@ -27,10 +27,10 @@ using hyperion::MinimalSyscallHandler;
 using hyperion::RegistryOptions;
 using hyperion::RegistryReport;
 using hyperion::RegistryRule;
-using hyperion::test::TempDir;
 using hyperion::RuleImplementation;
 using hyperion::RuleOrigin;
 using hyperion::SyscallStatus;
+using hyperion::test::TempDir;
 
 namespace {
 

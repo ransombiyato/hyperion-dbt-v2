@@ -17,15 +17,15 @@
 
 #include <unistd.h>
 
-#include "hyperion/host_syscalls.hpp"
-#include "hyperion/sigsys_diagnostics.hpp"
 #include "hyperion/address_space.hpp"
 #include "hyperion/elf.hpp"
 #include "hyperion/elf_loader.hpp"
 #include "hyperion/exec_mem.hpp"
 #include "hyperion/guest_state.hpp"
 #include "hyperion/host_probe.hpp"
+#include "hyperion/host_syscalls.hpp"
 #include "hyperion/interpreter.hpp"
+#include "hyperion/sigsys_diagnostics.hpp"
 #include "hyperion/syscall.hpp"
 #include "hyperion/syscall_dispatch.hpp"
 #include "hyperion/syscall_registry.hpp"
@@ -86,16 +86,13 @@ int cmd_probe() {
     // is what decides whether statx/memfd_create are used directly or
     // synthesized; see include/hyperion/host_syscalls.hpp.
     const int api = hyperion::host_android_api_level();
-    std::printf("android api:     %d%s\n", api,
-                api == 0 ? " (not Android, or unreadable)" : "");
-    std::printf("statx(2):        %s\n",
-                hyperion::host_statx_syscall_usable()
-                    ? "used directly"
-                    : "not issued; statx() synthesized from fstatat(2)");
-    std::printf("memfd_create(2): %s\n",
-                hyperion::host_memfd_create_syscall_usable()
-                    ? "used directly"
-                    : "not issued; O_TMPFILE fallback or -ENOSYS");
+    std::printf("android api:     %d%s\n", api, api == 0 ? " (not Android, or unreadable)" : "");
+    std::printf("statx(2):        %s\n", hyperion::host_statx_syscall_usable()
+                                             ? "used directly"
+                                             : "not issued; statx() synthesized from fstatat(2)");
+    std::printf("memfd_create(2): %s\n", hyperion::host_memfd_create_syscall_usable()
+                                             ? "used directly"
+                                             : "not issued; O_TMPFILE fallback or -ENOSYS");
     if (hyperion::host_portable_syscalls_forced()) {
         std::printf("                 (HYPERION_PORTABLE_SYSCALLS is set)\n");
     }
