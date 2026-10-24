@@ -19,8 +19,11 @@
 # Usage: syscall_compat_test.sh <hyperion-binary> <fixture-dir>
 set -euo pipefail
 
-BIN="${1:?usage: syscall_compat_test.sh <hyperion-binary> <fixture-dir>}"
-FIXTURE_SRC="${2:?usage: syscall_compat_test.sh <hyperion-binary> <fixture-dir>}"
+BIN="${1:?usage: syscall_compat_test.sh <hyperion-binary> <fixture-dir> [emulator]}"
+FIXTURE_SRC="${2:?usage: syscall_compat_test.sh <hyperion-binary> <fixture-dir> [emulator]}"
+# Same convention as process_test.sh: a third argument (or HYPERION_EMULATOR) is
+# a prefix command, used to run an AArch64-built hyperion under qemu-user.
+EMULATOR="${3:-${HYPERION_EMULATOR:-}}"
 
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
@@ -67,8 +70,15 @@ for name in compat_syscalls syscall_custom fork_rule_inherit; do
     fi
 done
 
+# Every guest run goes through this helper, so the emulator and the tier apply to
+# all of them - including the ones run with the registry disabled.
 run() {
-    timeout "${GUEST_TIMEOUT}" "${BIN}" run --quiet --tier="${HYPERION_TIER:-0}" "$@"
+    if [ -n "${EMULATOR}" ]; then
+        timeout "${GUEST_TIMEOUT}" "${EMULATOR}" "${BIN}" run --quiet \
+            --tier="${HYPERION_TIER:-0}" "$@"
+    else
+        timeout "${GUEST_TIMEOUT}" "${BIN}" run --quiet --tier="${HYPERION_TIER:-0}" "$@"
+    fi
 }
 
 # --- 1. native reference -----------------------------------------------------
@@ -94,8 +104,9 @@ if command -v script >/dev/null 2>&1; then
         fail "the fixture cannot put a pty into raw mode natively; the test is broken"
         printf '%s\n' "${tty_native}" | tail -5 | sed 's/^/  native: /' >&2
     else
-        tty_out="$(script -qec "${BIN} run --quiet --tier=${HYPERION_TIER:-0} \
-            ${WORK}/compat_syscalls" /dev/null 2>&1 | tr -d '\r')"
+        # `script` needs one command string, so the emulator is spliced in.
+        tty_out="$(script -qec "${EMULATOR:+${EMULATOR} }${BIN} run --quiet \
+            --tier=${HYPERION_TIER:-0} ${WORK}/compat_syscalls" /dev/null 2>&1 | tr -d '\r')"
         if printf '%s\n' "${tty_out}" | grep -q "^failures 0"; then
             pass "terminal attributes and window size work under HYPERION"
         else
@@ -142,8 +153,7 @@ fi
 # this run must behave exactly like case 2, and it must not create a file.
 absent="${WORK}/absent/registry.json"
 if out="$(HYPERION_NO_SYSCALL_REGISTRY=1 HYPERION_SYSCALL_REGISTRY="${absent}" \
-    timeout "${GUEST_TIMEOUT}" "${BIN}" run --quiet --tier="${HYPERION_TIER:-0}" \
-        "${WORK}/compat_syscalls" 2>"${WORK}/err2")"; then
+    run "${WORK}/compat_syscalls" 2>"${WORK}/err2")"; then
     if printf '%s\n' "${out}" | grep -q FAIL; then
         fail "the built-in rules alone do not serve the adapted syscalls"
         printf '%s\n' "${out}" | sed 's/^/  guest: /' >&2

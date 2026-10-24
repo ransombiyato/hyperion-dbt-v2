@@ -452,6 +452,9 @@ main path, and Phases 2-5 still build it.
 
 Re-verified on **2026-10-24** after the syscall compatibility engine (multi-layer
 dispatch, ABI adapters, persistent registry, tests, benchmark, docs). Host:
+x86-64, Debian 13, kernel 6.1.158, GCC 14.2.0, CMake 4.4.4, Ninja 1.13.2, plus
+`aarch64-linux-gnu-g++` 14.2.0 and the cached `qemu-aarch64-static` for the cross
+tree., persistent registry, tests, benchmark, docs). Host:
 x86-64, Debian 13, kernel 6.1.158, GCC 14.2.0, CMake 4.4.4, Ninja 1.13.2.
 **AArch64 execution was not available on this host**, so Tier 1 and the qemu
 cross tree were not re-run in this session — that is the one gap in the table
@@ -466,7 +469,17 @@ below, and it is a host limitation, not a passing claim:
 | Registry CLI suite | `cli.syscall_registry` | 11/11 checks |
 | Syscall inventory | `python3 tools/gen_syscall_inventory.py --check` | OK (0 errors, 0 warnings) |
 | Dispatch microbenchmark | `benchmarks/hyperion_syscall_bench --iterations 300000 --repeats 9` | see `TESTING.md` §6 |
-| Cross (qemu-user) | `scripts/dev.sh cross-test` | **not run this session** (no AArch64 toolchain on this host) |
+| Cross (qemu-user) | `scripts/dev.sh cross-test` | **10/10 passed** (see below) |
+| AArch64 unit tests | cross build + `qemu-aarch64-static` | **342 passed, 0 failed, 2 skipped** (of 344) |
+| AArch64 syscall compat, both tiers | `cross.aarch64_tests` | 11/11 checks per tier |
+| AArch64 tier-1 JIT evidence | compat guest at `--tier=1` | `tier 1: 1412 basic block(s) translated`, `failures 0`, 170 308 steps — same as tier 0 |
+
+The cross tree was run with a cross compiler installed for this session
+(`apt-get install g++-aarch64-linux-gnu`) against the repo-cached
+`tools/cache/bin/qemu-aarch64-static`. It previously did **not** cover the new
+compatibility layer; `tests/run_cross_tests.cmake` now runs the guest compat suite
+at both tiers, asserts that tier 1 really translated and executed generated code
+(and did not fall back), and runs the registry CLI under qemu.
 
 The ASan run earned its keep immediately: it found a stack buffer overflow in the
 `poll` adapter that no ordinary build could see (`get_u64_le(raw + 4)` reading
@@ -809,10 +822,10 @@ a TUI editor like Fresh) hits, not by syscall number:
    `TIOCSWINSZ`, and `FIONREAD`. Each is a small, testable addition with a
    well-defined guest layout, and `TERMIOS` on x86-64 and AArch64 differ in
    `c_cc` ordering — the exact class of bug the adapter layer exists for.
-3. **Cross-architecture verification.** `scripts/dev.sh cross-test` was **not**
-   run this session: the host is x86-64 and has no AArch64 toolchain, so Tier 1
-   and the qemu tree are unverified for the new code. Until that run happens,
-   treat the Tier 1 numbers in this file as historical.
+3. ~~Cross-architecture verification~~ — **done**: the cross tree passes 10/10,
+   the AArch64 unit suite is 342/0/2, and the compat guest runs at tier 1 with
+   1412 translated blocks and identical step counts. Keep it that way: the
+   driver now fails if tier 1 falls back to the interpreter.
 4. **`futex`(202) is implemented but not `validated`.** It was written before the
    adapter layer and is only exercised indirectly. A guest that creates threads
    will lean on it hard; it needs the same test treatment as the adapters

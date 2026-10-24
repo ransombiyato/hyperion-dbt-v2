@@ -145,4 +145,81 @@ foreach(tier IN ITEMS 0 1)
     endif()
 endforeach()
 
+# The syscall compatibility layer gets the same treatment as process creation:
+# the AArch64-built hyperion runs the guest-level compat suite through qemu at
+# both tiers. Tier 1 matters here specifically, because the adapters translate
+# structures the JIT never sees - a mistake would show up as wrong *guest*
+# behaviour only when the guest executes generated code.
+set(compat_script "${HYPERION_SOURCE_DIR}/tests/guest/syscall_compat_test.sh")
+foreach(tier IN ITEMS 0 1)
+    execute_process(
+        COMMAND ${CMAKE_COMMAND} -E env
+            "HYPERION_GUEST_CC=${guest_cc}"
+            "HYPERION_TIER=${tier}"
+            "HYPERION_EMULATOR=${HYPERION_QEMU}"
+            bash "${compat_script}" "${cli_binary}" "${process_fixtures}" "${HYPERION_QEMU}"
+        RESULT_VARIABLE compat_result
+        OUTPUT_VARIABLE compat_output
+        ERROR_VARIABLE compat_error)
+    message(STATUS "AArch64 syscall compat tests (tier ${tier}):\n${compat_output}${compat_error}")
+    if(NOT compat_result EQUAL 0)
+        message(FATAL_ERROR
+            "AArch64 syscall compat tests failed at tier ${tier} (exit ${compat_result})")
+    endif()
+endforeach()
+
+# At tier 1 the point is that the JIT really executed the guest, not that it fell
+# back to the interpreter and passed anyway. cli_smoke.sh already asserts this for
+# a hand-written blob; do it once more for a real program that leans on the
+# compat layer, because "status: ok" alone would be satisfied by the fallback.
+set(compat_fixture "${HYPERION_CROSS_BINARY_DIR}/compat_probe")
+execute_process(
+    COMMAND ${guest_cc} -O2 -static -o "${compat_fixture}"
+        "${HYPERION_SOURCE_DIR}/tests/guest/fixtures/compat_syscalls.c"
+    RESULT_VARIABLE cc_result
+    ERROR_VARIABLE cc_error)
+if(NOT cc_result EQUAL 0)
+    message(FATAL_ERROR "cross tests: cannot compile compat fixture:\n${cc_error}")
+endif()
+execute_process(
+    COMMAND ${CMAKE_COMMAND} -E env "HYPERION_SYSCALL_REGISTRY=${HYPERION_CROSS_BINARY_DIR}/tier1-registry.json"
+        "${HYPERION_QEMU}" "${cli_binary}" run --tier=1 "${compat_fixture}"
+    RESULT_VARIABLE tier1_result
+    OUTPUT_VARIABLE tier1_output
+    ERROR_VARIABLE tier1_error)
+message(STATUS "AArch64 tier 1 compat run:\n${tier1_output}${tier1_error}")
+if(NOT tier1_result EQUAL 0)
+    message(FATAL_ERROR "AArch64 tier 1 compat run failed (exit ${tier1_result})")
+endif()
+if(NOT tier1_output MATCHES "failures 0")
+    message(FATAL_ERROR "AArch64 tier 1 compat run reported guest failures:\n${tier1_output}")
+endif()
+# The "tier 1: N basic block(s) translated" line is printed on stdout, while the
+# fallback warning goes to stderr; search both, so the check cannot pass or fail
+# on which stream a message happens to use.
+set(tier1_all "${tier1_output}${tier1_error}")
+if(NOT tier1_all MATCHES "tier 1: [1-9][0-9]* basic block")
+    message(FATAL_ERROR
+        "AArch64 tier 1 compat run did not execute generated code - it fell back to "
+        "the interpreter, so this run proves nothing about the JIT. Output:\n"
+        "${tier1_all}")
+endif()
+if(tier1_all MATCHES "falling back")
+    message(FATAL_ERROR
+        "AArch64 tier 1 compat run reported a fallback to the interpreter:\n${tier1_all}")
+endif()
+
+# The registry CLI is the user-facing half of the layer; run it under qemu too, so
+# a path-resolution or permission difference on the AArch64 build cannot hide.
+execute_process(
+    COMMAND ${CMAKE_COMMAND} -E env "HYPERION_EMULATOR=${HYPERION_QEMU}"
+        bash "${HYPERION_SOURCE_DIR}/tests/cli/registry_cli_test.sh" "${cli_binary}"
+    RESULT_VARIABLE registry_result
+    OUTPUT_VARIABLE registry_output
+    ERROR_VARIABLE registry_error)
+message(STATUS "AArch64 registry CLI tests:\n${registry_output}${registry_error}")
+if(NOT registry_result EQUAL 0)
+    message(FATAL_ERROR "AArch64 registry CLI tests failed (exit ${registry_result})")
+endif()
+
 message(STATUS "cross-architecture validation pipeline OK")

@@ -123,14 +123,27 @@ Meaningful changes by milestone. Format loosely follows
   install directory only when it is absent, validates (never overwrites) an
   existing one, and deliberately keeps user rules on `--uninstall`.
 
+### Verification
+- **The AArch64 Tier 1 path is now covered by the cross pipeline.**
+  `tests/run_cross_tests.cmake` runs the new guest compat suite at both tiers
+  against the AArch64-built binary, runs the registry CLI under qemu, and fails
+  if tier 1 falls back to the interpreter. Measured with
+  `g++-aarch64-linux-gnu` 14.2.0 and the cached `qemu-aarch64-static`:
+  `scripts/dev.sh cross-test` **10/10**, AArch64 unit suite **342 passed / 0
+  failed / 2 skipped** of 344, and the compat guest at `--tier=1` reports
+  `1412 basic block(s) translated`, `failures 0` and **the same 170 308 guest
+  steps as tier 0**. `tests/guest/syscall_compat_test.sh` and
+  `tests/cli/registry_cli_test.sh` grew an optional emulator argument so both can
+  be driven against a cross-built binary.
+
 ### Changed
 - **`enable_linux_compat()`'s switch is documented as the third dispatch layer**
   and its number list is machine-read: `[stub]` marks a number that answers
   success without doing the work (the inventory must then say `stubbed`) and
   `[unsupported]` marks one that is only recognised to be refused cleanly
   (`rseq`), which stays `not-started`.
-- **AArch64/Tier 1 status for this work is unverified.** The development host is
-  x86-64 with no AArch64 toolchain, so `scripts/dev.sh cross-test` was not run.
+- **Tier 1 coverage is now part of the cross pipeline** rather than a manual step
+  (see Verification above).
 
 ---
 

@@ -228,6 +228,35 @@ under `qemu-aarch64`. The guest-process suite runs at both Tier 0 and Tier 1;
 `HYPERION_BUSYBOX` optionally enables the two shell-pipeline cases. Any failure
 fails the CTest run.
 
+The same driver also runs, against the **AArch64-built** binary at both tiers:
+
+- `tests/guest/syscall_compat_test.sh` — the whole compatibility suite, so the
+  adapters are exercised while the guest executes JIT-generated AArch64 code, not
+  just from the interpreter;
+- an explicit tier-1 assertion: the run must print `tier 1: N basic block(s)
+  translated` with `N > 0` **and** must not print a fallback warning. Without
+  that, a JIT that silently fell back to the interpreter would pass every
+  behavioural check and prove nothing;
+- `tests/cli/registry_cli_test.sh` — path resolution and permissions on the
+  AArch64 build.
+
+Measured 2026-10-24 (aarch64-linux-gnu-g++ 14.2.0, `qemu-aarch64-static`
+from `tools/cache`):
+
+| Run | Result |
+| --- | --- |
+| AArch64 unit tests | **342 passed, 0 failed, 2 skipped** (of 344 registered) |
+| AArch64 differential suite | 0 passed (correct: no x86-64 oracle on AArch64, every case SKIPs) |
+| AArch64 guest process, tier 0 / tier 1 | passed / passed |
+| AArch64 syscall compat, tier 0 / tier 1 | 11/11 checks each |
+| AArch64 tier-1 JIT evidence | `tier 1: 1412 basic block(s) translated`, `failures 0`, 170 308 guest steps — identical to tier 0 |
+| AArch64 registry CLI | 11/11 checks |
+
+To reproduce the toolchain on a fresh Debian container without root-level
+guessing: `sudo apt-get install -y --no-install-recommends g++-aarch64-linux-gnu`,
+then `scripts/dev.sh cross-test` (it prefers the repo-cached
+`tools/cache/bin/qemu-aarch64-static`).
+
 **Limits.** `qemu-user` validates *correctness*, never performance, and it is
 not a cycle-accurate model. Performance claims require real AArch64 hardware.
 AArch64-hosted runs (`unit.native` on an AArch64 machine) additionally verify

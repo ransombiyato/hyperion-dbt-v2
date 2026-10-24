@@ -19,7 +19,10 @@
 # Usage: registry_cli_test.sh <path-to-hyperion-binary>
 set -euo pipefail
 
-BIN="${1:?usage: registry_cli_test.sh <path-to-hyperion-binary>}"
+BIN="${1:?usage: registry_cli_test.sh <path-to-hyperion-binary> [emulator]}"
+# Same convention as the guest suites: an optional emulator prefix, used by the
+# cross pipeline to run the AArch64-built binary under qemu-user.
+EMULATOR="${2:-${HYPERION_EMULATOR:-}}"
 
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
@@ -34,7 +37,13 @@ fail() {
 REGISTRY="${WORK}/registry.json"
 export HYPERION_SYSCALL_REGISTRY="${REGISTRY}"
 
-run() { "${BIN}" syscall-registry "$@"; }
+run() {
+    if [ -n "${EMULATOR}" ]; then
+        "${EMULATOR}" "${BIN}" syscall-registry "$@"
+    else
+        "${BIN}" syscall-registry "$@"
+    fi
+}
 
 # --- 1. the resolved path is the environment override -------------------------
 out="$(run --list 2>&1 || true)"

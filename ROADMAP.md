@@ -415,8 +415,9 @@ not by syscall number:
    event-source gaps a file-watching editor hits.
 4. Sockets.
 5. Remaining terminal ioctls (`TIOCGPGRP`/`TIOCSPGRP`) and `TIOCLINUX` are `-ENOTTY`.
-6. Re-run `scripts/dev.sh cross-test`: the AArch64 tree was **not** exercised for
-   this work (the development host is x86-64), so Tier 1 is unverified here.
+6. ~~Re-run `scripts/dev.sh cross-test`~~ — done, and now part of the driver: the
+   AArch64 tree passes 10/10 with the compat suite at both tiers and a hard
+   assertion that tier 1 executed generated code rather than falling back.
 
 **Exit criteria.** A clearly defined set of real Linux guest programs works
 correctly. No claim of general compatibility.

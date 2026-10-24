@@ -4,11 +4,12 @@ Project HYPERION · branch `main` · HEAD `9d3bdcc`
 Host used for every measurement below: **x86-64**, Debian 13, kernel 6.1.158,
 GCC 14.2.0, CMake 4.4.4, Ninja 1.13.2, clang-format 19.1.7.
 
-> **Read this first.** The development host is x86-64. AArch64 code cannot be
-> executed natively here, so **Tier 1 and the `qemu-user` cross tree were not
-> exercised for this work**. Everything measured below is Tier 0 (interpreter)
-> on the host. Anything that needs an AArch64 machine is labelled as unverified
-> rather than claimed.
+> **Read this first.** The development host is x86-64, so AArch64 code was
+> validated by cross-compiling with `aarch64-linux-gnu-g++` 14.2.0 and running
+> under the repo-cached `qemu-aarch64-static`. **Tier 1 (the AArch64 JIT) is
+> exercised and passes** — see §6a. What is *not* covered: real AArch64 hardware
+> timings (qemu-user is a correctness tool, never a performance one) and the
+> reference Android device. Performance numbers in §7 are host-CPU only.
 
 ---
 
@@ -200,6 +201,33 @@ Modified (docs): `README.md`, `ARCHITECTURE.md`, `COMPATIBILITY.md`, `STATUS.md`
 `docs/syscalls/README.md`, `docs/syscalls/inventory.tsv`,
 `docs/syscalls/U1..U4.md` (regenerated).
 
+## 6a. AArch64 / Tier 1 verification (measured)
+
+```
+sudo apt-get install -y --no-install-recommends g++-aarch64-linux-gnu
+scripts/dev.sh cross-test        # 10/10 passed
+```
+
+| Run | Result |
+| --- | --- |
+| AArch64 unit suite (`qemu-aarch64-static`) | **342 passed, 0 failed, 2 skipped** (of 344 registered) |
+| AArch64 differential suite | 0 passed — correct: no x86-64 oracle on AArch64, so every case SKIPs |
+| `cross.aarch64_tests` (whole pipeline) | passed, 18–61 s |
+| AArch64 guest **process** tests, tier 0 / tier 1 | passed / passed |
+| AArch64 **syscall compat** suite, tier 0 / tier 1 | 11/11 checks each |
+| AArch64 registry CLI | 11/11 checks |
+| Tier 1 JIT evidence | `tier 1: 1412 basic block(s) translated`, `failures 0`, **170 308 guest steps — identical to tier 0** |
+
+The step-count identity matters: the JIT and the interpreter agree instruction
+for instruction on a guest that exercises 20 adapter-handled syscalls, `poll`,
+`epoll`, `select`, `timerfd`, `nanosleep`, `getrusage` and friends.
+
+The cross driver did **not** cover this layer before; `tests/run_cross_tests.cmake`
+now runs the compat suite at both tiers, runs the registry CLI under qemu, and
+**fails the build if tier 1 falls back to the interpreter** (`tier 1: N basic
+block(s) translated`, `N > 0`, plus a "must not print a fallback warning" check).
+Without that assertion a silent fallback would pass every behavioural check.
+
 ## 6. Build, test and measurement results (actual)
 
 ```sh
@@ -287,7 +315,7 @@ device. They must not be quoted as end-to-end performance.
 | File-backed `mmap`, `waitid`, `openat2` | not started | |
 | Registry live reload during a run | parsed once at startup; `reload()` is safe but nothing re-reads mid-run | editing the registry requires restarting the guest |
 | Concurrent `reload()` vs syscalls | designed for (immutable snapshot) and unit-tested for consistency, but no test runs them concurrently | unproven concurrency |
-| **Tier 1 / AArch64** | **not exercised this session** | the largest gap in this report: no `cross-test` run, no AArch64 hardware |
+| **Tier 1 / AArch64** | **exercised and passing** (§6a) | remaining gap is real hardware: `qemu-user` cannot measure performance and nothing has run on the reference Android device |
 
 Adapters assume the host kernel accepts the request; a host that rejects one
 (e.g. `membarrier` returning `EPERM`) surfaces as a normal `-errno` from the
@@ -320,5 +348,6 @@ adapter after `errno` has deliberately not been touched.
    validated: with the fix removed the guest prints `parent=1 child=0`).
 8. **Highest-value next items, in order:** `rt_sigaction` + `sigaltstack`
    (replace the lying stubs), `futex` validation, `inotify_*`/`signalfd`,
-   sockets, then **run `scripts/dev.sh cross-test` on an AArch64-capable
-   machine** — nothing in this report covers Tier 1.
+   sockets. **Keep the cross tree green**: `scripts/dev.sh cross-test` runs the
+   compat suite at both tiers and fails if tier 1 falls back, so it is the guard
+   that stops AArch64 support silently rotting.
