@@ -1,6 +1,7 @@
 # Dynamic Syscall Translation and Compatibility Engine — final report
 
-Project HYPERION · branch `main` · HEAD `1dc1b04`
+Project HYPERION · branch `main` · last code commit `0197a55` (documentation
+commits follow it; `git log --oneline -5` shows them)
 Host used for every measurement below: **x86-64**, Debian 13, kernel 6.1.158,
 GCC 14.2.0, CMake 4.4.4, Ninja 1.13.2, clang-format 19.1.7.
 
