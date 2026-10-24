@@ -51,6 +51,7 @@ endif()
 # --- Core library -----------------------------------------------------------
 add_library(hyperion_core
     src/core/version.cpp
+    src/core/json.cpp
     src/core/host_probe.cpp
     src/core/bench_stats.cpp
     src/core/guest_state.cpp
@@ -59,6 +60,9 @@ add_library(hyperion_core
     src/core/exec_mem.cpp
     src/core/interpreter.cpp
     src/core/syscall.cpp
+    src/core/syscall_dispatch.cpp
+    src/core/syscall_adapters.cpp
+    src/core/syscall_registry.cpp
     src/core/process.cpp
     src/core/translator.cpp
     src/core/runtime_helpers.cpp

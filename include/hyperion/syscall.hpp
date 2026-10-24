@@ -389,6 +389,11 @@ struct ChildProcess {
 // -EBADF, so a guest cannot name an arbitrary host descriptor. openat() opens a
 // host file on the guest's behalf and allocates a guest fd for it; the stream is
 // then handler-owned and closed when the guest closes the fd.
+class SyscallDispatcher;
+struct RegistryOptions;
+struct SyscallAccess;
+struct SyscallContext;
+
 class MinimalSyscallHandler final : public SyscallHandler {
 public:
     using OutputSink = std::function<long(int fd, const std::uint8_t* data, std::size_t count)>;
@@ -399,6 +404,9 @@ public:
     // see adopt() to add an already-open host stream under a guest fd.
     explicit MinimalSyscallHandler(OutputSink sink = {},
                                    GuestAddressSpace* address_space = nullptr);
+    ~MinimalSyscallHandler() override;
+    MinimalSyscallHandler(const MinimalSyscallHandler&) = delete;
+    MinimalSyscallHandler& operator=(const MinimalSyscallHandler&) = delete;
 
     SyscallResult handle(GuestState& state, Memory& memory) override;
 
@@ -414,6 +422,28 @@ public:
     // `ioctl(TCGETS/TIOCGWINSZ)`, `open`/`stat`/`lstat`/`pipe2`/`futex`/signals/
     // `sched_getaffinity`/`sysinfo`/`prctl`, and optional `--sysroot` prefixing).
     void enable_linux_compat(std::string sysroot = {});
+
+    // --- persistent syscall registry ---------------------------------------
+    //
+    // The dispatcher always holds the compiled-in rules. This call additionally
+    // loads the persistent external registry (see syscall_registry.hpp for the
+    // path resolution order), validates it and compiles it into the dispatch
+    // table. It is a single startup operation: nothing is read from disk, parsed
+    // or allocated per syscall afterwards.
+    //
+    // It is opt-in rather than automatic so that constructing a handler in a
+    // test or an embedding application has no filesystem side effects. The
+    // `hyperion run` command enables it unless --no-syscall-registry is given.
+    void enable_syscall_registry(); // default options
+    void enable_syscall_registry(const RegistryOptions& options);
+
+    // Re-read and re-validate the registry, then atomically swap the compiled
+    // snapshot into service. A failed load leaves the previous rules in service.
+    // Returns the report status as an integer (0 == ok) and fills `message`.
+    int reload_syscall_registry(const RegistryOptions& options, std::string& message);
+
+    // The dispatcher, for diagnostics (`hyperion syscall-registry`). Never null.
+    const SyscallDispatcher& dispatcher() const noexcept;
 
     // --- process support -----------------------------------------------------
     //
@@ -453,11 +483,15 @@ public:
 private:
     // process.cpp implements fork/vfork/clone/execve/wait4 against this state.
     friend struct ProcessAccess;
+    // syscall_dispatch.cpp / syscall_adapters.cpp provide the compatibility
+    // services an adapter needs (descriptor table, compat mode, sysroot).
+    friend struct SyscallAccess;
 
     // The real dispatch. handle() wraps it so HYPERION_TRACE_SYSCALLS=1 can log
     // every call and its result without duplicating the switch.
     SyscallResult handle_unguarded(GuestState& state, Memory& memory);
 
+    std::unique_ptr<SyscallDispatcher> dispatcher_;
     OutputSink sink_;
     GuestAddressSpace* address_space_;
     // Guest fd -> descriptor. Indexed by guest fd, so the guest can never index
@@ -488,7 +522,20 @@ private:
 
 // True if MinimalSyscallHandler implements this syscall number (as opposed to
 // returning -ENOSYS). Used by tests and by the compatibility matrix.
+//
+// This covers the *statically compiled* arms of the handler (the switch in
+// src/core/syscall.cpp plus, through is_linux_compat_syscall, the arms that are
+// only reachable in --linux-compat mode). Syscalls reached through the
+// compatibility-adapter layer are reported by is_compat_adapter_syscall() in
+// syscall_dispatch.hpp instead; the two sets are disjoint and both are checked
+// by the syscall inventory CI gate.
 bool is_minimal_syscall(std::uint64_t number);
+
+// True if the number is handled by the Box64-style --linux-compat arm of the
+// handler (the nested switch that runs when enable_linux_compat() was called).
+// These are *not* part of is_minimal_syscall(), which is why the registry
+// validator consults both before allowing a rule to claim a number.
+bool is_linux_compat_syscall(std::uint64_t number);
 
 } // namespace hyperion
 

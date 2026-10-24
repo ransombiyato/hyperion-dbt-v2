@@ -6,6 +6,8 @@
 #include "hyperion/syscall.hpp"
 
 #include "hyperion/process.hpp"
+#include "hyperion/syscall_detail.hpp"
+#include "hyperion/syscall_dispatch.hpp"
 
 #include <array>
 #include <cerrno>
@@ -49,12 +51,10 @@ const char* to_string(SyscallStatus status) {
     return "?";
 }
 
-namespace {
-
-// The x86-64 syscall argument registers, in order. r10 (not rcx) is the fourth
-// argument: the `syscall` instruction itself clobbers rcx with the return
-// address, so the ABI moves the fourth argument out of the way.
-constexpr Gpr kArgRegs[6] = {Gpr::kRdi, Gpr::kRsi, Gpr::kRdx, Gpr::kR10, Gpr::kR8, Gpr::kR9};
+// The shared guest-ABI helpers live in hyperion::syscall_detail so the
+// compatibility-adapter layer (src/core/syscall_adapters.cpp) reuses this one
+// implementation instead of growing a second, subtly different one.
+namespace syscall_detail {
 
 std::uint64_t arg(const GuestState& s, int index) {
     return s.gpr[static_cast<std::size_t>(kArgRegs[index])];
@@ -67,8 +67,6 @@ std::uint64_t arg(const GuestState& s, int index) {
 std::int32_t arg_i32(const GuestState& s, int index) {
     return static_cast<std::int32_t>(static_cast<std::uint32_t>(arg(s, index)));
 }
-
-constexpr std::int32_t kGuestAtFdcwd = -100;
 
 long default_sink(int fd, const std::uint8_t* data, std::size_t count) {
     std::FILE* out = (fd == 2) ? stderr : stdout;
@@ -108,7 +106,7 @@ int underlying_host_fd(const OpenFileDescription& ofd) {
 // Allocate the lowest free guest descriptor >= min_fd, as the kernel does.
 std::int64_t alloc_fd(std::vector<GuestDescriptor>& files,
                       std::shared_ptr<OpenFileDescription> desc, bool cloexec,
-                      std::size_t min_fd = 3) {
+                      std::size_t min_fd) {
     constexpr std::size_t kMaxGuestFds = 4096;
     if (min_fd >= kMaxGuestFds) {
         return -kEinval;
@@ -584,12 +582,7 @@ bool resolve_host_dirfd(const std::vector<GuestDescriptor>& files, std::int32_t 
     return true;
 }
 
-struct OpenFlags {
-    int host = 0;
-    bool implemented = true;
-};
-
-OpenFlags translate_open_flags(std::uint64_t flags, bool compat = false) {
+OpenFlags translate_open_flags(std::uint64_t flags, bool compat) {
     OpenFlags r;
     switch (flags & open_flags::kOAccmode) {
     case open_flags::kORdonly:
@@ -702,7 +695,7 @@ void put_u32(std::uint8_t* buf, std::size_t off, std::uint32_t value) {
     }
 }
 
-std::int64_t write_guest_stat(Memory& memory, std::uint64_t buf, const struct stat& st) {
+std::int64_t write_guest_stat(Memory& memory, std::uint64_t buf, const struct ::stat& st) {
     std::array<std::uint8_t, guest_stat::kSize> out{};
     put_u64(out.data(), guest_stat::kOffStDev, static_cast<std::uint64_t>(st.st_dev));
     put_u64(out.data(), guest_stat::kOffStIno, static_cast<std::uint64_t>(st.st_ino));
@@ -745,7 +738,7 @@ std::int64_t do_fstat(GuestState& s, Memory& memory, const std::vector<GuestDesc
     if (host_fd < 0) {
         return -kEbadf;
     }
-    struct stat st{};
+    struct ::stat st{};
     if (::fstat(host_fd, &st) != 0) {
         return -static_cast<std::int64_t>(errno == 0 ? kEio : errno);
     }
@@ -777,7 +770,7 @@ std::int64_t do_newfstatat(GuestState& s, Memory& memory, const std::vector<Gues
         return rc;
     }
     if (compat && (flags & statx::kAtEmptyPath) != 0 && path.empty()) {
-        struct stat st{};
+        struct ::stat st{};
         if (host_dirfd == AT_FDCWD) {
             return -kEinval;
         }
@@ -787,7 +780,7 @@ std::int64_t do_newfstatat(GuestState& s, Memory& memory, const std::vector<Gues
         return write_guest_stat(memory, buf, st);
     }
     path = resolve_guest_path(path, sysroot);
-    struct stat st{};
+    struct ::stat st{};
     int host_flags = ((flags & kAtSymlinkNofollow) != 0) ? AT_SYMLINK_NOFOLLOW : 0;
 #ifdef AT_NO_AUTOMOUNT
     if ((flags & 0x800ULL) != 0) {
@@ -1117,7 +1110,9 @@ std::shared_ptr<OpenFileDescription> make_stdio_desc(std::FILE* stream, int sink
     return d;
 }
 
-} // namespace
+} // namespace syscall_detail
+
+using namespace syscall_detail;
 
 MinimalSyscallHandler::MinimalSyscallHandler(OutputSink sink, GuestAddressSpace* address_space)
     : sink_(sink ? std::move(sink) : OutputSink(default_sink)), address_space_(address_space) {
@@ -1129,7 +1124,42 @@ MinimalSyscallHandler::MinimalSyscallHandler(OutputSink sink, GuestAddressSpace*
         GuestDescriptor{make_stdio_desc(stdout, 1), false},
         GuestDescriptor{make_stdio_desc(stderr, 2), false},
     };
+    // The dispatcher starts with the compiled-in rules only: constructing a
+    // handler has no filesystem side effects. enable_syscall_registry() loads
+    // the persistent registry once, at startup.
+    dispatcher_ = std::make_unique<SyscallDispatcher>();
 }
+
+MinimalSyscallHandler::~MinimalSyscallHandler() = default;
+
+void MinimalSyscallHandler::enable_syscall_registry() {
+    std::string message;
+    (void)reload_syscall_registry(RegistryOptions{}, message);
+}
+
+void MinimalSyscallHandler::enable_syscall_registry(const RegistryOptions& options) {
+    std::string message;
+    (void)reload_syscall_registry(options, message);
+}
+
+int MinimalSyscallHandler::reload_syscall_registry(const RegistryOptions& options,
+                                                   std::string& message) {
+    if (dispatcher_ == nullptr) {
+        message = "no dispatcher";
+        return 1;
+    }
+    const RegistryReport report = dispatcher_->reload(options);
+    message = report.message;
+    for (const std::string& warning : report.warnings) {
+        message += "\n  warning: " + warning;
+    }
+    for (const std::string& rejected : report.rejected) {
+        message += "\n  rejected: " + rejected;
+    }
+    return report.status == RegistryReport::Status::kOk ? 0 : 1;
+}
+
+const SyscallDispatcher& MinimalSyscallHandler::dispatcher() const noexcept { return *dispatcher_; }
 
 bool MinimalSyscallHandler::adopt(int guest_fd, std::FILE* stream) {
     if (guest_fd < 0 || stream == nullptr) {
@@ -1457,15 +1487,109 @@ void trace_syscall(std::uint64_t number, const SyscallResult& result, const Gues
 
 } // namespace
 
+namespace {
+
+// Apply a compiled alias rule: place the source syscall's arguments into the
+// target syscall's argument registers, remembering the originals so they can be
+// restored afterwards. The x86-64 `syscall` ABI only guarantees rax is the
+// result, but preserving the argument registers keeps an alias indistinguishable
+// from a direct implementation for a guest that inspects them.
+void apply_alias(const CompiledAlias& alias, GuestState& state, std::uint64_t (&saved)[6]) {
+    for (int i = 0; i < 6; ++i) {
+        saved[static_cast<std::size_t>(i)] = state.reg(kArgRegs[i]);
+    }
+    for (int i = 0; i < 6; ++i) {
+        if (static_cast<std::uint8_t>(i) >= alias.count) {
+            state.reg(kArgRegs[i]) = 0;
+            continue;
+        }
+        const std::uint8_t source = alias.from_arg[static_cast<std::size_t>(i)];
+        state.reg(kArgRegs[i]) = (source == 0xFF)
+                                     ? static_cast<std::uint64_t>(
+                                           alias.constant[static_cast<std::size_t>(i)])
+                                     : saved[source];
+    }
+}
+
+void restore_args(const std::uint64_t (&saved)[6], GuestState& state) {
+    for (int i = 0; i < 6; ++i) {
+        state.reg(kArgRegs[i]) = saved[static_cast<std::size_t>(i)];
+    }
+}
+
+} // namespace
+
+// Layered dispatch. See syscall_dispatch.hpp for the ordering and its rationale.
+//
+// The three layers are tried in cost order and the first match wins:
+//   1. the compiled dispatch table   (one bounds check, one load, one call)
+//   2. the existing handler switch   (handle_unguarded, unchanged)
+//   3. the unsupported path          (-ENOSYS plus one diagnostic)
 SyscallResult MinimalSyscallHandler::handle(GuestState& state, Memory& memory) {
     SyscallResult result;
     result.number = state.reg(Gpr::kRax);
-    if (syscall_trace_enabled()) {
-        const SyscallResult traced = handle_unguarded(state, memory);
-        trace_syscall(result.number, traced, state);
-        return traced;
+    const bool tracing = syscall_trace_enabled();
+
+    if (dispatcher_ != nullptr) {
+        const DispatchEntry* entry = dispatcher_->lookup(result.number);
+        if (entry != nullptr) {
+            if (entry->kind == DispatchKind::kAdapter) {
+                std::int64_t r = -kEnosys;
+                if ((entry->flags & kAdapterNeedsLinuxCompat) != 0 && !linux_compat_) {
+                    dispatcher_->note_translation_failure();
+                } else {
+                    SyscallContext ctx{*this, state, memory, result.number};
+                    r = entry->fn(ctx);
+                }
+                state.reg(Gpr::kRax) = static_cast<std::uint64_t>(r);
+                if (r == -kEnosys) {
+                    // The adapter declined to translate: the guest sees -ENOSYS
+                    // and the call is reported as unsupported, never as handled.
+                    result.status = SyscallStatus::kUnimplemented;
+                    dispatcher_->note_unsupported(result.number);
+                } else {
+                    result.status = SyscallStatus::kHandled;
+                    dispatcher_->note_adapter_success();
+                }
+                if (tracing) {
+                    trace_syscall(result.number, result, state);
+                }
+                return result;
+            }
+            if (entry->kind == DispatchKind::kGuestAlias) {
+                const CompiledAlias& alias =
+                    dispatcher_->rules()->aliases[static_cast<std::size_t>(entry->flags)];
+                std::uint64_t saved[6] = {};
+                apply_alias(alias, state, saved);
+                state.reg(Gpr::kRax) = alias.target;
+                SyscallResult inner = handle_unguarded(state, memory);
+                restore_args(saved, state);
+                inner.number = result.number;
+                if (inner.status == SyscallStatus::kUnimplemented) {
+                    dispatcher_->note_unsupported(result.number);
+                } else {
+                    dispatcher_->note_alias_success();
+                }
+                if (tracing) {
+                    trace_syscall(result.number, inner, state);
+                }
+                return inner;
+            }
+        }
     }
-    return handle_unguarded(state, memory);
+
+    const SyscallResult legacy = handle_unguarded(state, memory);
+    if (dispatcher_ != nullptr) {
+        if (legacy.status == SyscallStatus::kHandled) {
+            dispatcher_->note_existing_success();
+        } else if (legacy.status == SyscallStatus::kUnimplemented) {
+            dispatcher_->note_unsupported(legacy.number);
+        }
+    }
+    if (tracing) {
+        trace_syscall(result.number, legacy, state);
+    }
+    return legacy;
 }
 
 SyscallResult MinimalSyscallHandler::handle_unguarded(GuestState& state, Memory& memory) {
@@ -1766,7 +1890,7 @@ SyscallResult MinimalSyscallHandler::handle_unguarded(GuestState& state, Memory&
                     r = prc;
                 } else {
                     p = resolve_guest_path(p, sysroot_);
-                    struct stat st{};
+                    struct ::stat st{};
                     const int hrc =
                         (result.number == 6) ? ::lstat(p.c_str(), &st) : ::stat(p.c_str(), &st);
                     r = (hrc == 0) ? write_guest_stat(memory, arg(state, 1), st)
@@ -2117,6 +2241,57 @@ SyscallResult MinimalSyscallHandler::handle_unguarded(GuestState& state, Memory&
         state.reg(Gpr::kRax) = static_cast<std::uint64_t>(-kEnosys);
         result.status = SyscallStatus::kUnimplemented;
         return result;
+    }
+}
+
+// The syscall numbers handled by the nested `if (linux_compat_)` switch inside
+// handle_unguarded(). They are *not* part of is_minimal_syscall(): they only work
+// once enable_linux_compat() has been called. Keeping the list here, next to the
+// switch itself, is what lets the registry validator refuse to let a JSON rule
+// take over a number this layer already claims.
+bool is_linux_compat_syscall(std::uint64_t number) {
+    switch (number) {
+    case 2:   // open
+    case 4:   // stat
+    case 6:   // lstat
+    case 13:  // rt_sigaction
+    case 14:  // rt_sigprocmask
+    case 16:  // ioctl
+    case 22:  // pipe
+    case 25:  // mremap
+    case 28:  // madvise
+    case 35:  // nanosleep
+    case 62:  // kill
+    case 82:  // rename
+    case 83:  // mkdir
+    case 84:  // rmdir
+    case 87:  // unlink
+    case 90:  // chmod
+    case 91:  // fchmod
+    case 99:  // sysinfo
+    case 131: // sigaltstack
+    case 137: // statfs
+    case 138: // fstatfs
+    case 157: // prctl
+    case 202: // futex
+    case 204: // sched_getaffinity
+    case 221: // fadvise64
+    case 229: // clock_getres
+    case 230: // clock_nanosleep
+    case 234: // tgkill
+    case 258: // mkdirat
+    case 263: // unlinkat
+    case 264: // renameat
+    case 268: // fchmodat
+    case 269: // faccessat
+    case 280: // utimensat
+    case 293: // pipe2
+    case 316: // renameat2
+    case 334: // rseq
+    case 439: // faccessat2
+        return true;
+    default:
+        return false;
     }
 }
 
