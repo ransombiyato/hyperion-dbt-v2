@@ -402,6 +402,19 @@ int cmd_run(int argc, char** argv) {
 // `hyperion syscall-registry` - inspect, validate and export the persistent
 // syscall compatibility registry. Deliberately read-only unless --write is
 // given: inspecting the registry must never mutate it.
+// Exit status of `syscall-registry --validate`:
+//   0  the file parsed and every rule in it is in effect
+//   1  the file could not be used at all (missing, unreadable, bad JSON, newer
+//      schema); HYPERION falls back to its built-in rules
+//   3  the file parsed, but at least one rule was rejected and is NOT in effect
+//      - a user asking "did my rule take?" must not be told "yes" here
+int validate_exit(int status, std::size_t rejected) {
+    if (status != 0) {
+        return 1;
+    }
+    return rejected == 0 ? 0 : 3;
+}
+
 int cmd_syscall_registry(int argc, char** argv) {
     hyperion::RegistryOptions options;
     bool as_json = false;
@@ -444,27 +457,76 @@ int cmd_syscall_registry(int argc, char** argv) {
     const hyperion::SyscallDispatcher& dispatcher = handler.dispatcher();
     const hyperion::CompiledRules* rules = dispatcher.rules();
 
-    if (as_json) {
-        hyperion::RegistryDocument document;
-        std::vector<std::string> errors;
-        std::vector<std::string> warnings;
-        std::string text;
-        std::string read_error;
-        const hyperion::RegistryPathInfo info = hyperion::resolve_registry_path(options);
-        if (!info.path.empty() && hyperion::read_text_file(info.path, text, read_error)) {
-            hyperion::json::Value root;
-            hyperion::json::ParseError parse_error;
-            if (!hyperion::json::parse(text, root, parse_error)) {
-                std::printf("{\"status\": \"invalid\", \"error\": %s}\n",
-                            hyperion::json::quote(parse_error.format(info.path)).c_str());
-                return 1;
-            }
-            document = hyperion::document_from_json(root, errors, warnings);
-        } else {
-            document = hyperion::default_registry_document();
+    // Rules the compile pipeline refused are listed by the dispatcher; pull them
+    // out so the exit status can reflect them.
+    std::vector<std::string> rejected_rules;
+    for (const std::string& diagnostic : dispatcher.diagnostics()) {
+        if (diagnostic.rfind("rejected:", 0) == 0) {
+            rejected_rules.push_back(diagnostic.substr(std::strlen("rejected: ")));
         }
-        std::printf("%s", hyperion::document_to_text(document).c_str());
-        return status;
+    }
+
+
+    if (as_json) {
+        // A machine-readable view of what will actually happen, not of the file's
+        // text: the effective rule set (built-ins merged with the user's file),
+        // the resolved path, and every rule that was rejected. A tool that
+        // reported only the file's own contents could not answer the question a
+        // user actually has - "is my rule in effect?".
+        const hyperion::RegistryPathInfo info = hyperion::resolve_registry_path(options);
+        std::string report = "{\n";
+        report += "  \"status\": ";
+        report += hyperion::json::quote(status == 0 ? "ok" : "built-in-rules-only");
+        report += ",\n  \"message\": ";
+        report += hyperion::json::quote(message);
+        report += ",\n  \"path\": ";
+        report += hyperion::json::quote(info.path);
+        report += ",\n  \"path_source\": ";
+        report += hyperion::json::quote(info.source);
+        report += ",\n  \"path_reason\": ";
+        report += hyperion::json::quote(info.reason);
+        report += ",\n  \"schema_version\": ";
+        report += std::to_string(hyperion::kRegistrySchemaVersion);
+        report += ",\n  \"counts\": {\"adapter\": ";
+        report += std::to_string(rules != nullptr ? rules->adapter_rules : 0);
+        report += ", \"alias\": ";
+        report += std::to_string(rules != nullptr ? rules->alias_rules : 0);
+        report += ", \"rejected\": " + std::to_string(rejected_rules.size());
+        report += "},\n  \"rules\": [";
+        if (rules != nullptr) {
+            bool first = true;
+            for (const hyperion::RegistryRule& rule : rules->rules) {
+                report += first ? "\n" : ",\n";
+                first = false;
+                report += "    {\"id\": " + hyperion::json::quote(rule.id);
+                report += ", \"name\": " + hyperion::json::quote(rule.name);
+                report += ", \"syscall\": " + std::to_string(rule.syscall);
+                report += ", \"implementation\": ";
+                report += hyperion::json::quote(hyperion::to_string(rule.implementation));
+                report += ", \"handler\": " + hyperion::json::quote(rule.handler);
+                report += ", \"origin\": ";
+                report += hyperion::json::quote(hyperion::to_string(rule.origin));
+                report += ", \"rule_version\": " + std::to_string(rule.rule_version);
+                report += ", \"enabled\": ";
+                report += rule.enabled ? "true" : "false";
+                report += "}";
+            }
+        }
+        report += "\n  ],\n  \"rejected\": [";
+        for (std::size_t i = 0; i < rejected_rules.size(); ++i) {
+            report += i == 0 ? "\n    " : ",\n    ";
+            report += hyperion::json::quote(rejected_rules[i]);
+        }
+        report += rejected_rules.empty() ? "],\n" : "\n  ],\n";
+        report += "  \"diagnostics\": [";
+        const std::vector<std::string>& diagnostics = dispatcher.diagnostics();
+        for (std::size_t i = 0; i < diagnostics.size(); ++i) {
+            report += i == 0 ? "\n    " : ",\n    ";
+            report += hyperion::json::quote(diagnostics[i]);
+        }
+        report += diagnostics.empty() ? "]\n}\n" : "\n  ]\n}\n";
+        std::printf("%s", report.c_str());
+        return validate_exit(status, rejected_rules.size());
     }
 
     const hyperion::RegistryPathInfo info = hyperion::resolve_registry_path(options);
@@ -510,7 +572,10 @@ int cmd_syscall_registry(int argc, char** argv) {
                     info.path.c_str());
     }
 
-    return validate ? status : 0;
+    if (!validate) {
+        return 0;
+    }
+    return validate_exit(status, rejected_rules.size());
 }
 
 } // namespace

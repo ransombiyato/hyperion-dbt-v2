@@ -51,6 +51,14 @@ add_executable(hyperion_differential_tests
 target_link_libraries(hyperion_differential_tests PRIVATE hyperion_test_harness)
 add_test(NAME differential.native_vs_interpreter COMMAND hyperion_differential_tests)
 
+# --- syscall registry CLI contract ------------------------------------------
+# `hyperion syscall-registry` is the only supported way for a user to inspect or
+# extend the compatibility layer, so its observable behaviour is tested directly.
+add_test(NAME cli.syscall_registry
+    COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/cli/registry_cli_test.sh"
+            $<TARGET_FILE:hyperion>)
+set_tests_properties(cli.syscall_registry PROPERTIES LABELS "cli;syscall" TIMEOUT 60)
+
 # --- guest process regression tests -----------------------------------------
 #
 # These execute real x86-64 Linux guests, so they need a compiler that can

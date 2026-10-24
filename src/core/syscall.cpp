@@ -1149,12 +1149,24 @@ int MinimalSyscallHandler::reload_syscall_registry(const RegistryOptions& option
         return 1;
     }
     const RegistryReport report = dispatcher_->reload(options);
+    // One sentence: the detailed warning/rejection lines belong to
+    // dispatcher().diagnostics(), which callers already print. Repeating them
+    // here made every diagnostic appear twice in `syscall-registry` output.
     message = report.message;
-    for (const std::string& warning : report.warnings) {
-        message += "\n  warning: " + warning;
-    }
-    for (const std::string& rejected : report.rejected) {
-        message += "\n  rejected: " + rejected;
+    const std::size_t rejected = report.rejected.size();
+    const std::size_t warnings = report.warnings.size();
+    if (rejected != 0 || warnings != 0) {
+        message += " (";
+        if (rejected != 0) {
+            message += std::to_string(rejected) + " rule(s) rejected";
+            if (warnings != 0) {
+                message += ", ";
+            }
+        }
+        if (warnings != 0) {
+            message += std::to_string(warnings) + " warning(s)";
+        }
+        message += "; see diagnostics)";
     }
     return report.status == RegistryReport::Status::kOk ? 0 : 1;
 }

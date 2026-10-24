@@ -83,6 +83,18 @@ translator
   run <file>    execute a raw x86-64 code blob or static/dynamic ELF64 executable
   info <elf>    describe an ELF64 executable (read-only)
 
+syscall registry (the persistent compatibility rules)
+  syscall-registry --list            which rules are active, and from where
+  syscall-registry --validate        check the file; never modifies it
+  syscall-registry --write           create the default registry if absent
+  syscall-registry --export-defaults print the shipped rules as JSON
+  syscall-registry --json            machine-readable summary
+  --registry=FILE                   use FILE instead of the default path
+                                    (default: $XDG_DATA_HOME/hyperion/syscalls/registry.json,
+                                     else $HOME/.local/share/hyperion/syscalls/registry.json)
+  HYPERION_SYSCALL_REGISTRY=FILE    the same, for every invocation
+  HYPERION_NO_SYSCALL_REGISTRY=1    ignore the file; use only the built-in rules
+
   help          show this message
 EOF
 }
@@ -207,6 +219,15 @@ cmd_info() {
     exec "${bin}" info "$@"
 }
 
+# The registry commands are implemented by the binary. Delegating keeps a single
+# implementation: the wrapper never parses or edits the JSON itself.
+cmd_syscall_registry() {
+    need_build
+    local bin="${BUILD}/hyperion"
+    [ -x "${bin}" ] || die "hyperion binary not found at '${bin}' (run: hyperion build)"
+    exec "${bin}" syscall-registry "$@"
+}
+
 case "${1:-}" in
     ""|-h|--help|help)  cmd_help ;;
     status)             cmd_status ;;
@@ -223,5 +244,6 @@ case "${1:-}" in
     build-dir)          say "${BUILD}" ;;
     run)                shift; cmd_run "$@" ;;
     info)               shift; cmd_info "$@" ;;
+    syscall-registry)   shift; cmd_syscall_registry "$@" ;;
     *)                  printf 'error: unknown command %s\n\n' "$1" >&2; cmd_help >&2; exit 1 ;;
 esac

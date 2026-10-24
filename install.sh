@@ -131,6 +131,13 @@ if [ "$DO_UNINSTALL" -eq 1 ]; then
     fi
     # Remove now-empty directories, but only if they are empty: never delete
     # anything that was not created by this installer.
+    # The syscall registry is user data living outside the install directory. It
+    # is deliberately kept: deleting it would silently drop rules the user wrote.
+    registry="${XDG_DATA_HOME:-$HOME/.local/share}/hyperion/syscalls/registry.json"
+    if [ -f "${registry}" ]; then
+        say "Keeping the syscall registry at ${registry} (delete it yourself to remove"
+        say "your rules)."
+    fi
     rmdir "${LIB_DIR}" 2>/dev/null || true
     rmdir "$(dirname "${LIB_DIR}")" 2>/dev/null || true
     rmdir "${BIN_DIR}" 2>/dev/null || true
@@ -315,6 +322,44 @@ fi
     printf 'HYPERION_REF=%s\n' "${REF}"
 } > "${CONF_FILE}"
 chmod 0644 "${CONF_FILE}"
+
+# --- syscall registry -------------------------------------------------------
+#
+# The registry lives *outside* the install directory: it is the user's file, not
+# this installer's, so upgrading HYPERION must not overwrite hand-written rules.
+# It is therefore created only when it does not exist yet, and an existing one is
+# validated and left alone.
+
+say ""
+say "Syscall registry"
+REGISTRY_PATH="${XDG_DATA_HOME:-$HOME/.local/share}/hyperion/syscalls/registry.json"
+if [ -n "${HYPERION_SYSCALL_REGISTRY:-}" ]; then
+    REGISTRY_PATH="${HYPERION_SYSCALL_REGISTRY}"
+    info "using the path from \$HYPERION_SYSCALL_REGISTRY"
+fi
+
+if [ -f "${REGISTRY_PATH}" ]; then
+    info "keeping the existing registry at ${REGISTRY_PATH} (user rules are preserved)"
+    if HYPERION_NO_SYSCALL_REGISTRY= "${BIN_DIR}/hyperion" syscall-registry \
+        --validate --registry="${REGISTRY_PATH}" >"${TMP_DIR:-/tmp}/registry.check" 2>&1; then
+        info "registry validates"
+    else
+        warn "the registry did not validate; HYPERION will fall back to its built-in"
+        warn "rules at run time rather than refusing to start. Details:"
+        sed 's/^/  /' "${TMP_DIR:-/tmp}/registry.check" >&2 || true
+    fi
+else
+    if "${BIN_DIR}/hyperion" syscall-registry --write --registry="${REGISTRY_PATH}" \
+        >/dev/null 2>&1; then
+        info "created the default registry at ${REGISTRY_PATH}"
+    else
+        warn "could not create the registry at ${REGISTRY_PATH}"
+        warn "HYPERION works without it; the built-in rules are compiled in"
+    fi
+fi
+say "  edit or extend: ${REGISTRY_PATH}"
+say "  validate:       hyperion syscall-registry --validate"
+say "  disable:        HYPERION_NO_SYSCALL_REGISTRY=1 or --no-syscall-registry"
 
 say ""
 say "Installed."
