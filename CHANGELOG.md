@@ -83,6 +83,20 @@ Meaningful changes by milestone. Format loosely follows
   at work that was already done.
 
 ### Fixed
+- **`rt_sigaction` fabricated the guest's signal dispositions.** The syscall wrote
+  32 zero bytes into the caller's `oldact` and returned 0 regardless of what the
+  guest had installed, so a program that installed `SIGSEGV` and read it back was
+  told `SIG_DFL`. Dispositions for signals 1..64 are now recorded and reported
+  (handler, flags, restorer, mask), and the error paths match the kernel:
+  `-EINVAL` for out-of-range signals, for `SIGKILL`/`SIGSTOP`, and for
+  `sigsetsize != 8`; `-EFAULT` for either pointer outside the guest address space.
+  Signal *delivery* is still not implemented and is now documented as its own
+  limitation (`LIM-022`) instead of being implied by a stub.
+- **`sigaltstack` did the same to the alternate signal stack.** It now stores and
+  reports the 24-byte `stack_t`, reports `SS_DISABLE` before anything is
+  installed, clears on `SS_DISABLE`, and returns `-EINVAL` for undefined flag bits
+  and `-ENOMEM` below the kernel's 2048-byte floor. This is the read-back Rust's
+  standard library performs to confirm its stack-overflow guard is armed.
 - **`futex` reported wake-ups that never happened.** `FUTEX_WAIT` returned 0
   whenever the value matched, without blocking — telling the caller it had been
   woken when nothing had occurred. A guest thread cannot exist here (`clone` with
@@ -137,8 +151,8 @@ Meaningful changes by milestone. Format loosely follows
   against the AArch64-built binary, runs the registry CLI under qemu, and fails
   if tier 1 falls back to the interpreter. Measured with
   `g++-aarch64-linux-gnu` 14.2.0 and the cached `qemu-aarch64-static`:
-  `scripts/dev.sh cross-test` **10/10**, AArch64 unit suite **342 passed / 0
-  failed / 2 skipped** of 344, and the compat guest at `--tier=1` reports
+  `scripts/dev.sh cross-test` **10/10**, AArch64 unit suite **347 passed / 0
+  failed / 2 skipped** of 349, and the compat guest at `--tier=1` reports
   `1412 basic block(s) translated`, `failures 0` and **the same 170 308 guest
   steps as tier 0**. `tests/guest/syscall_compat_test.sh` and
   `tests/cli/registry_cli_test.sh` grew an optional emulator argument so both can

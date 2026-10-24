@@ -29,6 +29,7 @@
 #include <sys/time.h>
 #include <sys/times.h>
 #include <fcntl.h>
+#include <signal.h>
 #include <sched.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -231,6 +232,50 @@ int main(void) {
         }
     } else {
         printf("%-22s %s\n", "terminal", "skip (stdin is not a tty)");
+    }
+
+    /* --- signals ---------------------------------------------------------- */
+    /* Installing a handler and reading it back is what every runtime does at
+     * start-up (Rust's stack-overflow guard combines this with sigaltstack).
+     * Delivery is a separate mechanism that HYPERION does not implement, but the
+     * disposition itself must round-trip or the program draws the wrong
+     * conclusion about its own state. */
+    {
+        static char altstack[64 * 1024];
+        stack_t request;
+        memset(&request, 0, sizeof request);
+        request.ss_sp = altstack;
+        request.ss_size = sizeof altstack;
+        request.ss_flags = 0;
+        const int installed = sigaltstack(&request, NULL) == 0;
+        stack_t readback;
+        memset(&readback, 0, sizeof readback);
+        const int read_ok = sigaltstack(NULL, &readback) == 0;
+        check("sigaltstack", installed && read_ok && readback.ss_sp == altstack &&
+                                 readback.ss_size == sizeof altstack);
+
+        struct sigaction act;
+        memset(&act, 0, sizeof act);
+        act.sa_handler = (void (*)(int))1; /* SIG_IGN: a defined value, not "unset" */
+        act.sa_flags = SA_RESTART;
+        sigemptyset(&act.sa_mask);
+        const int set = sigaction(SIGUSR1, &act, NULL) == 0;
+        struct sigaction previous;
+        memset(&previous, 0, sizeof previous);
+        const int got = sigaction(SIGUSR1, NULL, &previous) == 0;
+        check("sigaction", set && got && previous.sa_handler == (void (*)(int))1 &&
+                                (previous.sa_flags & SA_RESTART) != 0);
+        /* SIGUSR2 was never touched and must still be the default. */
+        struct sigaction untouched;
+        memset(&untouched, 0, sizeof untouched);
+        check("sigaction_per_signal",
+              sigaction(SIGUSR2, NULL, &untouched) == 0 && untouched.sa_handler == SIG_DFL);
+        /* And the kernel refuses to change SIGKILL; a translator that accepted it
+         * would leave the guest believing it had ignored a fatal signal. */
+        memset(&act, 0, sizeof act);
+        act.sa_handler = SIG_IGN;
+        check("sigaction_rejects_sigkill",
+              sigaction(SIGKILL, &act, NULL) == -1 && errno == EINVAL);
     }
 
     /* --- process and scheduling ------------------------------------------- */

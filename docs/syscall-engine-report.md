@@ -138,7 +138,7 @@ deleting it restores `-ENOSYS`:
 Counts are generated from `docs/syscalls/inventory.tsv` and enforced in both
 directions by `tools/gen_syscall_inventory.py --check`.
 
-**128 of 375** numbers are answered: **121 implemented, 7 stubbed**. Before this
+**130 of 375** numbers are answered: **123 implemented, 5 stubbed**. Before this
 work the inventory claimed 47.
 
 Newly `implemented` in this work (42 numbers):
@@ -166,10 +166,11 @@ in the inventory (`open`, `stat`, `lstat`, `rt_sigprocmask`, `ioctl`, `pipe`,
 `renameat2`, `faccessat2`, …) — that correction is why the roadmap had been
 pointed at work that was already done.
 
-- **Moved from stub to real:** `nanosleep`(35), `clock_nanosleep`(230).
+- **Moved from stub to real:** `nanosleep`(35), `clock_nanosleep`(230),
+  `rt_sigaction`(13), `sigaltstack`(131).
 - **Still stubbed, and labelled `stubbed` rather than `implemented`:**
-  `rt_sigaction`(13), `madvise`(28), `sigaltstack`(131), `prctl`(157),
-  `fadvise64`(221), `clock_getres`(229), and `futex`(202).
+  `madvise`(28), `prctl`(157), `fadvise64`(221), `clock_getres`(229), and
+  `futex`(202).
 - **`futex` was corrected *downwards* in this work.** It had been counted as
   implemented while returning success from `FUTEX_WAIT` without blocking — i.e.
   telling callers they had been woken when nothing had happened. It now does the
@@ -207,6 +208,43 @@ Modified (docs): `README.md`, `ARCHITECTURE.md`, `COMPATIBILITY.md`, `STATUS.md`
 `docs/syscalls/README.md`, `docs/syscalls/inventory.tsv`,
 `docs/syscalls/U1..U4.md` (regenerated).
 
+## 6b. Signal-state fidelity: `rt_sigaction` and `sigaltstack`
+
+Both numbers used to be listed as stubs that answered success and did nothing.
+They are the same class of defect the `futex` correction fixed: the caller is
+told something happened that did not.
+
+**What was wrong.** `rt_sigaction`(13) wrote 32 zero bytes into the caller's
+`oldact` and returned 0. A program that installs `SIGSEGV` and then asks what is
+installed was told `SIG_DFL` — the opposite of the truth. `sigaltstack`(131) did
+the same with a 24-byte `stack_t`, which is exactly what Rust's standard library
+reads back to confirm its stack-overflow guard is armed.
+
+**What it does now** (`src/core/syscall.cpp`, state in
+`MinimalSyscallHandler::sigactions_` / `altstack_*_`):
+
+| Call | Behaviour |
+| --- | --- |
+| `rt_sigaction(sig, act, oldact, 8)` | Stores `{handler, flags, restorer, mask}` per signal 1..64; writes the previous action to `oldact` only when `oldact != 0`; a never-set signal reports the kernel's `SIG_DFL` (all zeros) |
+| `rt_sigaction` invalid input | `sig < 1` or `> 64` → `-EINVAL`; `SIGKILL`/`SIGSTOP` → `-EINVAL` (the kernel refuses, and a guest believing it ignored a fatal signal is dangerous); `sigsetsize != 8` → `-EINVAL`; either pointer outside the guest address space → `-EFAULT` (via the existing memory validation, not a new check) |
+| `sigaltstack(ss, old_ss)` | Stores `{ss_sp, ss_flags, ss_size}`; reports `SS_DISABLE` before anything is installed; `SS_DISABLE` clears it again; `SS_AUTODISARM` accepted |
+| `sigaltstack` invalid input | undefined flag bits → `-EINVAL`; `ss_size` below the kernel's 2048-byte floor → `-ENOMEM`; bad pointers → `-EFAULT` |
+
+**What is still not implemented, stated plainly (LIM-022):** nothing queues or
+delivers a signal into guest code. There is no guest signal frame, no
+arch-specific return trampoline, no interaction between the mask and delivery.
+The disposition is *recorded and reported*; it is not *acted upon*. That is a
+truthful capability, not a claim of signal support.
+
+**Tests.** Three unit tests (`linux_compat_rt_sigaction_round_trips_the_disposition`,
+`..._rejects_what_the_kernel_rejects`, `linux_compat_sigaltstack_records_the_alternate_stack`)
+including set-then-get round-trip, per-signal independence, `SIG_IGN` as a real
+value, `SIG_DFL` default, and every `-EINVAL`/`-EFAULT`/`-ENOMEM` path. The guest
+fixture gained `sigaltstack`, `sigaction`, `sigaction_per_signal` and
+`sigaction_rejects_sigkill`, so real glibc calls are exercised through the full
+dispatch path at both tiers. Non-vacuity was checked the same way as before: with
+the store removed the round-trip assertion fails.
+
 ## 6a. AArch64 / Tier 1 verification (measured)
 
 ```
@@ -216,11 +254,11 @@ scripts/dev.sh cross-test        # 10/10 passed
 
 | Run | Result |
 | --- | --- |
-| AArch64 unit suite (`qemu-aarch64-static`) | **342 passed, 0 failed, 2 skipped** (of 344 registered) |
+| AArch64 unit suite (`qemu-aarch64-static`) | **347 passed, 0 failed, 2 skipped** (of 349 registered) |
 | AArch64 differential suite | 0 passed — correct: no x86-64 oracle on AArch64, so every case SKIPs |
 | `cross.aarch64_tests` (whole pipeline) | passed, 18–61 s |
 | AArch64 guest **process** tests, tier 0 / tier 1 | passed / passed |
-| AArch64 **syscall compat** suite, tier 0 / tier 1 | 11/11 checks each |
+| AArch64 **syscall compat** suite, tier 0 / tier 1 | all checks passed (now 25 guest assertions incl. `sigaction`/`sigaltstack`) |
 | AArch64 registry CLI | 11/11 checks |
 | Tier 1 JIT evidence | `tier 1: 1412 basic block(s) translated`, `failures 0`, **170 308 guest steps — identical to tier 0** |
 
@@ -240,13 +278,13 @@ Without that assertion a silent fallback would pass every behavioural check.
 cmake -B build/dev -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
 cmake --build build/dev -j8            # clean, no warnings
 ctest --test-dir build/dev             # 16/16 passed
-./build/dev/tests/hyperion_unit_tests  # 316 passed, 0 failed, 24 skipped (of 340)
+./build/dev/tests/hyperion_unit_tests  # 321 passed, 0 failed, 24 skipped (of 345)
 python3 tools/gen_syscall_inventory.py --check   # 0 errors, 0 warnings
 ```
 
 | Suite | Command | Result |
 | --- | --- | --- |
-| Native unit | `./build/dev/tests/hyperion_unit_tests` | **316 passed, 0 failed, 24 skipped** (of 340) |
+| Native unit | `./build/dev/tests/hyperion_unit_tests` | **321 passed, 0 failed, 24 skipped** (of 345) |
 | Full CTest tree | `ctest --test-dir build/dev` | **16/16 passed** |
 | ASan + UBSan | `cmake -B build/asan -DHYPERION_ENABLE_SANITIZERS=ON` + build + `ctest` | **16/16 passed**, no report |
 | Guest compatibility | `ctest -R guest.syscall_compat` | 11 checks, 27 guest-side assertions |
@@ -315,7 +353,7 @@ device. They must not be quoted as end-to-end performance.
 | --- | --- | --- |
 | Threads (`clone` with `CLONE_VM`/`CLONE_THREAD`) | refused with `-ENOSYS` by design | correct, but any threaded guest does not run |
 | `futex`(202) | **stub by design**: value comparison real, blocking refused | cannot be fixed before thread creation exists; a guest that contends will get a clean `-ENOSYS` rather than a false wake-up |
-| `rt_sigaction`, `sigaltstack`, `prctl`, `madvise`, `fadvise64`, `clock_getres` | stubs that report success | **worst category**: a guest that depends on the effect misbehaves later, looks like an unrelated bug. Rust's stack-overflow guard checks that `sigaltstack` took effect |
+| `prctl`, `madvise`, `fadvise64`, `clock_getres` | stubs that report success | **worst category**: a guest that depends on the effect misbehaves later, looks like an unrelated bug. Rust's stack-overflow guard checks that `sigaltstack` took effect |
 | Sockets | not started | blocks an editor that spawns a language server |
 | `signalfd`, `inotify_*` | not started | blocks file-watching |
 | File-backed `mmap`, `waitid`, `openat2` | not started | |
@@ -352,8 +390,7 @@ adapter after `errno` has deliberately not been touched.
 7. **Verify non-vacuity deliberately.** When a fix makes a test pass, disable the
    fix once and confirm the test fails (that is how `fork_rule_inherit.c` was
    validated: with the fix removed the guest prints `parent=1 child=0`).
-8. **Highest-value next items, in order:** `rt_sigaction` + `sigaltstack`
-   (replace the lying stubs), `futex` validation, `inotify_*`/`signalfd`,
-   sockets. **Keep the cross tree green**: `scripts/dev.sh cross-test` runs the
+8. **Highest-value next items, in order:** a real `futex` wait queue,
+   `inotify_*`/`signalfd`, sockets. **Keep the cross tree green**: `scripts/dev.sh cross-test` runs the
    compat suite at both tiers and fails if tier 1 falls back, so it is the guard
    that stops AArch64 support silently rotting.

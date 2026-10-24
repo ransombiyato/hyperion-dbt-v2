@@ -2108,3 +2108,184 @@ HYPERION_TEST("syscall", "linux_compat_futex_uncontended_lock_is_unaffected") {
     handler.handle(s, memory);
     HYPERION_CHECK_EQ(s.reg(Gpr::kRax), static_cast<std::uint64_t>(-hyperion::kEagain));
 }
+
+// --- linux-compat layer: signal disposition round-trip ----------------------
+//
+// rt_sigaction used to zero the 32-byte old-action block and return success, so a
+// program that installed a handler and read it back was told it had none. Same
+// class of bug as the futex one: the syscall must do its actual job (record and
+// report dispositions) even though delivering signals to guest handlers is a
+// separate, unimplemented mechanism.
+
+namespace {
+
+// The x86-64 kernel's 32-byte struct sigaction: handler, flags, restorer, mask.
+struct GuestSigaction {
+    std::uint64_t handler;
+    std::uint64_t flags;
+    std::uint64_t restorer;
+    std::uint64_t mask;
+};
+
+void write_sigaction(FlatMemory& memory, std::uint64_t addr, const GuestSigaction& act) {
+    std::array<std::uint8_t, 32> buf{};
+    hyperion::syscall_detail::put_u64(buf.data(), 0, act.handler);
+    hyperion::syscall_detail::put_u64(buf.data(), 8, act.flags);
+    hyperion::syscall_detail::put_u64(buf.data(), 16, act.restorer);
+    hyperion::syscall_detail::put_u64(buf.data(), 24, act.mask);
+    HYPERION_CHECK(memory.write(addr, buf.data(), buf.size()));
+}
+
+GuestSigaction read_sigaction(FlatMemory& memory, std::uint64_t addr) {
+    std::array<std::uint8_t, 32> buf{};
+    HYPERION_CHECK(memory.read(addr, buf.data(), buf.size()));
+    GuestSigaction act{};
+    act.handler = hyperion::syscall_detail::get_u64_le(buf.data());
+    act.flags = hyperion::syscall_detail::get_u64_le(buf.data() + 8);
+    act.restorer = hyperion::syscall_detail::get_u64_le(buf.data() + 16);
+    act.mask = hyperion::syscall_detail::get_u64_le(buf.data() + 24);
+    return act;
+}
+
+} // namespace
+
+HYPERION_TEST("syscall", "linux_compat_rt_sigaction_round_trips_the_disposition") {
+    GuestAddressSpace as;
+    MinimalSyscallHandler handler({}, &as);
+    handler.enable_linux_compat();
+    FlatMemory memory(kBase, kMemSize);
+
+    // SIGSEGV (11) with SA_SIGINFO | SA_RESTART | SA_ONSTACK and a restorer, which
+    // is exactly what a language runtime installs for stack-overflow detection.
+    GuestSigaction act{0x400100, 0x4 | 0x10000000 | 0x08000000, 0x400200, 0x1};
+    write_sigaction(memory, kBase + 0x100, act);
+
+    GuestState s = syscall_state(13, {11, kBase + 0x100, kBase + 0x200, 8});
+    handler.handle(s, memory);
+    HYPERION_CHECK_EQ(s.reg(Gpr::kRax), std::uint64_t{0});
+
+    // The old action was the default one, which the kernel reports as all zeros.
+    const GuestSigaction previous = read_sigaction(memory, kBase + 0x200);
+    HYPERION_CHECK_EQ(previous.handler, std::uint64_t{0});
+
+    // Reading again without installing must return what was installed. This is
+    // the assertion that fails against a "zero the buffer" implementation.
+    s = syscall_state(13, {11, 0, kBase + 0x300, 8});
+    handler.handle(s, memory);
+    HYPERION_CHECK_EQ(s.reg(Gpr::kRax), std::uint64_t{0});
+    const GuestSigaction round_tripped = read_sigaction(memory, kBase + 0x300);
+    HYPERION_CHECK_EQ(round_tripped.handler, std::uint64_t{0x400100});
+    HYPERION_CHECK_EQ(round_tripped.flags, std::uint64_t{0x4 | 0x10000000 | 0x08000000});
+    HYPERION_CHECK_EQ(round_tripped.restorer, std::uint64_t{0x400200});
+    HYPERION_CHECK_EQ(round_tripped.mask, std::uint64_t{0x1});
+
+    // Dispositions are per signal: SIGINT must still be the default.
+    s = syscall_state(13, {2 /*SIGINT*/, 0, kBase + 0x400, 8});
+    handler.handle(s, memory);
+    HYPERION_CHECK_EQ(read_sigaction(memory, kBase + 0x400).handler, std::uint64_t{0});
+
+    // SIG_IGN is a real value (1), not "unset", and must come back as 1.
+    write_sigaction(memory, kBase + 0x500, GuestSigaction{1, 0, 0, 0});
+    s = syscall_state(13, {2, kBase + 0x500, 0, 8});
+    handler.handle(s, memory);
+    s = syscall_state(13, {2, 0, kBase + 0x600, 8});
+    handler.handle(s, memory);
+    HYPERION_CHECK_EQ(read_sigaction(memory, kBase + 0x600).handler, std::uint64_t{1});
+}
+
+HYPERION_TEST("syscall", "linux_compat_rt_sigaction_rejects_what_the_kernel_rejects") {
+    GuestAddressSpace as;
+    MinimalSyscallHandler handler({}, &as);
+    handler.enable_linux_compat();
+    FlatMemory memory(kBase, kMemSize);
+    write_sigaction(memory, kBase + 0x100, GuestSigaction{0x400100, 0, 0, 0});
+
+    auto call = [&](std::int64_t sig, std::uint64_t act, std::uint64_t old, std::uint64_t setsize) {
+        GuestState s = syscall_state(13, {static_cast<std::uint64_t>(sig), act, old, setsize});
+        handler.handle(s, memory);
+        return static_cast<std::int64_t>(s.reg(Gpr::kRax));
+    };
+
+    // Signal 0 and out-of-range numbers are EINVAL, not a silent store at index 0.
+    HYPERION_CHECK_EQ(call(0, kBase + 0x100, 0, 8), -hyperion::kEinval);
+    HYPERION_CHECK_EQ(call(65, kBase + 0x100, 0, 8), -hyperion::kEinval);
+    // SIGKILL and SIGSTOP cannot be caught or ignored; believing otherwise would
+    // be a nasty surprise later.
+    HYPERION_CHECK_EQ(call(9, kBase + 0x100, 0, 8), -hyperion::kEinval);
+    HYPERION_CHECK_EQ(call(19, kBase + 0x100, 0, 8), -hyperion::kEinval);
+    // sigsetsize must be the kernel's 8 bytes.
+    HYPERION_CHECK_EQ(call(11, kBase + 0x100, 0, 4), -hyperion::kEinval);
+    // Pointers are validated before use.
+    HYPERION_CHECK_EQ(call(11, 0xDEAD0000ULL, 0, 8), -hyperion::kEfault);
+    HYPERION_CHECK_EQ(call(11, 0, 0xDEAD0000ULL, 8), -hyperion::kEfault);
+}
+
+HYPERION_TEST("syscall", "linux_compat_sigaltstack_records_the_alternate_stack") {
+    GuestAddressSpace as;
+    MinimalSyscallHandler handler({}, &as);
+    handler.enable_linux_compat();
+    FlatMemory memory(kBase, kMemSize);
+
+    // A freshly initialised handler reports SS_DISABLE (2), like the kernel does.
+    GuestState s = syscall_state(131, {0, kBase + 0x100});
+    handler.handle(s, memory);
+    HYPERION_CHECK_EQ(s.reg(Gpr::kRax), std::uint64_t{0});
+    std::array<std::uint8_t, 24> buf{};
+    HYPERION_CHECK(memory.read(kBase + 0x100, buf.data(), buf.size()));
+    HYPERION_CHECK_EQ(hyperion::syscall_detail::get_u32_le(buf.data() + 8), std::uint32_t{2});
+
+    // Install one: ss_sp, ss_flags, ss_size.
+    std::array<std::uint8_t, 24> in{};
+    hyperion::syscall_detail::put_u64(in.data(), 0, kBase + 0x1000);
+    hyperion::syscall_detail::put_u32(in.data(), 8, 0);
+    hyperion::syscall_detail::put_u64(in.data(), 16, 8192);
+    HYPERION_CHECK(memory.write(kBase + 0x200, in.data(), in.size()));
+    s = syscall_state(131, {kBase + 0x200, 0});
+    handler.handle(s, memory);
+    HYPERION_CHECK_EQ(s.reg(Gpr::kRax), std::uint64_t{0});
+
+    // Read it back: this is what Rust's stack-overflow guard checks.
+    std::array<std::uint8_t, 24> out{};
+    HYPERION_CHECK(memory.write(kBase + 0x300, out.data(), out.size()));
+    s = syscall_state(131, {0, kBase + 0x300});
+    handler.handle(s, memory);
+    HYPERION_CHECK(memory.read(kBase + 0x300, out.data(), out.size()));
+    HYPERION_CHECK_EQ(hyperion::syscall_detail::get_u64_le(out.data()),
+                      std::uint64_t{kBase + 0x1000});
+    HYPERION_CHECK_EQ(hyperion::syscall_detail::get_u64_le(out.data() + 16), std::uint64_t{8192});
+
+    // Too small is ENOMEM (the kernel's floor is 2048 bytes); a bad flag is
+    // EINVAL; bad pointers are EFAULT.
+    std::array<std::uint8_t, 24> tiny{};
+    hyperion::syscall_detail::put_u64(tiny.data(), 0, kBase + 0x1000);
+    hyperion::syscall_detail::put_u64(tiny.data(), 16, 16);
+    HYPERION_CHECK(memory.write(kBase + 0x400, tiny.data(), tiny.size()));
+    s = syscall_state(131, {kBase + 0x400, 0});
+    handler.handle(s, memory);
+    HYPERION_CHECK_EQ(s.reg(Gpr::kRax), static_cast<std::uint64_t>(-hyperion::kEnomem));
+
+    std::array<std::uint8_t, 24> badflag{};
+    hyperion::syscall_detail::put_u64(badflag.data(), 0, kBase + 0x1000);
+    hyperion::syscall_detail::put_u32(badflag.data(), 8, 0x80);
+    hyperion::syscall_detail::put_u64(badflag.data(), 16, 8192);
+    HYPERION_CHECK(memory.write(kBase + 0x500, badflag.data(), badflag.size()));
+    s = syscall_state(131, {kBase + 0x500, 0});
+    handler.handle(s, memory);
+    HYPERION_CHECK_EQ(s.reg(Gpr::kRax), static_cast<std::uint64_t>(-hyperion::kEinval));
+
+    s = syscall_state(131, {0xDEAD0000ULL, 0});
+    handler.handle(s, memory);
+    HYPERION_CHECK_EQ(s.reg(Gpr::kRax), static_cast<std::uint64_t>(-hyperion::kEfault));
+
+    // SS_DISABLE clears it again.
+    std::array<std::uint8_t, 24> disable{};
+    hyperion::syscall_detail::put_u32(disable.data(), 8, 2);
+    HYPERION_CHECK(memory.write(kBase + 0x600, disable.data(), disable.size()));
+    s = syscall_state(131, {kBase + 0x600, 0});
+    handler.handle(s, memory);
+    HYPERION_CHECK_EQ(s.reg(Gpr::kRax), std::uint64_t{0});
+    s = syscall_state(131, {0, kBase + 0x700});
+    handler.handle(s, memory);
+    HYPERION_CHECK(memory.read(kBase + 0x700, out.data(), out.size()));
+    HYPERION_CHECK_EQ(hyperion::syscall_detail::get_u32_le(out.data() + 8), std::uint32_t{2});
+}

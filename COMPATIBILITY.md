@@ -324,7 +324,7 @@ guest buffer from the host in 4 KiB chunks, accepting only the two defined
 | `pipe`(22)/`pipe2`(293) + inheritance across `fork` | ✅ | 6 | `guest.process` (`pipe + fork IPC`, `file descriptor inheritance`) |
 | `futex`(202) | ⚠️ **stub, deliberately honest**: the value comparison is real (`-EAGAIN` when the word changed, `-EFAULT` on a bad address), `WAKE` reports 0 woken, and the paths that need a wait queue (`WAIT` on a matching value, PI, requeue) are refused with `-ENOSYS` instead of falsely reporting a wake-up | 6 | `syscall.linux_compat_futex_*` |
 | Thread creation (`clone` with `CLONE_THREAD`) | ❌ `-ENOSYS` by design | 6 | `guest.process` |
-| Signals: `rt_sigaction`(13) **stub**, `rt_sigprocmask`(14) tracked in a guest mask, handlers **not** invoked | ⚠️ partial (deliberate stubs, listed as such in the inventory) | 6 | — |
+| Signals: `rt_sigaction`(13) **records and reports the guest's dispositions**, `rt_sigprocmask`(14) tracked in a guest mask, handlers **not** invoked | ⚠️ partial — dispositions round-trip, delivery is not implemented (see below) | 6 | — |
 | `kill`(62)/`tgkill`(234) | ✅ (signal delivery to the single guest thread) | 6 | — |
 | `epoll_create1`(291)/`epoll_ctl`(233)/`epoll_wait`(232)/`epoll_pwait`(281)/`epoll_pwait2`(441) | ✅ (packed 12-byte guest `epoll_event` converted per entry) | 6 | `syscall_adapters.*`, `guest.syscall_compat` |
 | `poll`(7)/`ppoll`(271), `select`(23)/`pselect6`(270) | ✅ (`pollfd` and `fd_set` translated, guest fds restored on write-back) | 6 | `syscall_adapters.*`, `guest.syscall_compat` |
@@ -332,7 +332,7 @@ guest buffer from the host in 4 KiB chunks, accepting only the two defined
 | Filesystem metadata: `rename`(82)/`renameat`(264)/`renameat2`(316), `mkdir`(83)/`mkdirat`(258), `rmdir`(84), `unlink`(87)/`unlinkat`(263), `link`(86)/`linkat`(265), `symlink`(88)/`symlinkat`(266), `chmod`(90)/`fchmod`(91)/`fchmodat`(268), `truncate`(76)/`ftruncate`(77), `fsync`(74)/`fdatasync`(75)/`sync`(162)/`syncfs`(306), `chdir`(80)/`fchdir`(81), `umask`(95), `statfs`(137)/`fstatfs`(138), `utimensat`(280) | ✅ | 6 | `syscall_adapters.*`, `guest.syscall_compat` |
 | `nanosleep`(35), `clock_nanosleep`(230) | ✅ (real sleep, `-EINTR` with the unslept remainder, `TIMER_ABSTIME`) | 6 | `syscall.linux_compat_nanosleep_*`, `guest.syscall_compat` |
 | Resource/scheduling: `getrusage`(98), `times`(100), `getrlimit`(97)/`setrlimit`(160), `sched_getparam`(143)/`sched_setscheduler`(144)/`sched_getscheduler`(145)/`sched_get_priority_max`(146)/`sched_get_priority_min`(147), `sched_getaffinity`(204), `getitimer`(36)/`setitimer`(38), `setsid`(112)/`setpgid`(109)/`getpgid`(121)/`getpgrp`(111), `sched_yield`(24), `membarrier`(324) | ✅ | 6 | `syscall_adapters.*`, `guest.syscall_compat` |
-| Stubs (answer success, do nothing): `madvise`(28), `sigaltstack`(131), `prctl`(157), `fadvise64`(221), `clock_getres`(229), `rt_sigaction`(13) | ⚠️ stubbed — **not** claimed as implemented | 6 | inventory status `stubbed` |
+| Stubs (answer success, do nothing): `madvise`(28), `prctl`(157), `fadvise64`(221), `clock_getres`(229), `futex`(202) | ⚠️ stubbed — **not** claimed as implemented | 5 | inventory status `stubbed` |
 | Thread creation (`clone` with `CLONE_VM`/`CLONE_THREAD`) | ❌ `-ENOSYS` by design, which is *why* `futex` cannot block: no waiter could ever be woken | 6 | `guest.process` |
 | `io_uring`, `rseq`, `vDSO` | ⬜ | 6/7 | — |
 
@@ -409,9 +409,12 @@ regress into a fake success.
 * **A forked child runs on Tier 0 by default.** The parent keeps whichever tier it
   was using. Tier 0 is the reference interpreter that the differential test
   validates Tier 1 against, so child execution is the better-understood path.
-* **Guest signal handlers are not invoked.** `rt_sigaction`/`rt_sigprocmask` are
-  accepted and recorded, and children are real host children so `SIGCHLD` does
-  not block or kill the parent, but a handler the guest installed will not run.
+* **Guest signal handlers are not invoked.** `rt_sigaction` records and reports
+  the guest's own dispositions — ask what is installed and you get back what you
+  installed — and `sigaltstack` records and reports the alternate stack, but
+  nothing is ever delivered into guest code (`LIM-022`). `rt_sigprocmask` is
+  tracked in a guest mask. Children are real host children, so `SIGCHLD` does not
+  block or kill the parent, but a handler the guest installed will not run.
   Guests that poll with `wait4` — BusyBox and glibc's `system()`/`posix_spawn`
   both do — work; guests that rely purely on a `SIGCHLD` handler do not.
 

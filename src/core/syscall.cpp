@@ -1937,13 +1937,112 @@ SyscallResult MinimalSyscallHandler::handle_unguarded(GuestState& state, Memory&
                 }
                 break;
             }
-            case 13: // rt_sigaction
-                if (arg(state, 2) != 0) {
-                    std::array<std::uint8_t, 32> zero_act{};
-                    (void)memory.write(arg(state, 2), zero_act.data(), zero_act.size());
+            case 13: { // rt_sigaction(sig, act, oldact, sigsetsize)
+                // This used to write 32 zero bytes into oldact and report
+                // success: a program that installed a handler and read it back was
+                // told it had none. Recording the action makes the syscall do its
+                // actual job. *Delivering* a signal to a guest handler is a
+                // different mechanism and is still not implemented; that is
+                // documented rather than papered over.
+                const auto signum = arg_i32(state, 0);
+                const std::uint64_t act_addr = arg(state, 1);
+                const std::uint64_t old_addr = arg(state, 2);
+                const std::uint64_t setsize = arg(state, 3);
+                if (signum < 1 || signum > static_cast<std::int32_t>(kMaxSignal)) {
+                    r = -kEinval;
+                    break;
+                }
+                if (signum == 9 /*SIGKILL*/ || signum == 19 /*SIGSTOP*/) {
+                    // The kernel refuses to change these two, and a program that
+                    // believes it ignored them would be badly wrong.
+                    r = -kEinval;
+                    break;
+                }
+                if (setsize != 8) {
+                    r = -kEinval;
+                    break;
+                }
+                const auto index = static_cast<std::size_t>(signum);
+                if (old_addr != 0) {
+                    std::array<std::uint8_t, 32> out{};
+                    const GuestSignalAction& prev = sigactions_[index];
+                    put_u64(out.data(), 0, prev.installed ? prev.handler : 0); // SIG_DFL
+                    put_u64(out.data(), 8, prev.flags);
+                    put_u64(out.data(), 16, prev.restorer);
+                    put_u64(out.data(), 24, prev.mask);
+                    if (!memory.write(old_addr, out.data(), out.size())) {
+                        r = -kEfault;
+                        break;
+                    }
+                }
+                if (act_addr != 0) {
+                    std::array<std::uint8_t, 32> in{};
+                    if (!memory.read(act_addr, in.data(), in.size())) {
+                        r = -kEfault;
+                        break;
+                    }
+                    GuestSignalAction next;
+                    next.handler = get_u64_le(in.data());
+                    next.flags = get_u64_le(in.data() + 8);
+                    next.restorer = get_u64_le(in.data() + 16);
+                    next.mask = get_u64_le(in.data() + 24);
+                    next.installed = true;
+                    sigactions_[index] = next;
                 }
                 r = 0;
                 break;
+            }
+            case 131: { // sigaltstack(ss, old_ss)
+                // stack_t is 24 bytes on x86-64: ss_sp, ss_flags (int), padding,
+                // ss_size. Rust's stack-overflow guard installs an alternate stack
+                // and expects to read it back, so this has to be recorded rather
+                // than reported as done.
+                const std::uint64_t ss_addr = arg(state, 0);
+                const std::uint64_t old_addr = arg(state, 1);
+                if (old_addr != 0) {
+                    std::array<std::uint8_t, 24> out{};
+                    put_u64(out.data(), 0, altstack_sp_);
+                    put_u32(out.data(), 8, static_cast<std::uint32_t>(altstack_flags_));
+                    put_u64(out.data(), 16, altstack_size_);
+                    if (!memory.write(old_addr, out.data(), out.size())) {
+                        r = -kEfault;
+                        break;
+                    }
+                }
+                if (ss_addr != 0) {
+                    std::array<std::uint8_t, 24> in{};
+                    if (!memory.read(ss_addr, in.data(), in.size())) {
+                        r = -kEfault;
+                        break;
+                    }
+                    const auto flags = static_cast<std::int32_t>(get_u32_le(in.data() + 8));
+                    constexpr std::int32_t kSsDisable = 2;
+                    constexpr std::int32_t kSsAutodisarm = 4;
+                    if ((flags & ~(kSsDisable | kSsAutodisarm)) != 0) {
+                        r = -kEinval; // undefined flag bits
+                        break;
+                    }
+                    if ((flags & kSsDisable) != 0) {
+                        altstack_sp_ = 0;
+                        altstack_size_ = 0;
+                        altstack_flags_ = kSsDisable;
+                    } else {
+                        const std::uint64_t size = get_u64_le(in.data() + 16);
+                        // The kernel's own floor. glibc's MINSIGSTKSZ is a
+                        // runtime value and is not what the kernel checks.
+                        constexpr std::uint64_t kMinSigStackSize = 2048;
+                        if (size < kMinSigStackSize) {
+                            r = -kEnomem;
+                            break;
+                        }
+                        altstack_sp_ = get_u64_le(in.data());
+                        altstack_size_ = size;
+                        altstack_flags_ = flags;
+                    }
+                }
+                r = 0;
+                break;
+            }
             case 14: { // rt_sigprocmask
                 const auto how = arg_i32(state, 0);
                 const std::uint64_t nset = arg(state, 1);
@@ -2141,7 +2240,6 @@ SyscallResult MinimalSyscallHandler::handle_unguarded(GuestState& state, Memory&
                 break;
             }
             case 28:  // madvise [stub]
-            case 131: // sigaltstack [stub]
             case 157: // prctl [stub]
             case 221: // fadvise64 [stub]
             case 229: // clock_getres [stub]
@@ -2449,7 +2547,7 @@ bool is_linux_compat_syscall(std::uint64_t number) {
     case 2:   // open
     case 4:   // stat
     case 6:   // lstat
-    case 13:  // rt_sigaction [stub]
+    case 13:  // rt_sigaction
     case 14:  // rt_sigprocmask
     case 16:  // ioctl
     case 22:  // pipe
@@ -2466,7 +2564,7 @@ bool is_linux_compat_syscall(std::uint64_t number) {
     case 90:  // chmod
     case 91:  // fchmod
     case 99:  // sysinfo
-    case 131: // sigaltstack [stub]
+    case 131: // sigaltstack
     case 137: // statfs
     case 138: // fstatfs
     case 157: // prctl [stub]

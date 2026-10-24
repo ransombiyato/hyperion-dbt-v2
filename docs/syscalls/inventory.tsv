@@ -43,7 +43,7 @@
 10	mprotect	U4	implemented	Change protection on a memory region.	trace:77
 11	munmap	U4	implemented	Unmap a memory region.	trace:9
 12	brk	U4	implemented	Set the end of the data segment (heap).	trace:84
-13	rt_sigaction	U4	stubbed	Install or query a signal handler.	trace:154
+13	rt_sigaction	U4	implemented	Install or query a signal handler.	trace:154
 14	rt_sigprocmask	U4	implemented	Change or query the signal mask.	trace:22
 15	rt_sigreturn	E1	not-started	Return from a signal handler (kernel-issued trampoline).	trace:2
 16	ioctl	U3	implemented	Device-specific control operation.	trace:34
@@ -161,7 +161,7 @@
 128	rt_sigtimedwait	E2	not-started	Wait for a signal synchronously.	provisional
 129	rt_sigqueueinfo	E2	not-started	Queue a signal with data.	provisional
 130	rt_sigsuspend	E2	not-started	Replace the mask and suspend.	provisional
-131	sigaltstack	U3	stubbed	Set or query the alternate signal stack.	trace:1
+131	sigaltstack	U3	implemented	Set or query the alternate signal stack.	trace:1
 132	utime	U1	not-started	Set file times (legacy).	provisional
 133	mknod	E3	not-started	Create a device or FIFO node.	provisional
 134	uselib	E3	not-started	Load a shared library (obsolete).	provisional

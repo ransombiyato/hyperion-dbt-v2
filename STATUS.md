@@ -71,7 +71,7 @@ works, what was last verified, and what to do next.
 
 **Implemented-syscall status (verified automatically by
 `tools/gen_syscall_inventory.py --check`).** 128 numbers are answered
-today — 121 implemented and 7 stubbed — of the 375 in the pinned kernel
+today — 123 implemented and 5 stubbed — of the 375 in the pinned kernel
 table. The validator now cross-checks three sources in both directions:
 `MinimalSyscallHandler::handle()`, `is_linux_compat_syscall()` (whose numbers carry
 a `[stub]` or `[unsupported]` annotation that decides the expected status), and the
@@ -79,10 +79,10 @@ compatibility layer's adapter table and alias rules. A syscall cannot be counted
 as implemented in the inventory without a handler somewhere, and a handler cannot
 exist without the inventory saying so.
 
-The 7 stubs are `rt_sigaction`(13), `madvise`(28), `sigaltstack`(131),
-`prctl`(157), `fadvise64`(221), `clock_getres`(229) and `futex`(202). They answer
-success without performing the call, or — for `futex` — perform the value
-comparison and then refuse to block, and are listed as `stubbed` rather than
+The 5 stubs are `madvise`(28), `prctl`(157), `fadvise64`(221),
+`clock_getres`(229) and `futex`(202). They answer success without performing the
+call, or — for `futex` — perform the value comparison and then refuse to block,
+and are listed as `stubbed` rather than
 `implemented` because claiming them would be a lie a roadmap could be built on. `rseq`(334) is
 recognised only to be refused cleanly and stays `not-started`.
 
@@ -471,7 +471,7 @@ below, and it is a host limitation, not a passing claim:
 | Syscall inventory | `python3 tools/gen_syscall_inventory.py --check` | OK (0 errors, 0 warnings) |
 | Dispatch microbenchmark | `benchmarks/hyperion_syscall_bench --iterations 300000 --repeats 9` | see `TESTING.md` §6 |
 | Cross (qemu-user) | `scripts/dev.sh cross-test` | **10/10 passed** (see below) |
-| AArch64 unit tests | cross build + `qemu-aarch64-static` | **342 passed, 0 failed, 2 skipped** (of 344) |
+| AArch64 unit tests | cross build + `qemu-aarch64-static` | **344 passed, 0 failed, 2 skipped** (of 346) |
 | AArch64 syscall compat, both tiers | `cross.aarch64_tests` | 11/11 checks per tier |
 | AArch64 tier-1 JIT evidence | compat guest at `--tier=1` | `tier 1: 1412 basic block(s) translated`, `failures 0`, 170 308 steps — same as tier 0 |
 
@@ -804,33 +804,32 @@ stable-vs-noisy discrimination case).
 
 ## 4. Immediate next task
 
-**The syscall compatibility engine is in place** — four-layer dispatch, 39 ABI
+**The syscall compatibility engine is in place** — four-layer dispatch, 40 ABI
 adapters, an external validated registry, a CLI, an installer step and tests at
-three levels (unit, CLI, real-guest). 128 of 375 syscall numbers are answered.
+three levels (unit, CLI, real-guest). 130 of 375 syscall numbers are
+answered.
 
 The next work is ordered by what a real terminal application (the stated target:
 a TUI editor like Fresh) hits, not by syscall number:
 
-1. **`rt_sigaction`(13) and `sigaltstack`(131) are stubs.** Both currently answer
-   success without doing anything. Rust's standard library installs a SIGSEGV
-   handler with an alternate stack for stack-overflow detection, and expects
-   `sigaltstack` to have taken effect. An honest implementation records the
-   action in guest memory and either delivers or explicitly refuses; it must not
-   pretend. This is the highest-value correctness item because a stub that lies
-   is worse than a refusal.
-2. **`ioctl`(16) coverage.** `TIOCGWINSZ` is implemented; a TUI needs `TCGETS`/
-   `TCSETS` (raw mode, what every terminal app calls through `cfmakeraw`),
-   `TIOCSWINSZ`, and `FIONREAD`. Each is a small, testable addition with a
-   well-defined guest layout, and `TERMIOS` on x86-64 and AArch64 differ in
-   `c_cc` ordering — the exact class of bug the adapter layer exists for.
+1. ~~`rt_sigaction`(13) and `sigaltstack`(131) are stubs~~ — **done.** Both now
+   record and report the guest's own state: the 32-byte x86-64 `struct sigaction`
+   per signal (1..64), and the 24-byte `stack_t`. `SIGKILL`/`SIGSTOP` are refused
+   with `EINVAL`, `sigsetsize != 8` is `EINVAL`, bad pointers are `EFAULT`, and a
+   stack below the kernel floor (2048 B) is `ENOMEM`. What is *not* done, and is
+   now stated as such (`LIM-022`), is **delivering** a signal to a guest handler.
+2. ~~`ioctl`(16) coverage~~ — **done**: `TCGETS`/`TCSETS`/`TCSETSW`/`TCSETSF`,
+   `TIOCSWINSZ`, `FIONREAD`, with the x86-64/AArch64 `c_cc` difference in an
+   adapter and a unit test per direction.
 3. ~~Cross-architecture verification~~ — **done**: the cross tree passes 10/10,
    the AArch64 unit suite is 342/0/2, and the compat guest runs at tier 1 with
    1412 translated blocks and identical step counts. Keep it that way: the
    driver now fails if tier 1 falls back to the interpreter.
-4. **`futex`(202) is implemented but not `validated`.** It was written before the
-   adapter layer and is only exercised indirectly. A guest that creates threads
-   will lean on it hard; it needs the same test treatment as the adapters
-   (bit-set/wait, timeout, `-EAGAIN`, cancellation) before it is called done.
+4. **`futex`(202) needs a real wait queue.** The value comparison is now
+   honest (`-EAGAIN`/`-EFAULT`) and `WAKE` reports zero woken truthfully, but
+   `FUTEX_WAIT` on a matching value returns `-ENOSYS`. A threaded guest needs
+   actual blocking, which means a futex table keyed on host addresses plus a
+   wake path — the largest remaining correctness item for running real programs.
 5. **Sockets** (`socket`(41), `connect`(42), `bind`(49), `listen`(50), …) are
    `not-started`. A TUI editor that spawns a language server needs them, but
    they are a large, separable piece — do them after 1–2.

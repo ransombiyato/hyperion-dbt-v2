@@ -41,6 +41,7 @@
 #ifndef HYPERION_SYSCALL_HPP
 #define HYPERION_SYSCALL_HPP
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -503,6 +504,26 @@ private:
     bool linux_compat_ = false;
     std::string sysroot_;
     std::uint64_t sigmask_ = 0;
+    // Installed signal dispositions, exactly as the guest wrote them (the x86-64
+    // kernel's 32-byte `struct sigaction`: handler, flags, restorer, mask).
+    // Recording them is what makes sigaction()/signal() round-trip: a program
+    // that installs a handler and reads it back sees what it installed, instead
+    // of the zeroed block this layer used to hand back. Delivery is a separate
+    // mechanism and is not implemented - see COMPATIBILITY.md.
+    static constexpr std::size_t kMaxSignal = 64;
+    struct GuestSignalAction {
+        std::uint64_t handler = 0; // SIG_DFL (0), SIG_IGN (1), or a guest address
+        std::uint64_t flags = 0;
+        std::uint64_t restorer = 0;
+        std::uint64_t mask = 0;
+        bool installed = false;
+    };
+    std::array<GuestSignalAction, kMaxSignal + 1> sigactions_{};
+    // sigaltstack(2): the guest's alternate signal stack, as it wrote it
+    // (24-byte stack_t: ss_sp, ss_flags, ss_size).
+    std::uint64_t altstack_sp_ = 0;
+    std::int32_t altstack_flags_ = 2; // SS_DISABLE
+    std::uint64_t altstack_size_ = 0;
 
     // --- process state ------------------------------------------------------
     std::vector<ChildProcess> children_; // children this guest created
