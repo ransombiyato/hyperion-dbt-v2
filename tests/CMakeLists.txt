@@ -7,6 +7,10 @@ target_link_libraries(hyperion_test_harness PUBLIC hyperion::core hyperion_warni
 
 add_executable(hyperion_unit_tests
     unit/test_version.cpp
+    unit/test_json.cpp
+    unit/test_syscall_registry.cpp
+    unit/test_syscall_dispatch.cpp
+    unit/test_syscall_adapters.cpp
     unit/test_host_probe.cpp
     unit/test_bench_stats.cpp
     unit/test_guest_state.cpp

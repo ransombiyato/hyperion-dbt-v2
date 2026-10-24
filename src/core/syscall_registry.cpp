@@ -547,9 +547,14 @@ RegistryDocument document_from_json(const json::Value& root, std::vector<std::st
                          ")");
         return document;
     }
-    if (schema > 1000) {
+    if (schema > kRegistrySchemaVersion) {
+        // Never interpret a document written for a newer HYPERION: the fields
+        // it relies on may not exist yet, and silently ignoring them could
+        // change which syscalls are claimed.
         errors.push_back("document: schema_version " + std::to_string(schema) +
-                         " is implausible; refusing to interpret it");
+                         " is newer than this build supports (" +
+                         std::to_string(kRegistrySchemaVersion) +
+                         "); the file was left untouched");
         return document;
     }
     document.schema_version = static_cast<int>(schema);

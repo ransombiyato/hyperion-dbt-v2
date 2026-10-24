@@ -97,8 +97,9 @@ constexpr const char* kPathAndBuffer[] = {kTransformPathSysroot, kTransformGuest
 constexpr const char* kFdOnly[] = {kTransformGuestFd, nullptr};
 constexpr const char* kFdAndBuffer[] = {kTransformGuestFd, kTransformGuestBuffer, nullptr};
 constexpr const char* kEpollCtl[] = {kTransformGuestFd, kTransformEpollEvent, nullptr};
-constexpr const char* kEpollWait[] = {kTransformGuestFd, kTransformEpollEvent,
-                                      kTransformSigmask, nullptr};
+constexpr const char* kEpollWait[] = {kTransformGuestFd, kTransformEpollEvent, nullptr};
+constexpr const char* kEpollWaitMasked[] = {kTransformGuestFd, kTransformEpollEvent,
+                                            kTransformSigmask, nullptr};
 constexpr const char* kPollWait[] = {kTransformGuestFd, kTransformPollfd, kTransformSigmask,
                                      nullptr};
 constexpr const char* kSelectWait[] = {kTransformGuestFd, kTransformFdSet, kTransformTimespec,
@@ -668,7 +669,8 @@ std::int64_t adapter_epoll_ctl(SyscallContext& ctx) {
 // Shared body of epoll_pwait (millisecond timeout) and epoll_pwait2 (guest
 // timespec timeout). The guest's epoll_event array is 12 packed bytes per entry;
 // the host's is 16, so entries are converted one at a time and never memcpy'd.
-std::int64_t epoll_wait_common(SyscallContext& ctx, bool timespec_timeout) {
+std::int64_t epoll_wait_common(SyscallContext& ctx, bool timespec_timeout,
+                               bool has_sigmask_args) {
     const std::int64_t epfd = ctx.host_fd(ctx.arg_i32(0));
     if (epfd < 0) {
         return epfd;
@@ -685,8 +687,10 @@ std::int64_t epoll_wait_common(SyscallContext& ctx, bool timespec_timeout) {
         return -kEinval;
     }
     const std::uint64_t timeout_address = ctx.arg(3);
-    const std::uint64_t sigmask_address = ctx.arg(4);
-    const std::uint64_t sigsetsize = ctx.arg(5);
+    // epoll_wait(2) has no signal-mask arguments at all: reading r8/r9 for it
+    // would interpret caller scratch as a pointer.
+    const std::uint64_t sigmask_address = has_sigmask_args ? ctx.arg(4) : 0;
+    const std::uint64_t sigsetsize = has_sigmask_args ? ctx.arg(5) : 0;
 
     if (sigmask_address != 0 && sigsetsize != 8) {
         // The guest's signal mask is modelled inside the handler, not by the host
@@ -697,8 +701,9 @@ std::int64_t epoll_wait_common(SyscallContext& ctx, bool timespec_timeout) {
     }
 
     int timeout_ms = -1;
-    if (timeout_address != 0) {
-        if (timespec_timeout) {
+    if (timespec_timeout) {
+        // epoll_pwait2(2) is the only variant whose timeout is a pointer.
+        if (timeout_address != 0) {
             struct timespec spec {};
             if (!ctx.copy_in(timeout_address, &spec, kGuestTimespecSize)) {
                 return -kEfault;
@@ -711,13 +716,13 @@ std::int64_t epoll_wait_common(SyscallContext& ctx, bool timespec_timeout) {
                 static_cast<std::int64_t>(spec.tv_sec) * 1000 +
                 (static_cast<std::int64_t>(spec.tv_nsec) + 999999) / 1000000;
             timeout_ms = millis > INT_MAX ? INT_MAX : static_cast<int>(millis);
-        } else {
-            std::int32_t millis = 0;
-            if (!ctx.copy_in(timeout_address, &millis, sizeof(millis))) {
-                return -kEfault;
-            }
-            timeout_ms = millis < 0 ? -1 : static_cast<int>(millis);
         }
+    } else {
+        // epoll_wait/epoll_pwait take the millisecond timeout *by value* in the
+        // fourth argument register, exactly as the kernel does. Treating it as a
+        // pointer (the natural mistake) turns every call into -EFAULT.
+        const std::int32_t millis = static_cast<std::int32_t>(timeout_address);
+        timeout_ms = millis < 0 ? -1 : static_cast<int>(millis);
     }
 
     std::vector<struct epoll_event> host_events(static_cast<std::size_t>(maxevents));
@@ -736,9 +741,17 @@ std::int64_t epoll_wait_common(SyscallContext& ctx, bool timespec_timeout) {
     return static_cast<std::int64_t>(ready);
 }
 
-std::int64_t adapter_epoll_pwait(SyscallContext& ctx) { return epoll_wait_common(ctx, false); }
+std::int64_t adapter_epoll_wait(SyscallContext& ctx) {
+    return epoll_wait_common(ctx, false, false);
+}
 
-std::int64_t adapter_epoll_pwait2(SyscallContext& ctx) { return epoll_wait_common(ctx, true); }
+std::int64_t adapter_epoll_pwait(SyscallContext& ctx) {
+    return epoll_wait_common(ctx, false, true);
+}
+
+std::int64_t adapter_epoll_pwait2(SyscallContext& ctx) {
+    return epoll_wait_common(ctx, true, true);
+}
 
 // --- poll / select ------------------------------------------------------------
 
@@ -789,7 +802,12 @@ std::int64_t poll_common(SyscallContext& ctx, int timeout_ms) {
         std::uint8_t raw[kGuestPollfdSize] = {};
         syscall_detail::put_u32(raw, 0,
                                 static_cast<std::uint32_t>(guest_fds_backup[index]));
+        // struct pollfd { int fd; short events; short revents; }
+        // `events` is an input the kernel leaves alone, so it is written back
+        // unchanged rather than dropped.
         syscall_detail::put_u32(raw, 4, static_cast<std::uint32_t>(
+                                            static_cast<std::uint16_t>(host_fds[index].events)));
+        syscall_detail::put_u32(raw, 6, static_cast<std::uint32_t>(
                                             static_cast<std::uint16_t>(host_fds[index].revents)));
         if (!ctx.copy_out(fds_address + static_cast<std::uint64_t>(i) * kGuestPollfdSize, raw,
                           sizeof(raw))) {
@@ -1158,6 +1176,13 @@ const AdapterDescriptor kAdapterTable[] = {
      kAdapterNone,
      "flush all filesystems",
      nullptr},
+    {"compat.epoll_wait",
+     232,
+     "epoll_wait",
+     adapter_epoll_wait,
+     kAdapterNone,
+     "wait for epoll events (millisecond timeout)",
+     kEpollWait},
     {"compat.epoll_ctl",
      233,
      "epoll_ctl",
@@ -1262,7 +1287,7 @@ const AdapterDescriptor kAdapterTable[] = {
      adapter_epoll_pwait2,
      kAdapterNone,
      "wait for epoll events (nanosecond timeout)",
-     kEpollWait},
+     kEpollWaitMasked},
 };
 
 constexpr std::size_t kAdapterCount = sizeof(kAdapterTable) / sizeof(kAdapterTable[0]);

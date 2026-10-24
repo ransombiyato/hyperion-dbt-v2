@@ -31,6 +31,10 @@ INVENTORY = SYSDIR / "inventory.tsv"
 KERNEL_TABLE = SYSDIR / "kernel-table-x86_64-6.12.tsv"
 SYSCALL_HPP = ROOT / "include" / "hyperion" / "syscall.hpp"
 SYSCALL_CPP = ROOT / "src" / "core" / "syscall.cpp"
+# The compatibility-adapter layer implements further syscalls outside the
+# original switch. It is scanned too, so "implemented in C++" means what the
+# whole handler implements rather than one file of it.
+SYSCALL_ADAPTERS_CPP = ROOT / "src" / "core" / "syscall_adapters.cpp"
 
 USAGE_TIERS = ["U4", "U3", "U2", "U1"]
 EXTRA_TIERS = ["E1", "E2", "E3"]
@@ -152,6 +156,26 @@ def validate(rows, kernel, verbose=True):
         errors.append(f"extra: syscall {nr} is in the inventory but not common/64 in the "
                       f"kernel table")
 
+    # 4b. syscalls reachable only through the compatibility layer must be
+    #     implemented too: the adapter table and the alias rules are scanned so
+    #     a syscall cannot be marked implemented in the inventory without a real
+    #     handler somewhere, and an adapter cannot exist unnoticed by the
+    #     inventory.
+    adapter_nrs = set()
+    alias_nrs = set()
+    if SYSCALL_ADAPTERS_CPP.exists():
+        adapters_text = SYSCALL_ADAPTERS_CPP.read_text()
+        # Contract with src/core/syscall_adapters.cpp: every row of
+        # `kAdapterTable` begins with {"<handler-id>", <syscall-number>, and every
+        # shipped alias rule assigns `rule.syscall = <number>;`.
+        adapter_nrs = {int(m.group(2)) for m in re.finditer(
+            r'\{"(compat\.[a-z0-9_]+)",\s*(\d+),', adapters_text)}
+        alias_nrs = {int(m.group(1)) for m in re.finditer(
+            r"rule\.syscall = (\d+);", adapters_text)}
+        if not adapter_nrs:
+            errors.append("C++ sync: no adapters found in src/core/syscall_adapters.cpp "
+                          "(the scanner and the table have drifted apart)")
+
     # 5. bidirectional C++ implementation sync: every `case sysno::kX:` handled
     #    in MinimalSyscallHandler::handle() and listed in is_minimal_syscall()
     #    must match `status != 'not-started'` in inventory.tsv.
@@ -187,6 +211,7 @@ def validate(rows, kernel, verbose=True):
                     f"and is_minimal_syscall()"
                 )
             cpp_implemented_nrs = {sysno_map[s] for s in handled_syms if s in sysno_map}
+            cpp_implemented_nrs |= adapter_nrs | alias_nrs
             tsv_implemented_nrs = {r.nr for r in rows if r.status != "not-started"}
             for nr in sorted(cpp_implemented_nrs - tsv_implemented_nrs):
                 errors.append(

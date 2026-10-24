@@ -16,6 +16,23 @@ target_link_libraries(hyperion_bench PRIVATE hyperion::core hyperion_warnings)
 add_executable(hyperion_tier_bench tier_bench.cpp)
 target_link_libraries(hyperion_tier_bench PRIVATE hyperion::core hyperion_warnings)
 
+# Syscall dispatch microbenchmark (Phase 6 compatibility layer). Measures the cost
+# of one dispatch through each layer against a bare host syscall.
+add_executable(hyperion_syscall_bench syscall_bench.cpp)
+target_link_libraries(hyperion_syscall_bench PRIVATE hyperion::core hyperion_warnings)
+
+add_test(NAME syscall_bench.smoke
+    COMMAND hyperion_syscall_bench --iterations 20000 --repeats 3 --json)
+set_tests_properties(syscall_bench.smoke PROPERTIES LABELS "bench;smoke;syscall")
+
+# The benchmark must reject a single sample rather than publish a spread it
+# cannot compute - same rule as the host harness.
+add_test(NAME syscall_bench.rejects_single_sample
+    COMMAND ${CMAKE_COMMAND}
+        -DHYPERION_BENCH_BIN=$<TARGET_FILE:hyperion_syscall_bench>
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/../tests/bench_rejects_bad_args.cmake")
+set_tests_properties(syscall_bench.rejects_single_sample PROPERTIES LABELS "bench;syscall")
+
 # Correctness smoke: both tiers produce the right result for a small loop. Runs
 # on every host (on x86-64 only tier 0 executes; the script tolerates that).
 add_test(NAME tier_bench.smoke COMMAND hyperion_tier_bench --iterations 1000 --repeats 3 --json)
