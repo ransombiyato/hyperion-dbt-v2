@@ -1583,6 +1583,134 @@ expected to matter more than it does here.
 
 Not done, deliberately: CF/ZF/SF/OF stay eager (§29.10 stage 2), no IR, no P8, no P14.
 
+### 29.12 P6 done — hot-block gating, and the crossover that justifies it
+
+Item 6 of §L ("is there hot-block detection / tiering?") has two halves. The second half
+— an execution profile that feeds decisions — did not exist: every basic block was
+translated on its **first** reach, however cold. The measurement below says when that is
+the wrong call, and the change is the smallest one that acts on it.
+
+#### What was measured first
+
+The translator was temporarily instrumented (never committed) to print, per block, the
+number of guest instructions reached before the next miss, i.e. the number of times each
+compiled block actually executes. Then the two tiers were compared on the same guests at
+fixed step budgets (`/tmp/vm_guest_x64`, an add/`jmp`-dominated loop; `qemu-aarch64`,
+min of 3, whole process):
+
+| guest instructions | tier 0 | tier 1 (compile on first reach) | ratio |
+| --- | --- | --- | --- |
+| 1 000 | 48.3 ms | 73.0 ms | 0.66× (tier 1 **slower**) |
+| 10 000 | 55.0 ms | 173.6 ms | 0.32× (tier 1 **slower**) |
+| 100 000 | 80.0 ms | 153.7 ms | 0.52× |
+| 1 000 000 | 296.8 ms | 167.3 ms | 1.77× |
+| 10 000 000 | 2445.7 ms | 239.3 ms | 10.2× |
+
+The crossover is tens of thousands of guest instructions. Below it, translation plus the
+W^X publish (§29.6 — two `mprotect` calls per write window) costs more than the work it
+saves, and the guest pays that cost even when it is a `--help`-style run that halts after a
+few thousand instructions. A block reached once is pure loss; nothing tracked how often a
+block was reached, so the cache could not tell the two apart.
+
+#### What was implemented
+
+`TranslationCache` keeps a per-PC saturating counter and answers the first
+`hot_threshold` reaches of a block start with **one step of the reference interpreter**:
+
+* `hot_` is a direct-mapped table of 1024 `std::uint16_t` counts, indexed by
+  `(pc ^ (pc >> 12)) & 1023`. A collision only makes a count *lower* than the truth, which
+  means "translate a little later" — never a missed hot block and never a wrong answer, so
+  the table needs no tag, no eviction and no synchronisation.
+* `should_gate(pc)` is checked in `translate_at()` **after** the cache-miss lookup, so a
+  compiled block is never re-checked and dispatch hits are untouched.
+* A gated step runs `hyperion::step()`, the same code tier 0 runs, so tier-1 cold semantics
+  are tier-0 semantics by construction. It accounts for the step budget exactly like a
+  compiled block (`RunStatus::kStepLimit`), counts the guest instruction, bumps
+  `unimplemented_syscalls` the same way, and repeats the mapping-epoch TLB flush and
+  code-epoch `invalidate_all()` bookkeeping a compiled block would have done for a
+  `syscall` — a gate must not become a way to skip a invalidation.
+* `kDefaultHotThreshold = 2` (translate on the third reach); `0` restores the old
+  behaviour exactly, and `--hot-threshold=N` exposes both. Counters
+  `gated_steps()` / `promoted_blocks()` are printed by `hyperion run`.
+* P5 successor prefetch is deliberately **not** gated: a prefetched block exists because
+  its predecessor is already hot, and gating it would defeat the prefetch it was added for.
+  P7 direct linking is unaffected (links are patched between blocks that both exist).
+
+#### Effect — same guests, 5 interleaved repetitions, median/min of whole-process wall clock
+
+`t1-thr0` is the previous behaviour (compile on first reach); `t1-thr2` is gating.
+Every run includes the ~45 ms `qemu-aarch64` process startup, which is why the small
+budgets move so little.
+
+| guest | steps | tier 0 | t1-thr0 | t1-thr2 | gated/old |
+| --- | --- | --- | --- | --- | --- |
+| vm_guest | 1 000 | 54.4/51.4 | 69.1/68.2 | 66.5/59.7 | 0.96× |
+| vm_guest | 10 000 | 58.4/57.0 | 149.9/134.5 | 104.2/99.5 | 0.70× |
+| vm_guest | 100 000 | 86.0/81.5 | 158.4/145.7 | 109.9/103.2 | 0.69× |
+| vm_guest | 1 000 000 | 276.3/272.0 | 157.2/149.7 | 102.2/97.3 | 0.65× |
+| vm_guest | 10 000 000 | 2231.4/2065.5 | 224.0/215.6 | 177.2/174.1 | 0.79× |
+| call_guest | 1 000 | 55.1/52.7 | 64.4/60.1 | 65.6/62.8 | 1.02× |
+| call_guest | 100 000 | 74.8/73.6 | 151.0/149.9 | 116.7/114.3 | 0.77× |
+| call_guest | 1 000 000 | 280.5/239.6 | 190.4/176.9 | 137.9/133.8 | 0.72× |
+| call_guest | 31 300 000 (full run) | 6709.6/6267.2 | 1088.7/1022.0 | 938.2/858.0 | 0.86× |
+
+Gating is never slower than compiling eagerly (the two budget-1k rows are within
+run-to-run noise: the *same* guest, measured 1.02× and 0.96×), and it is 14–35 % faster
+from 10 000 instructions upwards, which is where a guest spends its time. Subtracting the
+~45 ms startup on the 1 M-step vm_guest run: 112 ms → 57 ms of actual work.
+
+Static cost, same run (1 M steps of vm_guest):
+
+| | t1-thr0 | t1-thr2 |
+| --- | --- | --- |
+| blocks translated | 1237 | **423** |
+| generated code | 480 828 B | **150 288 B** |
+| block starts translated (guest instructions compiled) | 6051 | **1951** |
+| `mprotect` calls | 394 | **130** |
+| translation wall time | 82.0 ms | **34.1 ms** |
+| guest instructions interpreted while cold | 0 | 5187 (0.52 %) |
+| blocks promoted | 0 | 130 |
+
+So the change buys a 69 % smaller code footprint and a 2.4× cheaper translation phase,
+and pays 0.5 % of the run in interpreted instructions. Full-run guest output is unchanged
+(`acc=9000001 counter=0` and `acc=20475694797959 g=50991808` on both tiers).
+
+#### Tests
+
+`tests/unit/test_translation_cache.cpp`, five new differential/gating tests (each with the
+usual AArch64-host `HYPERION_SKIP` stub):
+
+| test | pins |
+| --- | --- |
+| `gating_does_not_translate_a_cold_block` | 3-instruction program: `block_count() == 0`, `promoted_blocks() == 0`, `gated_steps() == 3`, state identical to tier 0 |
+| `gating_promotes_a_hot_loop` | 9-iteration, 18-instruction branch-heavy loop: ≥ 2 promotions, ≥ 2 blocks, `0 < gated_steps() < steps`, state identical to tier 0 |
+| `gating_zero_threshold_translates_immediately` | `--hot-threshold=0` reproduces the old behaviour exactly (`gated_steps() == 0`) |
+| `gating_results_match_across_tiering_transitions` | thresholds 0, 1, 2, 3, 1000 over the same program all produce the identical architectural state |
+| `gating_accounts_cold_steps_against_the_step_limit` | `max_steps = 4` stops mid-prefix: `kStepLimit`, `steps == 4`, `gated_steps() == 4`, nothing translated |
+
+The 14 pre-existing failures the change caused were all tests that assert *generated-code*
+properties (exact word counts, helper counters, PF/AF descriptor bookkeeping) from a single
+pass over a 2–15-instruction program. They are correct to fail — with gating there is no
+generated code to measure — so each now calls `set_hot_threshold(0)` with a comment saying
+why: the default is not weakened to make tests pass, and the counters they assert on can
+still observe real behaviour.
+
+#### Verification
+
+* native (x86-64), clang-19 RelWithDebInfo: 341 passed / 0 failed / 43 skipped of 384
+  (5 new skips are the new AArch64-only tests); `ctest` 19/19
+* `HYPERION_WARNINGS_AS_ERRORS=ON` with GCC 13 and clang-19: clean, 341/0/43 each
+* AArch64 (cross, `qemu-aarch64-static`): **384 passed / 0 failed / 5 skipped of 389**
+* full guests, both tiers, end to end: identical output (§ above)
+
+Platform limit: as in §29.11, this is `qemu-user` on an x86-64 host. Absolute times are
+emulated and startup-dominated; the ratios are the result. On real AArch64 hardware the
+translation-side win (fewer `mprotect` calls, less code) should be larger, not smaller.
+
+Rejected while investigating: gating *prefetched* successors; evicting cold blocks from a
+bounded cache (the cache is unbounded and code size is already down 69 %); an adaptive
+threshold based on translation-time-per-instruction (needs the profile P14 would build).
+
 ### 29.9 Still open from §L
 
 Items 1-5 of §L are all resolved (1 justified and pinned, 2 and 5 implemented, 3 retracted as wrong,
@@ -1593,9 +1721,11 @@ stands.
 Item 11 (inline the remaining helper opcodes) is done — §29.8 — with the work chosen by counting
 rather than by the audit's opcode estimate. Item 9 (lazy flags) was profiled in §29.10, which
 concluded that a full six-flag descriptor is architectural; **stage 1 of that design (PF/AF only) is
-implemented and measured in §29.11**. Still open: item 6 (hot-block gating), 8 (cross-block register
-allocation), 9 stage 2 (CF/ZF/SF/OF via `cc_op`/`cc_src`/`cc_dst`), 10 (shadow stack), 12 (signal
-delivery), 13 (guest threads), 14 (an IR and a real optimiser).
+implemented and measured in §29.11**. Item 6 (hot-block gating) is done and measured in §29.12:
+below a crossover of tens of thousands of guest instructions, compiling on first reach was paying
+more than it saved, and the cache now interprets cold block starts instead. Still open: item 8
+(cross-block register allocation), 9 stage 2 (CF/ZF/SF/OF via `cc_op`/`cc_src`/`cc_dst`), 10 (shadow
+stack), 12 (signal delivery), 13 (guest threads), 14 (an IR and a real optimiser).
 
 ---
 

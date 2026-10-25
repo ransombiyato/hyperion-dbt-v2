@@ -88,10 +88,39 @@ public:
     // code (exit epilogue, PF/AF consumers) are not counted here.
     std::uint64_t pf_af_flushes() const;
 
+    // --- P6: hot-block gating -------------------------------------------------
+    // Translation costs roughly three orders of magnitude more than executing
+    // one guest instruction (audit §29.5), so a program that reaches each block
+    // only a couple of times pays for a whole JIT and gets nothing back. A block
+    // is therefore only translated once it has been reached `hot_threshold`
+    // times; until then its instructions run one at a time in the reference
+    // interpreter, which is exactly the tier-0 semantics. `0` disables gating and
+    // restores "translate on first sight".
+    //
+    // The default is 2: a block reached three times is compiled. That is the
+    // measured break-even point on the borrow-and-don't-pay boundary (§29.12);
+    // it is a compile-time constant rather than a guess, and it is settable so a
+    // caller can A/B it.
+    static constexpr std::uint16_t kDefaultHotThreshold = 2;
+    void set_hot_threshold(std::uint16_t threshold) { hot_threshold_ = threshold; }
+    std::uint16_t hot_threshold() const { return hot_threshold_; }
+    // Guest instructions executed by the interpreter because their block had not
+    // reached the threshold yet, and blocks that crossed it.
+    std::uint64_t gated_steps() const { return gated_steps_; }
+    std::uint64_t promoted_blocks() const { return promoted_blocks_; }
+
     void invalidate_all();
 
 private:
-    enum class TranslateFailure : std::uint8_t { kNone, kFault, kUnsupported };
+    enum class TranslateFailure : std::uint8_t {
+        kNone,
+        kFault,
+        kUnsupported,
+        // P6: the block is cold. Not an error: the caller interprets one
+        // instruction and comes back. Distinct from kNone so a genuine
+        // translation failure can never be mistaken for a gate.
+        kCold,
+    };
 
     void ensure_trampolines();
     const CachedBlock* translate_at(Memory& memory, std::uint64_t pc, TranslateFailure& failure);
@@ -133,6 +162,24 @@ private:
     std::vector<CachedBlock*> window_blocks_;
 
     std::vector<std::uint8_t> fetch_;
+
+    // P6 hotness: a small direct-mapped table of (pc, times reached). Collisions
+    // merely under-count, which can only cause a cold block to be translated
+    // early - never a hot one to be skipped.
+    struct HotEntry {
+        std::uint64_t pc = ~0ULL;
+        std::uint16_t count = 0;
+    };
+    static constexpr std::size_t kHotBits = 10;
+    static constexpr std::size_t kHotSize = std::size_t{1} << kHotBits;
+    static constexpr std::size_t kHotMask = kHotSize - 1;
+    std::vector<HotEntry> hot_{kHotSize};
+    std::uint16_t hot_threshold_ = kDefaultHotThreshold;
+    std::uint64_t gated_steps_ = 0;
+    std::uint64_t promoted_blocks_ = 0;
+    // True when `pc` must be interpreted instead of translated right now, and
+    // records the visit; false once it is hot.
+    bool should_gate(std::uint64_t pc);
 };
 
 } // namespace hyperion

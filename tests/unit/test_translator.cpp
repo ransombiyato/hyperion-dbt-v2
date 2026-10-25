@@ -544,6 +544,10 @@ HYPERION_TEST("translator", "translated_code_size_is_bounded") {
     GuestState initial;
     initial.rip = kBase;
     hyperion::TranslationCache cache;
+    // This test pins the *generated* code size, so every block must actually be
+    // compiled. Hot-block gating (P6) would leave the two blocks reached once or
+    // twice interpreted; it has its own tests.
+    cache.set_hot_threshold(0);
     const hyperion::RunResult r = cache.run(mem, initial);
     HYPERION_CHECK(r.status == hyperion::RunStatus::kOk);
     HYPERION_CHECK_EQ(r.state.reg(Gpr::kRdx), std::uint64_t{3});
@@ -586,6 +590,7 @@ HYPERION_TEST("translator", "alu_immediate_is_folded") {
         GuestState st;
         st.rip = kBase;
         hyperion::TranslationCache cache;
+        cache.set_hot_threshold(0); // measuring generated code, not gating
         const hyperion::RunResult r = cache.run(mem, st);
         HYPERION_CHECK(r.status == hyperion::RunStatus::kOk);
         return cache.total_code_bytes() / 4;
@@ -618,6 +623,7 @@ HYPERION_TEST("translator", "dead_flags_are_not_computed") {
         GuestState st;
         st.rip = kBase;
         hyperion::TranslationCache cache;
+        cache.set_hot_threshold(0); // measuring generated code, not gating
         const hyperion::RunResult r = cache.run(mem, st);
         HYPERION_CHECK(r.status == hyperion::RunStatus::kOk);
         return cache.total_code_bytes() / 4;

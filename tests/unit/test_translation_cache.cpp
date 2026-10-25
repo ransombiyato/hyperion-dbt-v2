@@ -101,6 +101,10 @@ HYPERION_TEST("translation_cache", "direct_map_collision_falls_back_to_map") {
     std::memcpy(mem.data() + 0x1000, second.data(), second.size());
 
     TranslationCache cache;
+    // This test is about the direct-map fast path and the map fallback, so every
+    // reach must compile: hot-block gating (P6) would leave the first reaches of
+    // each PC interpreted and `block_count()` would not reach 2.
+    cache.set_hot_threshold(0);
 
     GuestState a;
     a.rip = kBase;
@@ -328,6 +332,10 @@ HYPERION_TEST("translation_cache", "helper_counter_is_not_always_zero") {
     initial.rip = kBase;
     initial.reg(Gpr::kRcx) = 2;
     TranslationCache cache;
+    // The assertion below is about the *helper* counter, which only moves when
+    // the block was compiled, so gating is off for this three-instruction
+    // program (see the note in p9::run_cached).
+    cache.set_hot_threshold(0);
     const hyperion::RunResult r = cache.run(mem, initial);
     HYPERION_CHECK(r.status == RunStatus::kOk);
     HYPERION_CHECK_EQ(r.state.reg(Gpr::kRax), std::uint64_t{0}); // 1 / 2 = 0
@@ -400,6 +408,12 @@ Outcome run_cached(const std::vector<std::uint8_t>& program, const GuestState& i
     FlatMemory mem(kBase, kMemSize);
     std::memcpy(mem.data(), program.data(), program.size());
     TranslationCache cache;
+    // These are two- to fifteen-instruction programs that run each block once.
+    // Hot-block gating (P6) would correctly interpret them instead of compiling
+    // them, so the descriptor machinery under test would never execute and every
+    // case would pass for the wrong reason. Gating is therefore switched off
+    // here; it is covered on its own by the `gating_*` tests below.
+    cache.set_hot_threshold(0);
     Outcome out;
     out.result = cache.run(mem, initial);
     out.deferred = cache.pf_af_deferred();
@@ -627,6 +641,184 @@ HYPERION_TEST("translation_cache", "pf_consumer_in_the_successor_block_forces_ma
     p9::check_matches("successor consumer", program, initial);
 }
 
+// --- P6: hot-block gating ---------------------------------------------------
+//
+// A block that is reached once is not worth compiling: translation plus the
+// W^X publish costs more than interpreting its instructions, and the profile in
+// docs/translator-audit.md §29.12 puts the break-even at tens of thousands of
+// guest instructions. `TranslationCache` therefore counts how often each block
+// start PC is reached and answers the first `hot_threshold` reaches with the
+// reference interpreter instead of generating code. These tests pin the three
+// properties that matter: a cold block is *not* translated, a hot block *is*,
+// and the observable result is identical either way.
+namespace p6 {
+
+// The branch-heavy program below, assembled and checked with as/objdump:
+//   xor eax, eax / mov ecx, 9
+// L: add eax, ecx / cmp eax, 20 / ja high / sub edx, 3 / jmp next
+// high: xor esi, esi / or edi, 1
+// next: dec ecx / jnz L / hlt
+// Nine iterations with a taken/not-taken mix: enough reaches for every block in
+// the loop to cross the default threshold, and enough distinct blocks (three)
+// that a linking or promotion bug changes the answer.
+const std::vector<std::uint8_t> kBranchHeavy = {
+    0x31, 0xC0,                   // xor eax, eax
+    0xB9, 0x09, 0x00, 0x00, 0x00, // mov ecx, 9
+    0x01, 0xC8,                   // add eax, ecx
+    0x83, 0xF8, 0x14,             // cmp eax, 20
+    0x77, 0x05,                   // ja high
+    0x83, 0xEA, 0x03,             // sub edx, 3
+    0xEB, 0x05,                   // jmp next
+    0x31, 0xF6,                   // xor esi, esi   (high)
+    0x83, 0xCF, 0x01,             // or edi, 1
+    0xFF, 0xC9,                   // dec ecx        (next)
+    0x75, 0xEB,                   // jnz L
+    0xF4,                         // hlt
+};
+
+struct Run {
+    hyperion::RunResult result;
+    std::size_t blocks = 0;
+    std::uint64_t gated = 0;
+    std::uint64_t promoted = 0;
+};
+
+Run run_gated(const std::vector<std::uint8_t>& program, const GuestState& initial,
+              std::uint16_t threshold = hyperion::TranslationCache::kDefaultHotThreshold,
+              std::uint64_t max_steps = 1'000'000) {
+    FlatMemory mem(kBase, kMemSize);
+    std::memcpy(mem.data(), program.data(), program.size());
+    TranslationCache cache;
+    cache.set_hot_threshold(threshold);
+    Run out;
+    out.result = cache.run(mem, initial, max_steps);
+    out.blocks = cache.block_count();
+    out.gated = cache.gated_steps();
+    out.promoted = cache.promoted_blocks();
+    return out;
+}
+
+hyperion::RunResult run_reference(const std::vector<std::uint8_t>& program,
+                                  const GuestState& initial, std::uint64_t max_steps = 1'000'000) {
+    FlatMemory mem(kBase, kMemSize);
+    std::memcpy(mem.data(), program.data(), program.size());
+    return hyperion::run_program(mem, initial, max_steps);
+}
+
+// Full architectural state, so "gating is invisible" is checked on everything
+// the two tiers could disagree about, and not just on rax.
+void check_same_state(const char* what, const hyperion::RunResult& got,
+                      const hyperion::RunResult& want) {
+    bool same = got.status == want.status && got.steps == want.steps &&
+                got.state.rip == want.state.rip && got.state.flags == want.state.flags;
+    for (std::size_t i = 0; i < hyperion::kGprCount; ++i) {
+        same = same && got.state.gpr[i] == want.state.gpr[i];
+    }
+    if (!same) {
+        std::fprintf(
+            stderr,
+            "  P6 mismatch in %s: status %d/%d steps %llu/%llu rip 0x%llx/0x%llx "
+            "cf/pf/af/zf/sf/of %d%d%d%d%d%d vs %d%d%d%d%d%d\n",
+            what, static_cast<int>(got.status), static_cast<int>(want.status),
+            static_cast<unsigned long long>(got.steps), static_cast<unsigned long long>(want.steps),
+            static_cast<unsigned long long>(got.state.rip),
+            static_cast<unsigned long long>(want.state.rip), got.state.flags.cf, got.state.flags.pf,
+            got.state.flags.af, got.state.flags.zf, got.state.flags.sf, got.state.flags.of,
+            want.state.flags.cf, want.state.flags.pf, want.state.flags.af, want.state.flags.zf,
+            want.state.flags.sf, want.state.flags.of);
+    }
+    HYPERION_CHECK(same);
+    // Whatever tier produced the last instruction, the descriptor must have been
+    // published before C++ could look at the state.
+    HYPERION_CHECK_EQ(static_cast<unsigned>(got.state.pf_af_pending), 0u);
+}
+
+} // namespace p6
+
+HYPERION_TEST("translation_cache", "gating_does_not_translate_a_cold_block") {
+    // Three instructions, reached once each: every one of them is cold, so the
+    // cache must compile nothing at all and interpret exactly three steps.
+    //   mov eax, 7 / add eax, 35 / hlt
+    const std::vector<std::uint8_t> program = {
+        0xB8, 0x07, 0x00, 0x00, 0x00, // mov eax, 7
+        0x83, 0xC0, 0x23,             // add eax, 35
+        0xF4,                         // hlt
+    };
+    GuestState initial;
+    initial.rip = kBase;
+    const p6::Run got = p6::run_gated(program, initial);
+    HYPERION_CHECK(got.result.status == RunStatus::kOk);
+    HYPERION_CHECK_EQ(got.result.state.reg(Gpr::kRax), std::uint64_t{42});
+    HYPERION_CHECK_EQ(got.blocks, std::size_t{0}); // nothing was translated
+    HYPERION_CHECK_EQ(got.promoted, std::uint64_t{0});
+    HYPERION_CHECK_EQ(got.gated, std::uint64_t{3}); // all three ran in the interpreter
+    p6::check_same_state("cold block", got.result, p6::run_reference(program, initial));
+}
+
+HYPERION_TEST("translation_cache", "gating_promotes_a_hot_loop") {
+    GuestState initial;
+    initial.rip = kBase;
+    const p6::Run got = p6::run_gated(p6::kBranchHeavy, initial);
+    HYPERION_CHECK(got.result.status == RunStatus::kOk);
+    // The loop body is reached ten times, so it must have been compiled, and the
+    // cold reaches before that must be visible as interpreted steps.
+    HYPERION_CHECK(got.promoted >= 2);
+    HYPERION_CHECK(got.blocks >= 2);
+    HYPERION_CHECK(got.gated >= 1);
+    HYPERION_CHECK(got.gated < got.result.steps); // gating is a prefix, not the whole run
+    p6::check_same_state("hot loop", got.result, p6::run_reference(p6::kBranchHeavy, initial));
+}
+
+HYPERION_TEST("translation_cache", "gating_zero_threshold_translates_immediately") {
+    // `--hot-threshold=0` must reproduce the pre-P6 behaviour exactly: no
+    // interpreted steps, first reach compiles. This is the escape hatch for
+    // code-size and tier-1 micro-benchmarks, so it has to stay exact.
+    GuestState initial;
+    initial.rip = kBase;
+    const p6::Run got = p6::run_gated(p6::kBranchHeavy, initial, /*threshold=*/0);
+    HYPERION_CHECK(got.result.status == RunStatus::kOk);
+    HYPERION_CHECK_EQ(got.gated, std::uint64_t{0});
+    HYPERION_CHECK_EQ(got.promoted, std::uint64_t{0});
+    HYPERION_CHECK(got.blocks >= 2);
+    p6::check_same_state("threshold 0", got.result, p6::run_reference(p6::kBranchHeavy, initial));
+}
+
+HYPERION_TEST("translation_cache", "gating_results_match_across_tiering_transitions") {
+    // The interesting case is not "cold" or "hot" but the boundary between them:
+    // the same program is run with the whole ladder of thresholds, from "never
+    // compile" (a threshold no single run can reach) through the real default to
+    // "always compile", and every run must produce the same architectural state.
+    // A promotion that dropped a pending PF/AF descriptor or lost a register
+    // would show up as a difference in the middles of this ladder.
+    GuestState initial;
+    initial.rip = kBase;
+    initial.reg(Gpr::kRdx) = 100;
+    initial.reg(Gpr::kRdi) = 8;
+    const hyperion::RunResult want = p6::run_reference(p6::kBranchHeavy, initial);
+    HYPERION_CHECK(want.state.reg(Gpr::kRax) != 0); // the program did something
+    for (std::uint16_t threshold : {std::uint16_t{0}, std::uint16_t{1}, std::uint16_t{2},
+                                    std::uint16_t{3}, std::uint16_t{1000}}) {
+        const p6::Run got = p6::run_gated(p6::kBranchHeavy, initial, threshold);
+        p6::check_same_state("tiering ladder", got.result, want);
+    }
+}
+
+HYPERION_TEST("translation_cache", "gating_accounts_cold_steps_against_the_step_limit") {
+    // A gated step is still a retired guest instruction, so the budget must run
+    // out in the middle of the cold prefix exactly as it does in compiled code.
+    GuestState initial;
+    initial.rip = kBase;
+    const p6::Run got =
+        p6::run_gated(p6::kBranchHeavy, initial, hyperion::TranslationCache::kDefaultHotThreshold,
+                      /*max_steps=*/4);
+    HYPERION_CHECK(got.result.status == RunStatus::kStepLimit);
+    HYPERION_CHECK_EQ(got.result.steps, std::uint64_t{4});
+    HYPERION_CHECK_EQ(got.gated, std::uint64_t{4});
+    HYPERION_CHECK_EQ(got.blocks, std::size_t{0}); // four steps never warm a block
+    p6::check_same_state("step limit", got.result,
+                         p6::run_reference(p6::kBranchHeavy, initial, /*max_steps=*/4));
+}
+
 #else
 
 HYPERION_TEST("translation_cache", "caches_blocks_and_agrees_with_interpreter") {
@@ -695,6 +887,26 @@ HYPERION_TEST("translation_cache", "pending_pf_af_crosses_a_directly_linked_exit
 }
 
 HYPERION_TEST("translation_cache", "pf_consumer_in_the_successor_block_forces_materialisation") {
+    HYPERION_SKIP("generated code is AArch64; requires an AArch64 host to run");
+}
+
+HYPERION_TEST("translation_cache", "gating_does_not_translate_a_cold_block") {
+    HYPERION_SKIP("generated code is AArch64; requires an AArch64 host to run");
+}
+
+HYPERION_TEST("translation_cache", "gating_promotes_a_hot_loop") {
+    HYPERION_SKIP("generated code is AArch64; requires an AArch64 host to run");
+}
+
+HYPERION_TEST("translation_cache", "gating_zero_threshold_translates_immediately") {
+    HYPERION_SKIP("generated code is AArch64; requires an AArch64 host to run");
+}
+
+HYPERION_TEST("translation_cache", "gating_results_match_across_tiering_transitions") {
+    HYPERION_SKIP("generated code is AArch64; requires an AArch64 host to run");
+}
+
+HYPERION_TEST("translation_cache", "gating_accounts_cold_steps_against_the_step_limit") {
     HYPERION_SKIP("generated code is AArch64; requires an AArch64 host to run");
 }
 

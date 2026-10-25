@@ -55,6 +55,12 @@ struct TranslateTimer {
     }
 };
 
+std::string hex_pc(std::uint64_t pc) {
+    char buf[32]{};
+    std::snprintf(buf, sizeof(buf), "0x%llx", static_cast<unsigned long long>(pc));
+    return std::string(buf);
+}
+
 bool jit_exec_complex(ExecContext* ctx, GuestState* state, const Instruction* insn) noexcept {
     ++ctx->helper_calls;
     // Force point 2 of 3 (see docs/translator-audit.md §29.11): the helper runs
@@ -86,6 +92,31 @@ void TranslationCache::ensure_trampolines() {
     jit_dispatch_ = arena_.allocate(tr.dispatch_code.data(), tr.dispatch_code.size());
     ctx_->jit_budget_epilogue = arena_.allocate(tr.budget_code.data(), tr.budget_code.size());
     ctx_->jit_exit_epilogue = arena_.allocate(tr.exit_code.data(), tr.exit_code.size());
+}
+
+bool TranslationCache::should_gate(std::uint64_t pc) {
+    if (hot_threshold_ == 0) {
+        return false;
+    }
+    const std::size_t slot = static_cast<std::size_t>((pc ^ (pc >> 12)) & kHotMask);
+    HotEntry& entry = hot_[slot];
+    if (entry.pc != pc) {
+        entry.pc = pc;
+        entry.count = 1;
+        return true;
+    }
+    if (entry.count <= hot_threshold_) {
+        const bool cold = entry.count < hot_threshold_;
+        if (entry.count < 0xFFFF) {
+            ++entry.count;
+        }
+        if (cold) {
+            return true;
+        }
+        ++promoted_blocks_;
+        return false;
+    }
+    return false;
 }
 
 const CachedBlock* TranslationCache::lookup(std::uint64_t pc) {
@@ -135,6 +166,13 @@ const CachedBlock* TranslationCache::translate_at(Memory& memory, std::uint64_t 
     const CachedBlock* cached = lookup(pc);
     if (cached != nullptr) {
         return cached;
+    }
+
+    // P6: cold blocks are not worth compiling yet. Report it separately from a
+    // translation failure so run() interprets rather than aborts.
+    if (should_gate(pc)) {
+        failure = TranslateFailure::kCold;
+        return nullptr;
     }
 
     // One write window for the entry block and whatever successors can be
@@ -268,16 +306,65 @@ RunResult TranslationCache::run(Memory& memory, GuestState state, std::uint64_t 
         const std::uint64_t pc = out.state.rip;
         TranslateFailure failure = TranslateFailure::kNone;
         const CachedBlock* block = translate_at(memory, pc, failure);
+        if (block == nullptr && failure == TranslateFailure::kCold) {
+            // P6: cold block. Execute exactly one instruction in the reference
+            // interpreter, which is the same code tier 0 runs, and try again. The
+            // step-limit accounting matches a block of one instruction.
+            if (steps >= max_steps) {
+                out.status = RunStatus::kStepLimit;
+                out.message = "step limit reached without halting";
+                out.steps = steps;
+                return out;
+            }
+            const StepResult sr = step(out.state, memory, syscalls);
+            ++steps;
+            ++gated_steps_;
+            out.unimplemented_syscalls += sr.unimplemented_syscalls;
+            if (sr.instruction.opcode == Opcode::kSyscall) {
+                // A syscall can move or re-permission memory. Same bookkeeping as
+                // the block path does after a kSyscall result: the data TLB is
+                // keyed on the mapping generation and the translations on the
+                // code epoch.
+                const std::uint64_t post_map_epoch = memory.mapping_epoch();
+                if (post_map_epoch != cached_map_epoch_) {
+                    ctx_->tlb.flush(post_map_epoch);
+                    cached_map_epoch_ = post_map_epoch;
+                }
+                const std::uint64_t post_epoch = memory.code_epoch();
+                if (post_epoch != cached_epoch_) {
+                    invalidate_all();
+                    cached_epoch_ = post_epoch;
+                }
+            }
+            switch (sr.status) {
+            case StepStatus::kOk:
+                continue;
+            case StepStatus::kHalted:
+                out.status = RunStatus::kOk;
+                out.steps = steps;
+                out.exited_via_syscall = sr.exited_via_syscall;
+                out.exit_code = sr.exit_code;
+                return out;
+            case StepStatus::kFault:
+                out.status = RunStatus::kFault;
+                out.message =
+                    sr.message.empty() ? "guest fault while interpreting a cold block" : sr.message;
+                out.steps = steps;
+                return out;
+            case StepStatus::kUnsupported:
+                out.status = RunStatus::kUnsupported;
+                out.message = std::string("unsupported instruction at pc=") + hex_pc(pc);
+                out.steps = steps;
+                return out;
+            }
+        }
         if (block == nullptr) {
             if (failure == TranslateFailure::kFault) {
                 out.status = RunStatus::kFault;
                 out.message = "instruction fetch fault at rip";
             } else {
-                char hex_buf[32]{};
-                std::snprintf(hex_buf, sizeof(hex_buf), "0x%llx",
-                              static_cast<unsigned long long>(pc));
                 out.status = RunStatus::kUnsupported;
-                out.message = std::string("unsupported instruction at pc=") + hex_buf;
+                out.message = std::string("unsupported instruction at pc=") + hex_pc(pc);
             }
             out.steps = steps;
             return out;

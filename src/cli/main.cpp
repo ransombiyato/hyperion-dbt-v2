@@ -175,6 +175,13 @@ void print_tier1_stats(const hyperion::TranslationCache& cache) {
     // still crosses into C++ per instruction.
     std::printf("tier 1: %llu instruction(s) executed through the helper\n",
                 static_cast<unsigned long long>(cache.helper_calls()));
+    // P6: how much of the run stayed cold, and how many blocks crossed the
+    // threshold into generated code.
+    std::printf("tier 1: %llu instruction(s) interpreted while cold, %llu block(s) promoted "
+                "(threshold %u)\n",
+                static_cast<unsigned long long>(cache.gated_steps()),
+                static_cast<unsigned long long>(cache.promoted_blocks()),
+                static_cast<unsigned>(cache.hot_threshold()));
     // P9 stage 1: PF/AF are recorded as a pending descriptor instead of being
     // materialised at every producer, and only materialised when something can
     // observe them.
@@ -249,7 +256,8 @@ bool env_flag_enabled(const char* name) {
 
 int run_elf(const std::vector<std::uint8_t>& file, const std::vector<std::string>& guest_argv,
             const std::string& guest_image_path, const std::string& sysroot, int tier,
-            std::uint64_t max_steps, bool quiet, bool dump, const RegistryCli& registry) {
+            std::uint64_t max_steps, bool quiet, bool dump, const RegistryCli& registry,
+            std::uint16_t hot_threshold = hyperion::TranslationCache::kDefaultHotThreshold) {
     // Disjoint 256 MiB heap at 0x20000000 and 1 GiB per-mapping ceiling at 0x7f0000000000.
     hyperion::GuestAddressSpace space(0x7f0000000000ULL, 0x20000000ULL, 256ULL << 20);
     hyperion::GuestState state;
@@ -326,6 +334,7 @@ int run_elf(const std::vector<std::uint8_t>& file, const std::vector<std::string
         result = hyperion::run_program(space, state, max_steps, &syscalls);
     } else {
         hyperion::TranslationCache cache;
+        cache.set_hot_threshold(hot_threshold);
         result = cache.run(space, state, max_steps, &syscalls);
         if (!quiet) {
             std::printf("tier 1: %zu basic block(s) translated\n", cache.block_count());
@@ -370,6 +379,7 @@ int run_elf(const std::vector<std::uint8_t>& file, const std::vector<std::string
 int cmd_run(int argc, char** argv) {
     const char* path = nullptr;
     int tier = 1;
+    std::uint16_t hot_threshold = hyperion::TranslationCache::kDefaultHotThreshold;
     bool explicit_steps = false;
     std::uint64_t max_steps = kDefaultBlobMaxSteps;
     bool quiet = false;
@@ -403,7 +413,8 @@ int cmd_run(int argc, char** argv) {
         const bool is_hyperion_option =
             arg.rfind("--tier=", 0) == 0 || arg.rfind("--max-steps=", 0) == 0 ||
             arg.rfind("--sysroot=", 0) == 0 || arg == "--quiet" || arg == "-q" || arg == "--dump" ||
-            arg == "--no-syscall-registry" || arg.rfind("--syscall-registry=", 0) == 0;
+            arg == "--no-syscall-registry" || arg.rfind("--syscall-registry=", 0) == 0 ||
+            arg.rfind("--hot-threshold=", 0) == 0;
 
         if (is_hyperion_option) {
             if (arg.rfind("--tier=", 0) == 0) {
@@ -417,6 +428,10 @@ int cmd_run(int argc, char** argv) {
                 quiet = true;
             } else if (arg == "--no-syscall-registry") {
                 registry.enabled = false;
+            } else if (arg.rfind("--hot-threshold=", 0) == 0) {
+                // P6: 0 disables hot-block gating (translate on first sight).
+                hot_threshold =
+                    static_cast<std::uint16_t>(std::strtoul(arg.c_str() + 16, nullptr, 10));
             } else if (arg.rfind("--syscall-registry=", 0) == 0) {
                 registry.path = arg.substr(19);
                 registry.enabled = true;
@@ -455,7 +470,8 @@ int cmd_run(int argc, char** argv) {
         full_argv.emplace_back(path);
         full_argv.insert(full_argv.end(), guest_argv.begin(), guest_argv.end());
         return run_elf(code, full_argv, path, sysroot, tier,
-                       explicit_steps ? max_steps : kDefaultElfMaxSteps, quiet, dump, registry);
+                       explicit_steps ? max_steps : kDefaultElfMaxSteps, quiet, dump, registry,
+                       hot_threshold);
     }
     return run_blob(code, tier, max_steps, quiet, dump);
 }
