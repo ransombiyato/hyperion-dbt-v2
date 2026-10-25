@@ -2105,6 +2105,11 @@ JitTrampolines build_jit_trampolines() {
     return out;
 }
 
+// A cached block has at most a handful of exit sites (a terminator ends it), but
+// a block of straight-line code can also fall out of the fetch window, so keep a
+// small fixed cap rather than letting a pathological input grow the vector.
+constexpr std::size_t kMaxExitLinks = 8;
+
 BlockTranslation translate_cached_block(const std::uint8_t* code, std::size_t size,
                                         const Instruction& first) {
     BlockTranslation out;
@@ -3254,6 +3259,18 @@ BlockTranslation translate_cached_block(const std::uint8_t* code, std::size_t si
                     emit_inline_tlb_read(e, kB, kA, 8, flbl, read_stubs);
                     spill_ra();
                 }
+                if (step.insn.dst.kind == OperandKind::kImmediate) {
+                    // Record the site before the branch word: the cache may
+                    // repoint it straight at the successor's entry. rip is
+                    // written here rather than relying on the dispatcher to do
+                    // it, so a linked exit leaves GuestState exactly as the
+                    // dispatch path would have (faults report the right PC).
+                    e.str(a64::Width::k64, kA, kState, kRipOffset);
+                    if (out.exit_links.size() < kMaxExitLinks) {
+                        out.exit_links.push_back(
+                            {static_cast<std::uint64_t>(e.count()) * 4, step.insn.dst.imm});
+                    }
+                }
                 e.br(kDispatchReg);
                 break;
             }
@@ -3337,18 +3354,29 @@ BlockTranslation translate_cached_block(const std::uint8_t* code, std::size_t si
                     e.cmp_imm(a64::Width::k32, kT0, 0);
                     fused = a64::Cond::kNe;
                 }
-                // Neither `MOVZ/MOVK` nor non-flag `ADD/SUB` touches `NZCV`!
+                // Two exits rather than one `CSEL`-selected exit. The CSEL form is
+                // two words shorter, but it funnels both successors through a
+                // single branch word, and a single word can only ever be repointed
+                // at one of them - so it keeps every conditional transition going
+                // through the shared dispatcher. Splitting the paths costs two
+                // words and is what lets the cache link *both* sides of a `Jcc`
+                // (audit §26 row 5), which is the commonest terminator in real
+                // code. Unlinked, the executed cost is unchanged: the dispatcher
+                // branch still runs, exactly as before.
+                const a64::Label fallthrough_path = e.new_label();
+                e.b_cond(invert_cond(fused), fallthrough_path);
                 e.mov_imm64(kA, taken_pc);
-                if (next_rip >= taken_pc && (next_rip - taken_pc) < 4096ULL) {
-                    e.add_imm(a64::Width::k64, kB, kA,
-                              static_cast<std::uint32_t>(next_rip - taken_pc));
-                } else if (taken_pc > next_rip && (taken_pc - next_rip) < 4096ULL) {
-                    e.sub_imm(a64::Width::k64, kB, kA,
-                              static_cast<std::uint32_t>(taken_pc - next_rip));
-                } else {
-                    e.mov_imm64(kB, next_rip);
+                e.str(a64::Width::k64, kA, kState, kRipOffset);
+                if (out.exit_links.size() < kMaxExitLinks) {
+                    out.exit_links.push_back({static_cast<std::uint64_t>(e.count()) * 4, taken_pc});
                 }
-                e.csel(a64::Width::k64, kA, kA, kB, fused);
+                e.br(kDispatchReg);
+                e.bind(fallthrough_path);
+                e.mov_imm64(kA, next_rip);
+                e.str(a64::Width::k64, kA, kState, kRipOffset);
+                if (out.exit_links.size() < kMaxExitLinks) {
+                    out.exit_links.push_back({static_cast<std::uint64_t>(e.count()) * 4, next_rip});
+                }
                 e.br(kDispatchReg);
                 break;
             }
@@ -3363,6 +3391,10 @@ BlockTranslation translate_cached_block(const std::uint8_t* code, std::size_t si
         if (exit == BlockExit::kFallThrough) {
             spill_ra();
             e.mov_imm64(kA, target);
+            e.str(a64::Width::k64, kA, kState, kRipOffset);
+            if (out.exit_links.size() < kMaxExitLinks) {
+                out.exit_links.push_back({static_cast<std::uint64_t>(e.count()) * 4, target});
+            }
             e.br(kDispatchReg);
         }
     }

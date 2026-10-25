@@ -99,6 +99,14 @@ public:
     // should cover enough code to fill the pages it touches.
     void publish();
 
+    // Overwrite one 32-bit instruction word of memory handed out by this arena
+    // but not yet published. Used to repoint a block's exit at a successor that
+    // was translated after it. Returns false - and changes nothing - if `at` is
+    // not arena memory, is not word-aligned, or is already read-execute: a
+    // published page is never made writable again, because re-permissioning it
+    // would cost exactly the protection churn this arena exists to avoid.
+    bool patch_instruction(void* at, std::uint32_t word);
+
     // Number of mprotect calls the arena has made. Exposed so a benchmark can
     // report the cost the audit is about instead of asserting it (§29.6).
     std::uint64_t protection_changes() const noexcept { return protection_changes_; }

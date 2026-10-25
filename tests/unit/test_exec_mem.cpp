@@ -179,6 +179,37 @@ HYPERION_TEST("exec_mem", "arena_write_window_defers_one_mprotect_per_window") {
     HYPERION_CHECK_EQ(arena.protection_changes(), std::uint64_t{2});
 }
 
+HYPERION_TEST("exec_mem", "arena_patches_code_inside_a_window_and_refuses_it_afterwards") {
+    // Direct linking repoints a block's exit at a successor that was translated
+    // after it. That is only legal while the page is still writable: a published
+    // page must never be re-opened, or the write window buys nothing (audit
+    // §29.6) and W^X is weakened.
+    hyperion::ExecArena arena(4096);
+    const std::uint8_t nop_ret[8] = {0x1F, 0x20, 0x03, 0xD5, 0xC0, 0x03, 0x5F, 0xD6};
+
+    arena.begin_write();
+    auto* code = static_cast<std::uint8_t*>(arena.allocate(nop_ret, sizeof(nop_ret)));
+    HYPERION_CHECK(code != nullptr);
+
+    // Inside the window: allowed, and the bytes really change.
+    const std::uint32_t patched = 0x14000000U; // b .+0
+    HYPERION_CHECK(arena.patch_instruction(code, patched));
+    HYPERION_CHECK_EQ(*reinterpret_cast<const std::uint32_t*>(code), patched);
+
+    // Misaligned and out-of-range requests are refused rather than corrupting
+    // whatever happens to be adjacent.
+    HYPERION_CHECK(!arena.patch_instruction(code + 1, patched));
+    std::uint32_t unrelated = 0;
+    HYPERION_CHECK(!arena.patch_instruction(&unrelated, patched));
+
+    arena.publish();
+
+    // After publishing the page is read-execute; the patch must be refused. The
+    // word keeps the value it was published with.
+    HYPERION_CHECK(!arena.patch_instruction(code, 0xD503201FU));
+    HYPERION_CHECK_EQ(*reinterpret_cast<const std::uint32_t*>(code), patched);
+}
+
 #if defined(__aarch64__)
 
 HYPERION_TEST("exec_mem", "arena_published_blocks_are_executable_and_reset_rearms_the_slab") {

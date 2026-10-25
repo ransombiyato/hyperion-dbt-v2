@@ -28,6 +28,9 @@ struct CachedBlock {
     // kJcc only: the branch destination (the other possible successor).
     std::uint64_t alternate = 0;
     bool has_alternate = false;
+    // Exit sites that always jump to one statically known successor, with byte
+    // offsets relative to `entry` (see ExitLink in translator.hpp).
+    std::vector<ExitLink> exit_links;
     std::size_t guest_instruction_count = 0;
     std::size_t code_bytes = 0;
 };
@@ -69,6 +72,9 @@ public:
     // Blocks translated ahead of execution (successor prefetch). Counted
     // separately from block_count() so the cost of a wrong guess is visible.
     std::size_t prefetched_blocks() const { return prefetched_blocks_; }
+    // Exits repointed straight at their successor's entry, removing the hash
+    // probe from that transition (audit §26 row 5).
+    std::size_t linked_exits() const { return linked_exits_; }
 
     void invalidate_all();
 
@@ -85,6 +91,9 @@ private:
     // window, within a bounded budget. A translation that fails is skipped
     // silently: it is a guess, not a requirement.
     void prefetch_successors(Memory& memory, const CachedBlock& block);
+    // Repoint any exit of `block` whose successor entry is now known. Only
+    // possible while the block's page is still inside the write window.
+    void resolve_links(CachedBlock& block);
     const CachedBlock* lookup(std::uint64_t pc);
     void install(const CachedBlock* block);
 
@@ -106,6 +115,10 @@ private:
     std::uint64_t translation_ns_ = 0;
     std::uint64_t translated_guest_instructions_ = 0;
     std::size_t prefetched_blocks_ = 0;
+    std::size_t linked_exits_ = 0;
+    // Blocks allocated since the current write window opened, in the order they
+    // were created: their exits are the ones that can still be patched.
+    std::vector<CachedBlock*> window_blocks_;
 
     std::vector<std::uint8_t> fetch_;
 };

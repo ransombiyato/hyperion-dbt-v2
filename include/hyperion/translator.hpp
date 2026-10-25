@@ -51,6 +51,18 @@ enum class BlockExit : std::uint8_t {
 
 const char* to_string(BlockExit exit);
 
+// An exit site that always jumps to one statically known successor: the byte
+// offset of a word emitted as `br x24` (the shared dispatcher) plus the guest PC
+// it jumps to. The cache repoints such a word at the successor's entry once that
+// entry is known, which removes the hash probe from the transition (audit §26
+// row 5). Sites whose target depends on guest data (kJmp reg, kCall, kRet) or on
+// a runtime condition (kJcc) are not recorded: one word cannot serve two
+// successors, and pretending otherwise would be a miscompile.
+struct ExitLink {
+    std::uint64_t code_offset = 0; // byte offset of the branch word inside `code`
+    std::uint64_t target_pc = 0;   // the successor that word always jumps to
+};
+
 struct BlockTranslation {
     TranslateError error = TranslateError::kNone;
     std::vector<std::uint8_t> code;
@@ -67,6 +79,9 @@ struct BlockTranslation {
     // write window instead of publishing one block at a time (audit §29.6).
     std::uint64_t alternate = 0;
     bool has_alternate = false;
+
+    // Direct-linkable exit sites, in code order.
+    std::vector<ExitLink> exit_links;
 
     bool ok() const { return error == TranslateError::kNone; }
 };

@@ -232,6 +232,27 @@ void* ExecArena::allocate(const std::uint8_t* code, std::size_t size) {
     return dst;
 }
 
+bool ExecArena::patch_instruction(void* at, std::uint32_t word) {
+    auto* bytes = static_cast<std::uint8_t*>(at);
+    if (bytes == nullptr || (reinterpret_cast<std::uintptr_t>(bytes) & 3U) != 0) {
+        return false;
+    }
+    for (std::size_t i = 0; i < slab_count_; ++i) {
+        Slab& slab = slabs_[i];
+        if (bytes < slab.base || bytes + sizeof(word) > slab.base + slab.used) {
+            continue;
+        }
+        const std::size_t offset = static_cast<std::size_t>(bytes - slab.base);
+        if (offset < slab.published) {
+            return false; // already read-execute: refuse rather than re-permission
+        }
+        std::memcpy(bytes, &word, sizeof(word));
+        dirty_ = true; // the page must be flushed again before it executes
+        return true;
+    }
+    return false;
+}
+
 void ExecArena::publish() {
     if (!dirty_) {
         window_open_ = false;

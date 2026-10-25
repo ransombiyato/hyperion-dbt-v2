@@ -6,6 +6,8 @@
 // multi-block native execution.
 #include "hyperion/translation_cache.hpp"
 
+#include "hyperion/aarch64_encoder.hpp"
+
 #include <algorithm>
 #include <chrono>
 #include <string>
@@ -134,10 +136,19 @@ const CachedBlock* TranslationCache::translate_at(Memory& memory, std::uint64_t 
     // never be handed back non-executable.
     const TranslateTimer translate_timer{translation_ns_};
     arena_.begin_write();
+    window_blocks_.clear();
     const CachedBlock* block = translate_one(memory, pc, failure);
     if (block != nullptr) {
         prefetch_successors(memory, *block);
     }
+    // Both directions are needed before publish(): a successor's entry is only
+    // known once it has been translated, and its exit can only be repointed while
+    // its page is still writable. Doing it here is what makes direct linking
+    // compatible with strict W^X - no published page is ever re-opened.
+    for (CachedBlock* created : window_blocks_) {
+        resolve_links(*created);
+    }
+    window_blocks_.clear();
     arena_.publish();
     return block;
 }
@@ -178,6 +189,7 @@ const CachedBlock* TranslationCache::translate_one(Memory& memory, std::uint64_t
 
     auto block = std::make_unique<CachedBlock>();
     block->entry = arena_.allocate(translated.code.data(), translated.code.size());
+    block->exit_links = translated.exit_links;
     block->exit = translated.exit;
     block->start = pc;
     block->target = translated.target;
@@ -185,6 +197,7 @@ const CachedBlock* TranslationCache::translate_one(Memory& memory, std::uint64_t
     block->code_bytes = translated.code.size();
 
     const CachedBlock* raw = block.get();
+    window_blocks_.push_back(const_cast<CachedBlock*>(raw));
     blocks_.emplace(pc, std::move(block));
     install(raw);
     translated_guest_instructions_ += translated.guest_instruction_count;
@@ -364,6 +377,30 @@ void TranslationCache::prefetch_successors(Memory& memory, const CachedBlock& bl
         ++prefetched_blocks_;
         budget = found->code_bytes >= budget ? 0 : budget - found->code_bytes;
         push_successors(*found);
+    }
+}
+
+void TranslationCache::resolve_links(CachedBlock& block) {
+    if (block.exit_links.empty() || block.entry == nullptr) {
+        return;
+    }
+    for (const ExitLink& link : block.exit_links) {
+        const CachedBlock* successor = lookup(link.target_pc);
+        if (successor == nullptr || successor->entry == nullptr) {
+            continue; // not translated yet: the exit keeps its dispatcher branch
+        }
+        auto* site = static_cast<std::uint8_t*>(block.entry) + link.code_offset;
+        const auto from = reinterpret_cast<std::intptr_t>(site);
+        const auto to = reinterpret_cast<std::intptr_t>(successor->entry);
+        const std::int64_t delta = static_cast<std::int64_t>(to - from);
+        // 26-bit signed word offset: anything outside +-128 MiB stays on the
+        // dispatcher rather than relying on a truncated branch displacement.
+        if (delta < -(std::int64_t{1} << 27) || delta >= (std::int64_t{1} << 27)) {
+            continue;
+        }
+        if (arena_.patch_instruction(site, a64::Encoder::encode_b(delta))) {
+            ++linked_exits_;
+        }
     }
 }
 

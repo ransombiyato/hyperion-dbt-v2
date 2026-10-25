@@ -714,7 +714,7 @@ implemented.
 | 2 | ~~**Two `mprotect` + `clear_cache` per translated block**~~ — **FIXED, see §29.6** | was `exec_mem.cpp:170-190` | was 99.8 % of publish cost (2.787 µs/block); now one publish per write window, 0.31 mprotect calls per block measured |
 | 3 | **Register spills on every block transition** (5 stores + 5 loads) | `spill_ra`/`reload_ra` | ~10 memory ops per block, forever (no cross-block allocation) |
 | 4 | ~~**Redundant spill/reload around helper calls**~~ — **RETRACTED, see §29: these stores are required** | `:3013-3020` | not overhead: `execute_cached_helper` re-reads `GuestState`, so the spills are the state sync point |
-| 5 | **No direct linking** — hash lookup on every block exit | `:2054-2073` | ~10 instructions per transition instead of 1 |
+| 5 | ~~**No direct linking** — hash lookup on every block exit~~ — **FIXED, see §29.7** | was `:2054-2073` | now one `b` for a statically known successor; 19 % off a branch-heavy guest under qemu |
 | 6 | **Flags materialised to 6 separate bytes** with `cset`+`strb` each | `:283-320` | up to 16 instructions for a non-fused `cmp` |
 | 7 | **8-instruction SoftTlb fast path** per guest memory access | `:1962-1973` | 8× a native load |
 | 8 | **512-entry TLB** (2 MiB coverage) | `interpreter.hpp:38-40` | aliases on real workloads; misses cost a C++ call |
@@ -991,7 +991,7 @@ In rough order of value/effort:
 | 4 | Metrics: report existing counters + add a translation-cost and syscall-heavy benchmark | None | Everything after this needs a baseline; §27 | **Done, §29.5.** Translation cost is now measured (11 608 ns/guest-instruction under qemu), syscall-heavy guest benchmarked end to end, counters printed by `hyperion run --tier=1`. |
 | 5 | Slab-level W^X | Low | Largest translation-time cost | **Done via option A, §29.6** (not the "low risk" version the audit implied): one mprotect per write window instead of two per block, 2.00 → 0.31 calls/block on a real guest, strict W^X kept. Cost: bounded successor prefetch (16 blocks / 3584 bytes per window). |
 | 6 | Hot-block gating (interpret → promote) | Medium | Makes Tier 1 a win on short programs; §11 |
-| 7 | Direct linking of block exits | Medium | ~20 → ~1 instructions per transition |
+| 7 | Direct linking of block exits | Medium | ~20 → ~1 instructions per transition | **Done, §29.7** — piggybacks on P5's write window; 19 % on a branch-heavy guest under qemu, no regression on the self-loop workload. |
 | 8 | Cross-block register allocation with spilling | Medium-High | Biggest codegen win; needs liveness over the CFG |
 | 9 | Lazy flags (keep `NZCV`, materialise on demand) | Medium | Removes 6 byte-stores per ALU op |
 | 10 | Shadow stack for `call`/`ret` | Medium | 16 instructions per call/return |
@@ -1093,10 +1093,10 @@ attempt to do so was made.
 
 | Host | What ran | Result |
 | --- | --- | --- |
-| x86-64 Linux, native | `build-strict` unit suite | **340 passed / 0 failed / 24 skipped (of 364)** |
+| x86-64 Linux, native | `build-strict` unit suite | **341 passed / 0 failed / 25 skipped (of 366)** |
 | x86-64 Linux, native | `ctest` | 19/19 (two new tests: `translate_bench.smoke`, `translate_bench.rejects_single_sample`) |
 | x86-64 Linux, native | dynamic-loader guest (`PT_INTERP` → `ld-linux`, exercises the RELRO `mprotect` path) | OK after the fix |
-| AArch64, cross-built, **`qemu-aarch64-static`** (no hardware) | unit suite | **364 passed / 0 failed / 5 skipped (of 369)** |
+| AArch64, cross-built, **`qemu-aarch64-static`** (no hardware) | unit suite | **366 passed / 0 failed / 5 skipped (of 371)** |
 | AArch64 under qemu | `hyperion_tier_bench` | 436.55 ns/guest-ins Tier 0 vs 3.6895 Tier 1, both correct |
 | AArch64 under qemu | sieve, 200 000 | Tier 0 1332 ms vs Tier 1 458 ms |
 
@@ -1226,12 +1226,57 @@ changes inside a window, one per publish, none for an empty window) and
 `exec_mem.arena_published_blocks_are_executable_and_reset_rearms_the_slab` (AArch64: published code
 actually runs, and `reset()` makes the surviving slab writable again).
 
-### 29.7 Still open from §L
+### 29.7 P7 done early — direct linking of block exits
 
-Items 1-5 of §L are now all resolved: 1 justified and pinned, 2 and 5 implemented, 3 retracted as
-wrong, 4 implemented. §26 rows 1-5 should be read with §29 in mind; the rest of the table stands.
-Items 6-14 (hot-block gating, direct linking, cross-block allocation, lazy flags, shadow stack,
-remaining helper inlining, signals, threads, IR) are untouched.
+§L item 7 (and §26 row 5) say every block exit goes back through the in-JIT hash
+probe (hash, load pair, compare, branch: ~9 instructions) when it could be a single
+`b`. That is now implemented, and it was done next because P5's write window makes it
+nearly free: a block's page is writable until the window closes, so an exit can be
+repointed at its successor without ever re-opening a published page.
+
+How it works:
+
+* The translator records an `ExitLink` for every exit whose successor is statically
+  known — `jmp` with an immediate target and fall-through — as the byte offset of a
+  branch word it emits as `br x24` (the shared dispatcher), plus the target guest PC.
+* The cache, inside the same write window, translates the successors and then walks
+  every block created in that window: each recorded site is overwritten with a direct
+  `b <successor entry>`. `ExecArena::patch_instruction()` does the write and refuses
+  any address that is published, misaligned or outside the arena, so W^X is never
+  weakened; the page is simply flushed again by the `publish()` that follows.
+* A word can only be repointed at one target, so a `Jcc` used to funnel both
+  successors through one `CSEL`-selected exit — which can never be linked. It now
+  emits two exit paths (`b.cond` to the other side), costing two extra words per
+  conditional but making *both* sides linkable. Unlinked, the executed cost is
+  unchanged: the dispatcher branch still runs exactly as before.
+
+Measured on the AArch64 tree under qemu, one binary built with linking and one with
+`resolve_links()` disabled, run alternately so host noise affects both:
+
+| guest | linked | unlinked | effect |
+| --- | --- | --- | --- |
+| branch-heavy VM-style guest, 102M retired instructions | 6086 / 5891 / 6439 ms | 7567 / 7702 / 7470 ms | **-19 %** (medians 6086 vs 7567) |
+| `hyperion_tier_bench` self-loop | 3.11 ns/ins | 3.09 ns/ins | no change (this workload is a self-loop superblock: it has almost no block transitions to link, so it cannot show the win) |
+
+Link coverage on real guests: 1233 of 1605 exits linked on the VM-style guest, 1409 of
+1835 blocks on the mixed guest. Generated code grows 2.5 % from the split-conditional
+change. Both guests produce byte-identical output at both settings.
+
+**Caveat, stated plainly:** these are qemu-user numbers for a translator that is itself
+being emulated, on an x86-64 host. They show the change is a real and large win under
+this measurement and that it does not regress the self-loop path; they are not an
+AArch64 hardware measurement, which remains unavailable here.
+
+### 29.8 Still open from §L
+
+Items 1-5 of §L are all resolved (1 justified and pinned, 2 and 5 implemented, 3 retracted as wrong,
+4 implemented), and item 7 (direct linking) is implemented as well — §29.7 — because P5's write
+window made it cheap. §26 rows 1, 2, 3, 4, 5 should be read with §29 in mind; the rest of the table
+stands.
+
+Still open: item 6 (hot-block gating), 8 (cross-block register allocation), 9 (lazy flags), 10
+(shadow stack), 11 (inlining the remaining helper opcodes), 12 (signal delivery), 13 (guest
+threads), 14 (an IR and a real optimiser).
 
 ---
 

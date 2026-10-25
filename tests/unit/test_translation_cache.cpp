@@ -121,6 +121,42 @@ HYPERION_TEST("translation_cache", "direct_map_collision_falls_back_to_map") {
     HYPERION_CHECK_EQ(cache.block_count(), std::size_t{2});        // not re-translated
 }
 
+HYPERION_TEST("translation_cache", "exits_are_linked_to_successors_and_stay_correct") {
+    // A branch-heavy guest, so there are many block transitions to link: two
+    // conditional arms around a backward jump, i.e. five blocks whose exits all
+    // have a statically known successor. Assembled from
+    //   mov eax,0 / top: add eax,3 / dec rcx / test rcx,1 / jz even_path
+    //               / cmp rcx,0 / jne top / hlt
+    //   even_path:  add eax,1 / cmp rcx,0 / jne top / hlt
+    const std::vector<std::uint8_t> program = {
+        0xB8, 0x00, 0x00, 0x00, 0x00, 0x83, 0xC0, 0x03, 0x48, 0xFF, 0xC9, 0x48, 0xF7,
+        0xC1, 0x01, 0x00, 0x00, 0x00, 0x74, 0x07, 0x48, 0x83, 0xF9, 0x00, 0x75, 0xEB,
+        0xF4, 0x83, 0xC0, 0x01, 0x48, 0x83, 0xF9, 0x00, 0x75, 0xE1, 0xF4,
+    };
+    FlatMemory interp_mem(kBase, kMemSize);
+    std::memcpy(interp_mem.data(), program.data(), program.size());
+    GuestState initial;
+    initial.rip = kBase;
+    initial.reg(Gpr::kRcx) = 40;
+    const hyperion::RunResult expected = hyperion::run_program(interp_mem, initial);
+
+    FlatMemory cache_mem(kBase, kMemSize);
+    std::memcpy(cache_mem.data(), program.data(), program.size());
+    TranslationCache cache;
+    const hyperion::RunResult actual = cache.run(cache_mem, initial);
+
+    // Correctness first: a mislinked exit shows up as a wrong result or a wrong
+    // step count, not as a crash.
+    HYPERION_CHECK(actual.status == RunStatus::kOk);
+    HYPERION_CHECK_EQ(actual.steps, expected.steps);
+    HYPERION_CHECK_EQ(actual.state.reg(Gpr::kRax), expected.state.reg(Gpr::kRax));
+    HYPERION_CHECK_EQ(actual.state.rip, expected.state.rip);
+    // And the link really happened, so the checks above are not the checks of an
+    // unlinked run.
+    HYPERION_CHECK(cache.linked_exits() > 0);
+    HYPERION_CHECK(cache.linked_exits() <= cache.block_count() * 2);
+}
+
 HYPERION_TEST("translation_cache",
               "self_loop_superblock_matches_interpreter_with_and_without_step_limit") {
     // Tight self-loop exercising both full completion and mid-loop step-budget
@@ -172,6 +208,10 @@ HYPERION_TEST("translation_cache", "caches_blocks_and_agrees_with_interpreter") 
 }
 
 HYPERION_TEST("translation_cache", "direct_map_collision_falls_back_to_map") {
+    HYPERION_SKIP("generated code is AArch64; requires an AArch64 host to run");
+}
+
+HYPERION_TEST("translation_cache", "exits_are_linked_to_successors_and_stay_correct") {
     HYPERION_SKIP("generated code is AArch64; requires an AArch64 host to run");
 }
 
