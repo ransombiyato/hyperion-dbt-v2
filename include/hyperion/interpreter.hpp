@@ -76,6 +76,21 @@ public:
         return read(address, out, count);
     }
     virtual std::uint64_t code_epoch() const noexcept { return 0; }
+
+    // Generation counter for *mapping* changes: any operation that can add,
+    // remove, resize, move or re-permission a guest page bumps this, and a
+    // SoftTlb entry derived from a page is invalid once it changes.
+    //
+    // This is deliberately not the same counter as code_epoch(). code_epoch()
+    // tracks self-modifying *code* (and so drives translation invalidation), and
+    // address spaces legitimately bump it only when executable memory is
+    // involved. Reusing it to decide "do my cached host page pointers still hold"
+    // was wrong: an ordinary `mprotect(PROT_READ|PROT_WRITE)` (RELRO) or a plain
+    // non-exec `mmap`/`munmap` moves backing stores without touching code, and the
+    // data SoftTlb then pointed at freed memory. The default here returns
+    // code_epoch() so any implementation that does not distinguish the two stays
+    // conservatively correct (it will simply flush more often).
+    virtual std::uint64_t mapping_epoch() const noexcept { return code_epoch(); }
     virtual PageAccess translate_page(std::uint64_t page_addr) noexcept {
         (void)page_addr;
         return {};

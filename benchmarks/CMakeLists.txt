@@ -33,6 +33,26 @@ add_test(NAME syscall_bench.rejects_single_sample
         -P "${CMAKE_CURRENT_SOURCE_DIR}/../tests/bench_rejects_bad_args.cmake")
 set_tests_properties(syscall_bench.rejects_single_sample PROPERTIES LABELS "bench;syscall")
 
+# Translation-cost and syscall-heavy guest benchmark (post-audit P4). Translation
+# cost is reported from the cache's own counters, so it is measured rather than
+# inferred; on a host that cannot execute generated code it is reported
+# unavailable. The syscall-heavy half runs on every host at tier 0 and adds tier 1
+# where it exists.
+add_executable(hyperion_translate_bench translate_bench.cpp)
+target_link_libraries(hyperion_translate_bench PRIVATE hyperion::core hyperion_warnings)
+
+add_test(NAME translate_bench.smoke
+    COMMAND hyperion_translate_bench --syscalls 2000 --iterations 2000 --repeats 3 --json)
+set_tests_properties(translate_bench.smoke PROPERTIES LABELS "bench;smoke")
+
+# Same rule as the other harnesses: a single sample has no spread, so the
+# benchmark must refuse it rather than publish a meaningless result.
+add_test(NAME translate_bench.rejects_single_sample
+    COMMAND ${CMAKE_COMMAND}
+        -DHYPERION_BENCH_BIN=$<TARGET_FILE:hyperion_translate_bench>
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/../tests/bench_rejects_bad_args.cmake")
+set_tests_properties(translate_bench.rejects_single_sample PROPERTIES LABELS "bench")
+
 # Correctness smoke: both tiers produce the right result for a small loop. Runs
 # on every host (on x86-64 only tier 0 executes; the script tolerates that).
 add_test(NAME tier_bench.smoke COMMAND hyperion_tier_bench --iterations 1000 --repeats 3 --json)

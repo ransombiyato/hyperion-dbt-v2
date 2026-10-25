@@ -293,8 +293,25 @@ struct Instruction {
     Operand aux;                         // third operand (3-op IMUL, SHLD/SHRD, PSHUFD)
     bool has_src = false;
     bool has_aux = false;
-    bool rex_w = false;     // 64-bit operand size was selected
-    bool lock = false;      // 0xF0 LOCK prefix validated on memory RMW
+    bool rex_w = false; // 64-bit operand size was selected
+    // 0xF0 LOCK prefix, validated on a memory read-modify-write.
+    //
+    // It is recorded, not acted on, and the reason is an invariant rather than an
+    // omission: Hyperion refuses thread creation (CLONE_THREAD / CLONE_VM /
+    // CLONE_SIGHAND all return -ENOSYS in process.cpp), and each guest process is
+    // a single host thread. A LOCK-prefixed RMW in a single-threaded process is
+    // observationally identical to the plain RMW - there is no second observer to
+    // see an intermediate value, and no peer whose stores need ordering - so
+    // executing it as a plain RMW is *correct today*, not merely tolerated.
+    //
+    // The moment guest threads exist this becomes wrong, which is why the flag is
+    // carried in the decoded instruction: an implementation of threads must either
+    // emit an atomics sequence (LDXR/STXR or LSE LDADD) here or refuse the prefix.
+    // Half of that contract is pinned by
+    // tests/unit/test_decoder.cpp::decoder.lock_prefix_is_recorded_and_does_not_
+    // change_semantics (the prefix is recorded and changes nothing); the other
+    // half - that thread creation is refused - is pinned by the process tests.
+    bool lock = false;
     std::uint8_t rep = 0;   // 0, 0xF2 (REPNE), or 0xF3 (REP/REPE)
     std::uint8_t subop = 0; // string op base opcode (A4..AF) or CLD(0)/STD(1)
 };

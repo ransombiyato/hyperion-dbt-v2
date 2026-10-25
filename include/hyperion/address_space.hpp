@@ -161,6 +161,7 @@ public:
     bool write(std::uint64_t address, const std::uint8_t* in, std::size_t count) override;
     bool fetch(std::uint64_t address, std::uint8_t* out, std::size_t count) override;
     std::uint64_t code_epoch() const noexcept override { return code_epoch_; }
+    std::uint64_t mapping_epoch() const noexcept override { return mapping_epoch_; }
 
     // Invalidate translated code without changing the address-space layout.
     // The mutating operations above bump the epoch as a side effect; this is
@@ -217,6 +218,9 @@ private:
     std::uint64_t brk_ = 0;
     std::size_t max_map_bytes_ = kDefaultMaxMapBytes;
     std::uint64_t code_epoch_ = 1;
+    // Bumped by every operation that can add, remove, resize, move or
+    // re-permission a region. See Memory::mapping_epoch().
+    std::uint64_t mapping_epoch_ = 1;
     mutable std::size_t mru_index_ = 0;
 };
 

@@ -7,6 +7,7 @@
 #include "hyperion/translation_cache.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <string>
 
 namespace hyperion {
@@ -38,6 +39,19 @@ bool jit_mem_write_slow(ExecContext* ctx, std::uint64_t addr, const void* in,
                         std::size_t bytes) noexcept {
     return soft_tlb_write_slow(*ctx->memory, ctx->tlb, addr, in, bytes);
 }
+
+// Accumulates translation wall time on every exit path from translate_at(),
+// including the failure paths: a translation that failed still cost what it
+// cost, and hiding that is how a slow cold start goes unexplained.
+struct TranslateTimer {
+    std::uint64_t& sink;
+    std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+    ~TranslateTimer() {
+        sink += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                               std::chrono::steady_clock::now() - start)
+                                               .count());
+    }
+};
 
 bool jit_exec_complex(ExecContext* ctx, GuestState* state, const Instruction* insn) noexcept {
     return execute_cached_helper(*insn, *state, *ctx->memory, &ctx->tlb);
@@ -112,6 +126,11 @@ const CachedBlock* TranslationCache::translate_at(Memory& memory, std::uint64_t 
         return cached;
     }
 
+    // Everything below is the miss path: decode, translate, allocate executable
+    // memory, and install. Timed as a whole, because that whole is what a guest
+    // pays the first time it reaches an address.
+    const TranslateTimer translate_timer{translation_ns_};
+
     ensure_trampolines();
 
     if (fetch_.size() < kMaxWindow) {
@@ -147,6 +166,7 @@ const CachedBlock* TranslationCache::translate_at(Memory& memory, std::uint64_t 
     const CachedBlock* raw = block.get();
     blocks_.emplace(pc, std::move(block));
     install(raw);
+    translated_guest_instructions_ += translated.guest_instruction_count;
     return raw;
 }
 
@@ -175,7 +195,13 @@ RunResult TranslationCache::run(Memory& memory, GuestState state, std::uint64_t 
     }
     cached_epoch_ = entry_epoch;
     ctx_->memory = &memory;
-    ctx_->tlb.flush(entry_epoch);
+    // The data SoftTlb is validated against the mapping generation, which changes
+    // on *any* operation that moves or re-permissions a page; the translation
+    // cache itself is invalidated by the code epoch, which changes when
+    // executable memory is written. Conflating the two either flushed on every
+    // syscall (~600 ns each) or, worse, left the data TLB holding freed pages.
+    cached_map_epoch_ = memory.mapping_epoch();
+    ctx_->tlb.flush(cached_map_epoch_);
 
     std::uint64_t steps = 0;
     while (true) {
@@ -237,8 +263,15 @@ RunResult TranslationCache::run(Memory& memory, GuestState state, std::uint64_t 
                 return out;
             }
             const SyscallResult sr = syscalls->handle(out.state, memory);
+            const std::uint64_t post_map_epoch = memory.mapping_epoch();
+            if (post_map_epoch != cached_map_epoch_) {
+                // The address space changed shape: every cached host page pointer
+                // is suspect. Flush the data TLB, and - if executable memory moved
+                // - drop the translations too.
+                ctx_->tlb.flush(post_map_epoch);
+                cached_map_epoch_ = post_map_epoch;
+            }
             const std::uint64_t post_epoch = memory.code_epoch();
-            ctx_->tlb.flush(post_epoch); // flush data SoftTlb across mmap/munmap/mprotect
             if (post_epoch != cached_epoch_) {
                 invalidate_all();
                 cached_epoch_ = post_epoch;

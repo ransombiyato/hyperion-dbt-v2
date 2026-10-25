@@ -367,3 +367,38 @@ HYPERION_TEST("decoder", "benign_rex_nop_and_multi_rex_length_limit") {
     HYPERION_CHECK(!too_long.ok());
     HYPERION_CHECK(too_long.error == DecodeError::kTooLong);
 }
+
+// --- LOCK prefix: recorded, deliberately not acted on ------------------------
+//
+// Hyperion refuses guest threads (see clone() in process.cpp), so a guest is a
+// single host thread. In a single-threaded process a LOCK-prefixed read-modify-
+// write is observationally identical to the plain RMW: no second observer can see
+// the intermediate value and no peer's stores need ordering. Executing it as a
+// plain RMW is therefore correct, and this test pins the contract at both ends -
+// the prefix is decoded and carried in the instruction (so a future atomics
+// implementation has something to read), and it does not change the semantics
+// today.
+HYPERION_TEST("decoder", "lock_prefix_is_recorded_and_does_not_change_semantics") {
+    // lock add [rax], rbx  : F0 48 01 18
+    const auto locked = dec({0xF0, 0x48, 0x01, 0x18});
+    HYPERION_CHECK(locked.ok());
+    HYPERION_CHECK(locked.instruction.lock);
+    HYPERION_CHECK(locked.instruction.opcode == Opcode::kAdd);
+    HYPERION_CHECK(locked.instruction.dst.kind == OperandKind::kMemory);
+
+    // The same instruction without the prefix must decode identically apart from
+    // the flag: if these two ever diverge, the prefix has started mattering in a
+    // place that has no atomics implementation behind it.
+    const auto plain = dec({0x48, 0x01, 0x18});
+    HYPERION_CHECK(plain.ok());
+    HYPERION_CHECK(!plain.instruction.lock);
+    HYPERION_CHECK(plain.instruction.opcode == locked.instruction.opcode);
+    HYPERION_CHECK(plain.instruction.dst.kind == locked.instruction.dst.kind);
+    HYPERION_CHECK(plain.instruction.dst.mem.base == locked.instruction.dst.mem.base);
+    HYPERION_CHECK(plain.instruction.length == locked.instruction.length - 1);
+
+    // LOCK is only legal on a memory destination: on a register operand the
+    // hardware faults (#UD) and so must the decoder - never a silent accept.
+    const auto illegal = dec({0xF0, 0x48, 0x01, 0xD8}); // lock add rax, rbx
+    HYPERION_CHECK(!illegal.ok());
+}

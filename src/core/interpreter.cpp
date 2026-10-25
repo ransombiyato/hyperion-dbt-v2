@@ -2316,9 +2316,8 @@ FastStepOutcome execute_decoded(GuestState& state, Memory& memory, SoftTlb* tlb,
         }
         state.rip = next_rip;
         const SyscallResult sr = syscalls->handle(state, memory);
-        if (tlb != nullptr) {
-            tlb->flush(memory.code_epoch());
-        }
+        // No flush here: the loop above revalidates against memory.mapping_epoch()
+        // before every instruction, which is both stricter and cheaper.
         if (sr.status == SyscallStatus::kExit) {
             result.status = StepStatus::kHalted;
             result.exited_via_syscall = true;
@@ -3073,10 +3072,17 @@ RunResult run_program(Memory& memory, GuestState state, std::uint64_t max_steps,
 
     for (std::uint64_t i = 0; i < max_steps; ++i) {
         const std::uint64_t pc = out.state.rip;
-        const std::uint64_t epoch = memory.code_epoch();
-        if (epoch != tlb.epoch) {
-            tlb.flush(epoch);
+        // Validate the cached host page pointers against the *mapping* generation,
+        // not the code/SMC epoch: an ordinary mprotect(RELRO) or a non-exec mmap
+        // moves backing stores without touching code. Checking here, once per
+        // guest instruction, also makes the old unconditional flush after every
+        // syscall unnecessary - it cost ~600 ns on each syscall, more than 5x the
+        // dispatch itself, for mappings a write()/getpid() cannot have changed.
+        const std::uint64_t map_epoch = memory.mapping_epoch();
+        if (map_epoch != tlb.epoch) {
+            tlb.flush(map_epoch);
         }
+        const std::uint64_t epoch = memory.code_epoch();
         DecodedSlot& slot = icache[pc & kDecodeCacheMask];
         if (epoch == 0 || slot.epoch != epoch || slot.pc != pc) {
             std::uint8_t code[15] = {};

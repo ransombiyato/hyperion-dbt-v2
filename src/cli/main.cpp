@@ -149,6 +149,33 @@ int cmd_info(int argc, char** argv) {
     return 0;
 }
 
+// Report the Tier 1 counters that the cache has always collected but never
+// printed. Every number here is measured, not estimated; where it is wall-clock
+// (translation time) that is said, because ns/guest-instruction at tier 1 is
+// amortised across a whole run and this is not.
+//
+// Kept *after* the existing "tier 1: N basic block(s) translated" line so that
+// consumers matching that line (tests/run_cross_tests.cmake) are unaffected.
+void print_tier1_stats(const hyperion::TranslationCache& cache) {
+    const std::size_t blocks = cache.block_count();
+    const std::uint64_t guest_instructions = cache.translated_guest_instructions();
+    const std::uint64_t hits = cache.dispatch_hits();
+    const std::uint64_t misses = cache.dispatch_misses();
+    std::printf("tier 1: %llu guest instruction(s) translated into %zu byte(s) of generated code\n",
+                static_cast<unsigned long long>(guest_instructions), cache.total_code_bytes());
+    std::printf("tier 1: dispatch %llu hit(s) / %llu miss(es)\n",
+                static_cast<unsigned long long>(hits), static_cast<unsigned long long>(misses));
+    if (blocks != 0) {
+        const std::uint64_t ns = cache.translation_ns();
+        std::printf("tier 1: translation %.3f ms wall (%.1f ns per translated guest "
+                    "instruction)\n",
+                    static_cast<double>(ns) / 1e6,
+                    guest_instructions != 0
+                        ? static_cast<double>(ns) / static_cast<double>(guest_instructions)
+                        : 0.0);
+    }
+}
+
 int run_blob(const std::vector<std::uint8_t>& code, int tier, std::uint64_t max_steps, bool quiet,
              bool dump) {
     if (code.size() > kMemSize) {
@@ -175,6 +202,7 @@ int run_blob(const std::vector<std::uint8_t>& code, int tier, std::uint64_t max_
         result = cache.run(memory, state, max_steps);
         if (!quiet) {
             std::printf("tier 1: %zu basic block(s) translated\n", cache.block_count());
+            print_tier1_stats(cache);
         }
     }
 
@@ -284,6 +312,7 @@ int run_elf(const std::vector<std::uint8_t>& file, const std::vector<std::string
         result = cache.run(space, state, max_steps, &syscalls);
         if (!quiet) {
             std::printf("tier 1: %zu basic block(s) translated\n", cache.block_count());
+            print_tier1_stats(cache);
         }
     }
 

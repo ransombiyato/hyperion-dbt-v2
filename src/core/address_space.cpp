@@ -36,6 +36,13 @@ std::optional<std::uint64_t> GuestAddressSpace::page_align_up(std::uint64_t valu
 }
 
 void GuestAddressSpace::reset() {
+    // Every mutating entry point bumps the mapping generation unconditionally.
+    // This is the counter a SoftTlb validates against: it is about pages
+    // moving, not about code changing, and getting it wrong for one branch is
+    // exactly how the data TLB came to hold pointers into freed buffers. An
+    // over-bump costs one 16 KiB flush; an under-bump costs wrong guest memory.
+    ++mapping_epoch_;
+
     // Free the backing storage before re-arming the cursor: a program image can
     // be hundreds of MiB, and holding it while the new image is mapped would
     // double the transient host footprint on a small device.
@@ -138,6 +145,13 @@ bool GuestAddressSpace::range_is_free(std::uint64_t addr, std::uint64_t size) co
 
 bool GuestAddressSpace::map_image(std::uint64_t base, const void* data, std::size_t size,
                                   MemPerm perm) {
+    // Every mutating entry point bumps the mapping generation unconditionally.
+    // This is the counter a SoftTlb validates against: it is about pages
+    // moving, not about code changing, and getting it wrong for one branch is
+    // exactly how the data TLB came to hold pointers into freed buffers. An
+    // over-bump costs one 16 KiB flush; an under-bump costs wrong guest memory.
+    ++mapping_epoch_;
+
     if ((base & kPageMask) != 0) {
         return false;
     }
@@ -179,6 +193,13 @@ bool GuestAddressSpace::map_image(std::uint64_t base, const void* data, std::siz
 
 bool GuestAddressSpace::map_segment(std::uint64_t vaddr, const void* data, std::size_t filesz,
                                     std::size_t memsz, MemPerm perm) {
+    // Every mutating entry point bumps the mapping generation unconditionally.
+    // This is the counter a SoftTlb validates against: it is about pages
+    // moving, not about code changing, and getting it wrong for one branch is
+    // exactly how the data TLB came to hold pointers into freed buffers. An
+    // over-bump costs one 16 KiB flush; an under-bump costs wrong guest memory.
+    ++mapping_epoch_;
+
     const auto* bytes_in = static_cast<const std::uint8_t*>(data);
     if (filesz > memsz || memsz == 0) {
         return false;
@@ -263,6 +284,13 @@ bool GuestAddressSpace::map_segment(std::uint64_t vaddr, const void* data, std::
 
 std::optional<std::uint64_t> GuestAddressSpace::map_anonymous(std::size_t size, MemPerm perm,
                                                               std::uint64_t hint) {
+    // Every mutating entry point bumps the mapping generation unconditionally.
+    // This is the counter a SoftTlb validates against: it is about pages
+    // moving, not about code changing, and getting it wrong for one branch is
+    // exactly how the data TLB came to hold pointers into freed buffers. An
+    // over-bump costs one 16 KiB flush; an under-bump costs wrong guest memory.
+    ++mapping_epoch_;
+
     if (size == 0) {
         return std::nullopt;
     }
@@ -343,6 +371,13 @@ std::optional<std::uint64_t> GuestAddressSpace::map_anonymous(std::size_t size, 
 
 bool GuestAddressSpace::map_fixed(std::uint64_t addr, std::size_t size, MemPerm perm,
                                   const void* init_data, std::size_t init_len) {
+    // Every mutating entry point bumps the mapping generation unconditionally.
+    // This is the counter a SoftTlb validates against: it is about pages
+    // moving, not about code changing, and getting it wrong for one branch is
+    // exactly how the data TLB came to hold pointers into freed buffers. An
+    // over-bump costs one 16 KiB flush; an under-bump costs wrong guest memory.
+    ++mapping_epoch_;
+
     if (size == 0 || (addr & kPageMask) != 0 || size > max_map_bytes_ || init_len > size) {
         return false;
     }
@@ -391,6 +426,13 @@ bool GuestAddressSpace::map_fixed(std::uint64_t addr, std::size_t size, MemPerm 
 }
 
 bool GuestAddressSpace::unmap(std::uint64_t addr, std::size_t size) {
+    // Every mutating entry point bumps the mapping generation unconditionally.
+    // This is the counter a SoftTlb validates against: it is about pages
+    // moving, not about code changing, and getting it wrong for one branch is
+    // exactly how the data TLB came to hold pointers into freed buffers. An
+    // over-bump costs one 16 KiB flush; an under-bump costs wrong guest memory.
+    ++mapping_epoch_;
+
     if (size == 0 || (addr & kPageMask) != 0) {
         return false;
     }
@@ -430,6 +472,13 @@ bool GuestAddressSpace::unmap(std::uint64_t addr, std::size_t size) {
 }
 
 bool GuestAddressSpace::protect(std::uint64_t addr, std::size_t size, MemPerm perm) {
+    // Every mutating entry point bumps the mapping generation unconditionally.
+    // This is the counter a SoftTlb validates against: it is about pages
+    // moving, not about code changing, and getting it wrong for one branch is
+    // exactly how the data TLB came to hold pointers into freed buffers. An
+    // over-bump costs one 16 KiB flush; an under-bump costs wrong guest memory.
+    ++mapping_epoch_;
+
     if (size == 0 || (addr & kPageMask) != 0) {
         return false;
     }
@@ -469,6 +518,13 @@ bool GuestAddressSpace::protect(std::uint64_t addr, std::size_t size, MemPerm pe
 }
 
 std::uint64_t GuestAddressSpace::set_brk(std::uint64_t requested) {
+    // Every mutating entry point bumps the mapping generation unconditionally.
+    // This is the counter a SoftTlb validates against: it is about pages
+    // moving, not about code changing, and getting it wrong for one branch is
+    // exactly how the data TLB came to hold pointers into freed buffers. An
+    // over-bump costs one 16 KiB flush; an under-bump costs wrong guest memory.
+    ++mapping_epoch_;
+
     if (requested < heap_base_ || requested > heap_end_) {
         return brk_; // unchanged: the request is outside the heap area
     }
@@ -504,6 +560,13 @@ std::uint64_t GuestAddressSpace::set_brk(std::uint64_t requested) {
 }
 
 bool GuestAddressSpace::ensure_heap_mapped(std::uint64_t upto) {
+    // Every mutating entry point bumps the mapping generation unconditionally.
+    // This is the counter a SoftTlb validates against: it is about pages
+    // moving, not about code changing, and getting it wrong for one branch is
+    // exactly how the data TLB came to hold pointers into freed buffers. An
+    // over-bump costs one 16 KiB flush; an under-bump costs wrong guest memory.
+    ++mapping_epoch_;
+
     if (upto <= heap_base_) {
         return true;
     }

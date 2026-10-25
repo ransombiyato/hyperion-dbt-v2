@@ -318,3 +318,80 @@ HYPERION_TEST("address_space", "sub_region_mprotect_and_nx_instruction_fetch_enf
         HYPERION_CHECK(revoked.status == hyperion::RunStatus::kFault);
     }
 }
+
+// --- mapping generation: the contract the data SoftTlb validates against ----
+//
+// The interpreter and the JIT both cache `host_page` pointers in a SoftTlb and
+// re-validate them against mapping_epoch(). That is only sound if *every*
+// operation that can add, remove, resize, move or re-permission a page bumps it.
+// code_epoch() is not a substitute: it has to track self-modifying code, so it
+// legitimately bumps only when executable memory is involved, and a plain
+// non-exec mprotect(RELRO) or mmap moves backing stores without touching code.
+//
+// This test walks each mutating operation and requires the generation to move.
+// It would have caught the bug this pair of counters was introduced to fix: with
+// only code_epoch, a non-exec protect() left the data TLB holding pointers into a
+// buffer that split_region_at() had already replaced, and the guest read freed
+// memory.
+HYPERION_TEST("address_space", "every_mapping_mutation_bumps_the_mapping_generation") {
+    GuestAddressSpace as;
+
+    const auto bump_on = [&as](const char* what, auto&& op) {
+        const std::uint64_t before = as.mapping_epoch();
+        op();
+        if (as.mapping_epoch() == before) {
+            std::fprintf(stderr, "  mapping_epoch did not move for: %s\n", what);
+        }
+        HYPERION_CHECK(as.mapping_epoch() != before);
+    };
+
+    std::uint64_t one = 0;
+    bump_on("map_anonymous", [&] {
+        const auto base = as.map_anonymous(kPage, MemPerm::kRead | MemPerm::kWrite);
+        HYPERION_CHECK(base.has_value());
+        one = base.value_or(0);
+    });
+
+    // Non-executable protect: the exact case code_epoch() deliberately ignores,
+    // because re-permissioning a page is not self-modifying code.
+    bump_on("protect(non-exec)", [&] { HYPERION_CHECK(as.protect(one, kPage, MemPerm::kRead)); });
+
+    // A protect that splits a mapping: split_region_at() replaces the tail's
+    // backing store, so host pointers cached for the tail pages go stale even
+    // though the split pages keep their original permissions.
+    std::uint64_t split_base = 0;
+    bump_on("map_anonymous(4 pages)", [&] {
+        const auto base = as.map_anonymous(4 * kPage, MemPerm::kRead | MemPerm::kWrite);
+        HYPERION_CHECK(base.has_value());
+        split_base = base.value_or(0);
+    });
+    bump_on("protect(split)", [&] {
+        HYPERION_CHECK(as.protect(split_base + kPage, kPage, MemPerm::kRead | MemPerm::kWrite));
+    });
+
+    bump_on("unmap", [&] { HYPERION_CHECK(as.unmap(split_base, kPage)); });
+
+    bump_on("map_fixed", [&] {
+        HYPERION_CHECK(
+            as.map_fixed(split_base, kPage, MemPerm::kRead | MemPerm::kWrite, nullptr, 0));
+    });
+
+    // brk changes the heap's backing store shape with no mprotect at all.
+    const std::uint64_t grown = as.set_brk(as.brk() + 64 * kPage);
+    HYPERION_CHECK_EQ(grown, as.brk());
+    bump_on("set_brk(grow)", [&] { (void)as.set_brk(grown + 16 * kPage); });
+    bump_on("set_brk(shrink)", [&] { (void)as.set_brk(grown); });
+
+    bump_on("reset", [&] { as.reset(); });
+
+    // The two generations must stay independent: an ordinary non-exec mapping
+    // change has to be visible to the TLB yet must not be mistaken for
+    // self-modifying code, or every mmap would discard the whole translation
+    // cache.
+    GuestAddressSpace plain;
+    const std::uint64_t code_before = plain.code_epoch();
+    const std::uint64_t mapping_before = plain.mapping_epoch();
+    HYPERION_CHECK(plain.map_anonymous(kPage, MemPerm::kRead | MemPerm::kWrite).has_value());
+    HYPERION_CHECK_EQ(plain.code_epoch(), code_before);
+    HYPERION_CHECK(plain.mapping_epoch() != mapping_before);
+}
