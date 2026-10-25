@@ -324,8 +324,8 @@ guest buffer from the host in 4 KiB chunks, accepting only the two defined
 | `pipe`(22)/`pipe2`(293) + inheritance across `fork` | ✅ | 6 | `guest.process` (`pipe + fork IPC`, `file descriptor inheritance`) |
 | `futex`(202) | ⚠️ **stub, deliberately honest**: the value comparison is real (`-EAGAIN` when the word changed, `-EFAULT` on a bad address), `WAKE` reports 0 woken, and the paths that need a wait queue (`WAIT` on a matching value, PI, requeue) are refused with `-ENOSYS` instead of falsely reporting a wake-up | 6 | `syscall.linux_compat_futex_*` |
 | Thread creation (`clone` with `CLONE_THREAD`) | ❌ `-ENOSYS` by design | 6 | `guest.process` |
-| Signals: `rt_sigaction`(13) **records and reports the guest's dispositions**, `rt_sigprocmask`(14) tracked in a guest mask, handlers **not** invoked | ⚠️ partial — dispositions round-trip, delivery is not implemented (see below) | 6 | — |
-| `kill`(62)/`tgkill`(234) | ✅ (signal delivery to the single guest thread) | 6 | — |
+| Signals: `rt_sigaction`(13) **records and reports the guest's dispositions**, `rt_sigprocmask`(14) tracked in a guest mask (with `SIG_BLOCK`/`SIG_UNBLOCK`/`SIG_SETMASK`), handlers **not** invoked | ⚠️ partial — dispositions and masks round-trip, delivery into a guest handler is not implemented (see below) | 6 | `syscall.kill_*`, `syscall.a_blocked_signal_*`, `syscall.an_installed_handler_*` |
+| `kill`(62)/`tgkill`(234) aimed at this (single) guest process | ⚠️ synchronous self-raise only, decided by the guest's own disposition and mask: `SIG_IGN` and ignore-class defaults drop it, a **blocked** signal is held and delivered when the mask stops blocking it, a terminate-class default ends the run with status `128+signo`, and an installed handler is **not** invoked (the run ends the same way) | 6 | `syscall.kill_*`, `syscall.SIGKILL_cannot_be_blocked_or_ignored` |
 | `epoll_create1`(291)/`epoll_ctl`(233)/`epoll_wait`(232)/`epoll_pwait`(281)/`epoll_pwait2`(441) | ✅ (packed 12-byte guest `epoll_event` converted per entry) | 6 | `syscall_adapters.*`, `guest.syscall_compat` |
 | `poll`(7)/`ppoll`(271), `select`(23)/`pselect6`(270) | ✅ (`pollfd` and `fd_set` translated, guest fds restored on write-back) | 6 | `syscall_adapters.*`, `guest.syscall_compat` |
 | `eventfd2`(290), `timerfd_create`(283)/`settime`(286)/`gettime`(287), `memfd_create`(319) | ✅ | 6 | `syscall_adapters.*`, `guest.syscall_compat` |
@@ -418,6 +418,19 @@ regress into a fake success.
   block or kill the parent, but a handler the guest installed will not run.
   Guests that poll with `wait4` — BusyBox and glibc's `system()`/`posix_spawn`
   both do — work; guests that rely purely on a `SIGCHLD` handler do not.
+  Since `kill`/`tgkill` became disposition-aware, that distinction is visible in
+  the cases a guest can actually reach: self-signalling with an ignored signal,
+  with an ignore-class default (`SIGCHLD`, `SIGCONT`, `SIGURG`, `SIGWINCH`) or
+  with a blocked signal no longer kills the run, and a blocked signal that is
+  later unblocked is handled at that point. The two cases that remain wrong are
+  an *installed handler* (it never runs; the run ends with `128+signo` instead)
+  and the stop class (`SIGSTOP`/`SIGTSTP`/`SIGTTIN`/`SIGTTOU`, whose default
+  action has no meaning for a process with no scheduler, so it is dropped).
+  **Nothing arrives asynchronously**: no host signal is forwarded into the guest,
+  so `SIGINT` from a terminal, `SIGTERM` from a supervisor or `SIGSEGV` from an
+  out-of-bounds guest access are not delivered as guest signals at all — a guest
+  memory fault is reported through the emulator's own fault path instead
+  (`LIM-022`).
 
 ### Verified end-to-end
 

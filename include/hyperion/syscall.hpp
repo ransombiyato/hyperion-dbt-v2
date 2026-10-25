@@ -60,6 +60,8 @@ namespace hyperion {
 // handler does not depend on the documentation.
 namespace sysno {
 inline constexpr std::uint64_t kRead = 0;
+inline constexpr std::uint64_t kRtSigaction = 13;
+inline constexpr std::uint64_t kRtSigprocmask = 14;
 inline constexpr std::uint64_t kWrite = 1;
 inline constexpr std::uint64_t kClose = 3;
 inline constexpr std::uint64_t kFstat = 5;
@@ -80,6 +82,7 @@ inline constexpr std::uint64_t kFork = 57;
 inline constexpr std::uint64_t kVfork = 58;
 inline constexpr std::uint64_t kClone = 56;
 inline constexpr std::uint64_t kExit = 60;
+inline constexpr std::uint64_t kKill = 62;
 inline constexpr std::uint64_t kWait4 = 61;
 inline constexpr std::uint64_t kExecve = 59;
 inline constexpr std::uint64_t kUname = 63;
@@ -98,6 +101,7 @@ inline constexpr std::uint64_t kGetdents64 = 217;
 inline constexpr std::uint64_t kSetTidAddress = 218;
 inline constexpr std::uint64_t kClockGettime = 228;
 inline constexpr std::uint64_t kExitGroup = 231;
+inline constexpr std::uint64_t kTgkill = 234;
 inline constexpr std::uint64_t kOpenat = 257;
 inline constexpr std::uint64_t kNewfstatat = 262;
 inline constexpr std::uint64_t kReadlinkat = 267;
@@ -528,6 +532,27 @@ private:
     std::uint64_t altstack_sp_ = 0;
     std::int32_t altstack_flags_ = 2; // SS_DISABLE
     std::uint64_t altstack_size_ = 0;
+
+    // --- Signals raised at this guest, and what happens to them (P12) --------
+    //
+    // Only *synchronous* self-raised signals exist here: kill/tgkill aimed at
+    // this process. Nothing arrives asynchronously (no host signal is forwarded),
+    // so `signal_pending_` only ever holds signals that arrived while blocked.
+    // Bit (sig - 1) is set for a pending signal, matching the guest's own
+    // sigset_t layout.
+    std::uint64_t signal_pending_ = 0;
+    // What the recorded disposition and the default table say a signal does,
+    // ignoring the mask: 0 = the guest must not notice it, otherwise 128 + sig is
+    // the status the guest run ends with. Never builds or calls a guest handler -
+    // that needs an x86-64 signal frame and rt_sigreturn, which this layer does
+    // not implement (COMPATIBILITY.md states the gap).
+    std::int64_t signal_disposition(int sig) const;
+    // Mask-aware: queues a blocked signal, returns 0 when the guest keeps
+    // running, else 128 + sig.
+    std::int64_t raise_signal(int sig);
+    // Re-evaluate signals that were blocked when they arrived; call after the
+    // mask changes. Same return convention as raise_signal().
+    std::int64_t deliver_pending_signals();
 
     // prctl(2) state this layer can answer from. These are the options whose
     // observable meaning for the guest is "what does prctl report back":

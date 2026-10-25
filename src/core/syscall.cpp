@@ -2178,6 +2178,18 @@ SyscallResult MinimalSyscallHandler::handle_unguarded(GuestState& state, Memory&
                             sigmask_ &= ~m;
                         } else if (how == 2) {
                             sigmask_ = m;
+                        } else {
+                            r = -kEinval;
+                            break;
+                        }
+                        // A signal that arrived while blocked is delivered as
+                        // soon as the mask stops blocking it - that is the whole
+                        // point of queueing it rather than dropping it.
+                        const std::int64_t outcome = deliver_pending_signals();
+                        if (outcome != 0) {
+                            result.status = SyscallStatus::kExit;
+                            result.exit_code = outcome;
+                            return result;
                         }
                     }
                     r = 0;
@@ -2943,10 +2955,25 @@ SyscallResult MinimalSyscallHandler::handle_unguarded(GuestState& state, Memory&
                 break;
             case 62:    // kill
             case 234: { // tgkill(tgid, tid, sig)
+                // Every signal this layer can see is aimed at the one guest
+                // process it emulates, so kill()/tgkill() is a *synchronous*
+                // self-raise. What happens next is decided by the disposition the
+                // guest installed and by its signal mask, not by the syscall:
+                // ignoring it, dropping it (SIG_IGN or an ignore-class default),
+                // holding it until the guest unblocks it, or ending the run.
                 const int sig = (result.number == 234) ? arg_i32(state, 2) : arg_i32(state, 1);
-                if (sig != 0) {
+                if (sig < 0 || sig > static_cast<int>(kMaxSignal)) {
+                    r = -kEinval;
+                    break;
+                }
+                if (sig == 0) {
+                    r = 0; // existence probe: the process is obviously there
+                    break;
+                }
+                const std::int64_t outcome = raise_signal(sig);
+                if (outcome != 0) {
                     result.status = SyscallStatus::kExit;
-                    result.exit_code = 128 + (sig & 0x7F);
+                    result.exit_code = outcome;
                     return result;
                 }
                 r = 0;
@@ -2966,6 +2993,79 @@ SyscallResult MinimalSyscallHandler::handle_unguarded(GuestState& state, Memory&
         result.status = SyscallStatus::kUnimplemented;
         return result;
     }
+}
+
+// --- signal dispositions (P12) ---------------------------------------------
+//
+// A single-threaded emulator can honour exactly three outcomes for a signal
+// aimed at the guest: ignore it, hold it while it is blocked, or end the run.
+// Guest *handlers* are a fourth outcome that this layer cannot produce - it would
+// have to build an x86-64 rt_sigframe on the guest stack, divert rip, and
+// implement rt_sigreturn to undo it - so an installed handler is treated as the
+// terminate class and the gap is documented rather than reported as success.
+//
+// Default dispositions, restricted to what a process without a scheduler and
+// without a stopped state can represent:
+//   SIGCHLD(17) SIGURG(23) SIGWINCH(28) SIGCONT(18)  default action is "ignore"
+//   SIGSTOP(19) SIGTSTP(20) SIGTTIN(21) SIGTTOU(22)  default action is "stop",
+//     which has no equivalent here; terminating would end a run a real kernel
+//     would merely pause, so these are treated as ignored as well.
+std::int64_t MinimalSyscallHandler::signal_disposition(int sig) const {
+    switch (sig) {
+    case 17: // SIGCHLD
+    case 18: // SIGCONT
+    case 19: // SIGSTOP
+    case 20: // SIGTSTP
+    case 21: // SIGTTIN
+    case 22: // SIGTTOU
+    case 23: // SIGURG
+    case 28: // SIGWINCH
+        return 0;
+    default:
+        break;
+    }
+    const auto index = static_cast<std::size_t>(sig);
+    if (index < sigactions_.size() && sigactions_[index].installed) {
+        const GuestSignalAction& act = sigactions_[index];
+        if (act.handler == 1) {
+            return 0; // SIG_IGN
+        }
+        // A real handler address is installed and therefore *not* the default
+        // action: this layer cannot invoke it, so the run ends with the status a
+        // terminate-class default would have produced.
+        return 128 + sig;
+    }
+    return 128 + sig;
+}
+
+std::int64_t MinimalSyscallHandler::raise_signal(int sig) {
+    // SIGKILL and SIGSTOP are the two signals a mask cannot hold back.
+    const bool maskable = (sig != 9 && sig != 19);
+    const std::uint64_t bit = (sig >= 1 && sig <= 64) ? (1ULL << (sig - 1)) : 0;
+    if (maskable && bit != 0 && (sigmask_ & bit) != 0) {
+        signal_pending_ |= bit;
+        return 0;
+    }
+    return signal_disposition(sig);
+}
+
+std::int64_t MinimalSyscallHandler::deliver_pending_signals() {
+    for (int sig = 1; sig <= static_cast<int>(kMaxSignal) && signal_pending_ != 0; ++sig) {
+        const std::uint64_t bit = 1ULL << (sig - 1);
+        if ((signal_pending_ & bit) == 0) {
+            continue;
+        }
+        const bool maskable = (sig != 9 && sig != 19);
+        if (maskable && (sigmask_ & bit) != 0) {
+            continue; // still blocked
+        }
+        signal_pending_ &= ~bit;
+        const std::int64_t outcome = signal_disposition(sig);
+        if (outcome != 0) {
+            return outcome;
+        }
+    }
+    return 0;
 }
 
 // The syscall numbers handled by the nested `if (linux_compat_)` switch inside

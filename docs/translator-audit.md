@@ -1877,7 +1877,7 @@ easy half; the surface is every place a flag can be produced or observed:
 * and it must be *exactly* the reference interpreter's answer, including the flags x86
   calls undefined, because the whole test strategy is differential against tier 0.
 
-The defensible way in is to make flag effects explicit in an IR (§29.16, P14) and generate
+The defensible way in is to make flag effects explicit in an IR (§29.18, P14) and generate
 the descriptor from one table instead of from ~30 emitter sites. Revisit trigger: either a
 native-AArch64 measurement setup with ≤1 % noise, or P14 landing with a flag-effect table.
 
@@ -1926,6 +1926,81 @@ decision with its own cost), the boundary cost rises and this becomes worth meas
 As it stands, P11 (inlining the remaining helper opcodes) and P6 (not translating cold
 blocks) attacked the same overhead from the side that actually pays.
 
+### 29.16 P12 — signals: what exists, what was fixed, and the gap that stays a gap
+
+Item 12 of §L asks for an audit before anything else, and the audit is the reason this item
+is smaller than it looks: the missing part is not a policy, it is an x86-64 signal frame.
+
+#### Audit — what a guest can do today
+
+| mechanism | before this change | after |
+| --- | --- | --- |
+| `rt_sigaction`(13) | records and reports dispositions; rejects `SIGKILL`/`SIGSTOP` and a wrong `sigsetsize` | unchanged |
+| `rt_sigprocmask`(14) | `SIG_BLOCK`/`SIG_UNBLOCK`/`SIG_SETMASK` stored in a guest mask; an invalid `how` was silently treated as "set" | invalid `how` now `-EINVAL`; the mask change re-evaluates pending signals |
+| `sigaltstack`(131) | records and reports the alternate stack | unchanged (still never *used*: nothing is delivered) |
+| `kill`(62)/`tgkill`(234) | **any non-zero signal ended the run** with `128+signo`, whatever the guest had installed | decided by the guest's disposition and mask — see below |
+| handler invocation | never | never (documented, with the reason) |
+| `rt_sigreturn`(15) | `-ENOSYS` | unchanged; unreachable while nothing is delivered |
+| asynchronous delivery | none: no host signal is forwarded, no signal can arrive mid-block | unchanged, and stated as an invariant (see below) |
+
+#### What was implemented
+
+`kill`/`tgkill` aimed at this guest (the only target the emulator has) is now a *synchronous
+self-raise* evaluated against the guest's own recorded disposition and mask:
+
+* **blocked** (`sigmask_`, and the signal is maskable) → recorded in `signal_pending_`,
+  syscall returns 0. `rt_sigprocmask` re-evaluates the pending set after every successful
+  mask change and handles what it can now see — which is what makes `block(SIGUSR1);
+  raise(SIGUSR1); unblock()` behave like Linux instead of killing the guest in the middle;
+* **`SIG_IGN`**, or a default action that ignores for a single-threaded process
+  (`SIGCHLD`, `SIGCONT`, `SIGURG`, `SIGWINCH`) → dropped, syscall returns 0. This was the
+  most visible bug: a guest that ignores `SIGCHLD` and signals itself died;
+* **stop class** (`SIGSTOP`/`SIGTSTP`/`SIGTTIN`/`SIGTTOU`) → dropped. There is no stopped
+  state to enter, and terminating would end a run a real kernel would merely pause; the
+  choice is documented rather than silent;
+* **terminate class**, or a signal the mask cannot hold (`SIGKILL`, `SIGSTOP`) → the run ends
+  with status `128 + signo`, which is what a caller observes;
+* `signo == 0` → 0 (existence probe); `signo < 0 || signo > 64` → `-EINVAL`.
+
+These are the outcomes a process without a scheduler and without a frame builder can
+represent honestly. What is deliberately *not* here:
+
+* **An installed handler is not invoked.** The run ends with `128+signo` instead. This
+  needs, at minimum: the 248-byte `rt_sigframe` laid out exactly as x86-64 glibc expects
+  (`pretcode`, `ucontext` with a full `sigcontext`, `siginfo_t`), the `SA_SIGINFO` vs
+  `void(int)` calling convention, `SA_ONSTACK` (the recorded altstack), `SA_NODEFER` and
+  `SA_RESETHAND` mask semantics, `SA_RESTART` syscall restart, and `rt_sigreturn` to undo
+  all of it. Getting the frame wrong produces a guest crash that looks like an emulator
+  bug, so it needs an end-to-end test with a real dynamically-linked guest process before it
+  can be claimed. A test pins the current behaviour
+  (`an_installed_handler_is_documented_as_not_invoked`) so the gap cannot quietly turn into
+  a success return that drops the signal.
+* **No asynchronous signals, by construction.** Nothing on the host side installs a handler,
+  so there is no path by which a signal could interrupt generated code — which is also why
+  the translator needs no safe-point machinery. The invariant is worth stating: signals are
+  only raised at syscall boundaries, and a syscall already leaves generated code through the
+  exit epilogue, so `GuestState` (including the pending PF/AF descriptor of §29.11) is
+  coherent at every point where a signal can be decided. Host `SIGINT`/`SIGTERM` kill the
+  emulator itself; a guest memory fault is reported through the fault path (`RunStatus::kFault`),
+  not as a guest `SIGSEGV` with a frame.
+
+#### Tests — eight new deterministic cases
+
+`syscall.kill_ignores_an_ignore_class_default_signal`, `kill_honours_SIG_IGN`,
+`kill_of_a_terminate_class_signal_ends_the_run`, `a_blocked_signal_is_held_and_delivered_when_unblocked`,
+`an_ignored_blocked_signal_is_dropped_on_unblock`, `SIGKILL_cannot_be_blocked_or_ignored`,
+`an_installed_handler_is_documented_as_not_invoked`,
+`kill_rejects_a_signal_number_out_of_range`. Each drives `MinimalSyscallHandler` directly with
+a real `GuestState` and `FlatMemory`, so they are deterministic and host-independent
+(they run on both the native and the AArch64 builds — no `HYPERION_SKIP`).
+
+#### Verification
+
+* native (x86-64) clang-19: **349 passed / 0 failed / 47 skipped of 396**; `ctest` 19/19
+* AArch64 (`qemu-aarch64-static`): **396 passed / 0 failed / 5 skipped of 401**
+* no generated-code change: this item is entirely in the syscall layer, so the translator
+  and its differential tests are untouched
+
 ### 29.9 Still open from §L
 
 Items 1-5 of §L are all resolved (1 justified and pinned, 2 and 5 implemented, 3 retracted as wrong,
@@ -1948,8 +2023,10 @@ deferral cannot resolve 5 words per producer in this environment (ratio median 1
 0.89–1.21) — so it is deferred, not attempted, with the required design recorded. Item 8 (cross-block register allocation) was
 measured in §29.15: the allocator pins 0.65–0.75 registers per block, so all boundary traffic
 together is 6.1–6.6 % of generated code and only part of that is removable — below the
-measurement resolution of §29.14, so it is designed but deferred. Still open: 12 (signal delivery),
-13 (guest threads), 14 (an IR and a real optimiser).
+measurement resolution of §29.14, so it is designed but deferred. Item 12 (signals) is audited and partly
+implemented in §29.16: `kill`/`tgkill` now honour the guest's disposition and mask instead of
+ending every run, with handler invocation (the x86-64 frame plus `rt_sigreturn`) and asynchronous
+delivery documented as absent. Still open: 13 (guest threads), 14 (an IR and a real optimiser).
 
 ---
 

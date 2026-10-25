@@ -2158,6 +2158,174 @@ GuestSigaction read_sigaction(FlatMemory& memory, std::uint64_t addr) {
 
 } // namespace
 
+// --- P12: what a signal aimed at the guest actually does --------------------
+//
+// Before this, kill()/tgkill() with any non-zero signal ended the run
+// unconditionally, whatever the guest had installed: a program that ignored
+// SIGCHLD, or blocked SIGUSR1 and unblocked it later, died instead. These tests
+// pin the three outcomes a single-threaded emulator can honour - ignore, hold
+// while blocked, terminate - and pin the documented gap (an installed handler is
+// not invoked) so nobody can mistake it for support.
+
+HYPERION_TEST("syscall", "kill_ignores_an_ignore_class_default_signal") {
+    GuestAddressSpace as;
+    MinimalSyscallHandler handler({}, &as);
+    handler.enable_linux_compat();
+    FlatMemory memory(kBase, kMemSize);
+
+    // SIGCHLD's default action is "ignore"; signalling yourself with it must not
+    // end the run.
+    GuestState s = syscall_state(hyperion::sysno::kKill, {1 /*pid: self*/, 17 /*SIGCHLD*/});
+    const auto r = handler.handle(s, memory);
+    HYPERION_CHECK(r.status == SyscallStatus::kHandled);
+    HYPERION_CHECK_EQ(s.reg(Gpr::kRax), std::uint64_t{0});
+}
+
+HYPERION_TEST("syscall", "kill_honours_SIG_IGN") {
+    GuestAddressSpace as;
+    MinimalSyscallHandler handler({}, &as);
+    handler.enable_linux_compat();
+    FlatMemory memory(kBase, kMemSize);
+
+    // rt_sigaction(SIGUSR1, {SIG_IGN}, nullptr, 8)
+    const GuestSigaction ign{1 /*SIG_IGN*/, 0, 0, 0};
+    write_sigaction(memory, kBase + 0x100, ign);
+    GuestState install =
+        syscall_state(hyperion::sysno::kRtSigaction, {10 /*SIGUSR1*/, kBase + 0x100, 0, 8});
+    HYPERION_CHECK(handler.handle(install, memory).status == SyscallStatus::kHandled);
+    HYPERION_CHECK_EQ(install.reg(Gpr::kRax), std::uint64_t{0});
+
+    GuestState s = syscall_state(hyperion::sysno::kKill, {1, 10});
+    const auto r = handler.handle(s, memory);
+    HYPERION_CHECK(r.status == SyscallStatus::kHandled);
+    HYPERION_CHECK_EQ(s.reg(Gpr::kRax), std::uint64_t{0}); // ignored, not fatal
+}
+
+HYPERION_TEST("syscall", "kill_of_a_terminate_class_signal_ends_the_run") {
+    GuestAddressSpace as;
+    MinimalSyscallHandler handler({}, &as);
+    handler.enable_linux_compat();
+    FlatMemory memory(kBase, kMemSize);
+
+    // SIGTERM with the default disposition: the run ends, status 128 + 15. This
+    // is the behaviour that makes `raise(SIGABRT)`-style aborts observable.
+    GuestState s = syscall_state(hyperion::sysno::kKill, {1, 15});
+    const auto r = handler.handle(s, memory);
+    HYPERION_CHECK(r.status == SyscallStatus::kExit);
+    HYPERION_CHECK_EQ(r.exit_code, std::int64_t{143});
+}
+
+HYPERION_TEST("syscall", "a_blocked_signal_is_held_and_delivered_when_unblocked") {
+    GuestAddressSpace as;
+    MinimalSyscallHandler handler({}, &as);
+    handler.enable_linux_compat();
+    FlatMemory memory(kBase, kMemSize);
+
+    // rt_sigprocmask(SIG_BLOCK, {SIGUSR1}, nullptr, 8)
+    const std::uint64_t mask = 1ULL << (10 - 1);
+    std::array<std::uint8_t, 8> buf{};
+    hyperion::syscall_detail::put_u64(buf.data(), 0, mask);
+    HYPERION_CHECK(memory.write(kBase + 0x200, buf.data(), buf.size()));
+    GuestState block =
+        syscall_state(hyperion::sysno::kRtSigprocmask, {0 /*SIG_BLOCK*/, kBase + 0x200, 0, 8});
+    HYPERION_CHECK(handler.handle(block, memory).status == SyscallStatus::kHandled);
+
+    // The signal arrives while blocked: the syscall succeeds and nothing happens.
+    GuestState raise = syscall_state(hyperion::sysno::kKill, {1, 10});
+    const auto r1 = handler.handle(raise, memory);
+    HYPERION_CHECK(r1.status == SyscallStatus::kHandled);
+    HYPERION_CHECK_EQ(raise.reg(Gpr::kRax), std::uint64_t{0});
+
+    // Unblocking it must now deliver it, which for SIG_DFL/SIGUSR1 ends the run.
+    GuestState unblock =
+        syscall_state(hyperion::sysno::kRtSigprocmask, {1 /*SIG_UNBLOCK*/, kBase + 0x200, 0, 8});
+    const auto r2 = handler.handle(unblock, memory);
+    HYPERION_CHECK(r2.status == SyscallStatus::kExit);
+    HYPERION_CHECK_EQ(r2.exit_code, std::int64_t{138});
+}
+
+HYPERION_TEST("syscall", "an_ignored_blocked_signal_is_dropped_on_unblock") {
+    GuestAddressSpace as;
+    MinimalSyscallHandler handler({}, &as);
+    handler.enable_linux_compat();
+    FlatMemory memory(kBase, kMemSize);
+
+    const std::uint64_t mask = 1ULL << (10 - 1);
+    std::array<std::uint8_t, 8> buf{};
+    hyperion::syscall_detail::put_u64(buf.data(), 0, mask);
+    HYPERION_CHECK(memory.write(kBase + 0x200, buf.data(), buf.size()));
+    GuestState block = syscall_state(hyperion::sysno::kRtSigprocmask, {0, kBase + 0x200, 0, 8});
+    HYPERION_CHECK(handler.handle(block, memory).status == SyscallStatus::kHandled);
+
+    const GuestSigaction ign{1, 0, 0, 0};
+    write_sigaction(memory, kBase + 0x100, ign);
+    GuestState install = syscall_state(hyperion::sysno::kRtSigaction, {10, kBase + 0x100, 0, 8});
+    HYPERION_CHECK(handler.handle(install, memory).status == SyscallStatus::kHandled);
+
+    GuestState raise = syscall_state(hyperion::sysno::kKill, {1, 10});
+    HYPERION_CHECK(handler.handle(raise, memory).status == SyscallStatus::kHandled);
+
+    GuestState unblock = syscall_state(hyperion::sysno::kRtSigprocmask, {1, kBase + 0x200, 0, 8});
+    const auto r = handler.handle(unblock, memory);
+    HYPERION_CHECK(r.status == SyscallStatus::kHandled); // ignored, run continues
+    HYPERION_CHECK_EQ(unblock.reg(Gpr::kRax), std::uint64_t{0});
+}
+
+HYPERION_TEST("syscall", "SIGKILL_cannot_be_blocked_or_ignored") {
+    GuestAddressSpace as;
+    MinimalSyscallHandler handler({}, &as);
+    handler.enable_linux_compat();
+    FlatMemory memory(kBase, kMemSize);
+
+    // A mask that claims to block SIGKILL must not save the guest.
+    const std::uint64_t mask = 1ULL << (9 - 1);
+    std::array<std::uint8_t, 8> buf{};
+    hyperion::syscall_detail::put_u64(buf.data(), 0, mask);
+    HYPERION_CHECK(memory.write(kBase + 0x200, buf.data(), buf.size()));
+    GuestState block = syscall_state(hyperion::sysno::kRtSigprocmask, {0, kBase + 0x200, 0, 8});
+    HYPERION_CHECK(handler.handle(block, memory).status == SyscallStatus::kHandled);
+
+    GuestState s = syscall_state(hyperion::sysno::kKill, {1, 9});
+    const auto r = handler.handle(s, memory);
+    HYPERION_CHECK(r.status == SyscallStatus::kExit);
+    HYPERION_CHECK_EQ(r.exit_code, std::int64_t{137});
+}
+
+HYPERION_TEST("syscall", "an_installed_handler_is_documented_as_not_invoked") {
+    GuestAddressSpace as;
+    MinimalSyscallHandler handler({}, &as);
+    handler.enable_linux_compat();
+    FlatMemory memory(kBase, kMemSize);
+
+    // A handler address is installed: this layer cannot build an x86-64 signal
+    // frame and call it, so the run ends with the terminate-class status. The
+    // point of this test is that the gap cannot silently turn into "the handler
+    // ran" or into a success return that drops the signal.
+    const GuestSigaction act{0x400100, 0x4 /*SA_SIGINFO*/, 0x400200, 0};
+    write_sigaction(memory, kBase + 0x100, act);
+    GuestState install = syscall_state(hyperion::sysno::kRtSigaction, {10, kBase + 0x100, 0, 8});
+    HYPERION_CHECK(handler.handle(install, memory).status == SyscallStatus::kHandled);
+
+    GuestState s = syscall_state(hyperion::sysno::kKill, {1, 10});
+    const auto r = handler.handle(s, memory);
+    HYPERION_CHECK(r.status == SyscallStatus::kExit);
+    HYPERION_CHECK_EQ(r.exit_code, std::int64_t{138});
+}
+
+HYPERION_TEST("syscall", "kill_rejects_a_signal_number_out_of_range") {
+    GuestAddressSpace as;
+    MinimalSyscallHandler handler({}, &as);
+    handler.enable_linux_compat();
+    FlatMemory memory(kBase, kMemSize);
+    GuestState bad = syscall_state(hyperion::sysno::kKill, {1, 65});
+    handler.handle(bad, memory);
+    HYPERION_CHECK_EQ(bad.reg(Gpr::kRax), static_cast<std::uint64_t>(-hyperion::kEinval));
+    GuestState probe = syscall_state(hyperion::sysno::kKill, {1, 0});
+    const auto r = handler.handle(probe, memory);
+    HYPERION_CHECK(r.status == SyscallStatus::kHandled);
+    HYPERION_CHECK_EQ(probe.reg(Gpr::kRax), std::uint64_t{0});
+}
+
 HYPERION_TEST("syscall", "linux_compat_rt_sigaction_round_trips_the_disposition") {
     GuestAddressSpace as;
     MinimalSyscallHandler handler({}, &as);
@@ -2169,7 +2337,8 @@ HYPERION_TEST("syscall", "linux_compat_rt_sigaction_round_trips_the_disposition"
     GuestSigaction act{0x400100, 0x4 | 0x10000000 | 0x08000000, 0x400200, 0x1};
     write_sigaction(memory, kBase + 0x100, act);
 
-    GuestState s = syscall_state(13, {11, kBase + 0x100, kBase + 0x200, 8});
+    GuestState s =
+        syscall_state(hyperion::sysno::kRtSigaction, {11, kBase + 0x100, kBase + 0x200, 8});
     handler.handle(s, memory);
     HYPERION_CHECK_EQ(s.reg(Gpr::kRax), std::uint64_t{0});
 
@@ -2179,7 +2348,7 @@ HYPERION_TEST("syscall", "linux_compat_rt_sigaction_round_trips_the_disposition"
 
     // Reading again without installing must return what was installed. This is
     // the assertion that fails against a "zero the buffer" implementation.
-    s = syscall_state(13, {11, 0, kBase + 0x300, 8});
+    s = syscall_state(hyperion::sysno::kRtSigaction, {11, 0, kBase + 0x300, 8});
     handler.handle(s, memory);
     HYPERION_CHECK_EQ(s.reg(Gpr::kRax), std::uint64_t{0});
     const GuestSigaction round_tripped = read_sigaction(memory, kBase + 0x300);
@@ -2189,15 +2358,15 @@ HYPERION_TEST("syscall", "linux_compat_rt_sigaction_round_trips_the_disposition"
     HYPERION_CHECK_EQ(round_tripped.mask, std::uint64_t{0x1});
 
     // Dispositions are per signal: SIGINT must still be the default.
-    s = syscall_state(13, {2 /*SIGINT*/, 0, kBase + 0x400, 8});
+    s = syscall_state(hyperion::sysno::kRtSigaction, {2 /*SIGINT*/, 0, kBase + 0x400, 8});
     handler.handle(s, memory);
     HYPERION_CHECK_EQ(read_sigaction(memory, kBase + 0x400).handler, std::uint64_t{0});
 
     // SIG_IGN is a real value (1), not "unset", and must come back as 1.
     write_sigaction(memory, kBase + 0x500, GuestSigaction{1, 0, 0, 0});
-    s = syscall_state(13, {2, kBase + 0x500, 0, 8});
+    s = syscall_state(hyperion::sysno::kRtSigaction, {2, kBase + 0x500, 0, 8});
     handler.handle(s, memory);
-    s = syscall_state(13, {2, 0, kBase + 0x600, 8});
+    s = syscall_state(hyperion::sysno::kRtSigaction, {2, 0, kBase + 0x600, 8});
     handler.handle(s, memory);
     HYPERION_CHECK_EQ(read_sigaction(memory, kBase + 0x600).handler, std::uint64_t{1});
 }
@@ -2210,7 +2379,8 @@ HYPERION_TEST("syscall", "linux_compat_rt_sigaction_rejects_what_the_kernel_reje
     write_sigaction(memory, kBase + 0x100, GuestSigaction{0x400100, 0, 0, 0});
 
     auto call = [&](std::int64_t sig, std::uint64_t act, std::uint64_t old, std::uint64_t setsize) {
-        GuestState s = syscall_state(13, {static_cast<std::uint64_t>(sig), act, old, setsize});
+        GuestState s = syscall_state(hyperion::sysno::kRtSigaction,
+                                     {static_cast<std::uint64_t>(sig), act, old, setsize});
         handler.handle(s, memory);
         return static_cast<std::int64_t>(s.reg(Gpr::kRax));
     };
