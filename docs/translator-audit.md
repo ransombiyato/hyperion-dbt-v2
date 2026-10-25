@@ -1809,6 +1809,78 @@ that shows the ret side is worth more than the ~4–5 % ceiling above.
 * full runs on both tiers still print `acc=20475694797959 g=50991808` and
   `acc=9000001 counter=0`
 
+### 29.14 P9 stage 2 (CF/ZF/SF/OF) — measured, and not started: the ceiling is inside the noise
+
+§29.10 profiled lazy flags and concluded that a full six-flag descriptor is an architectural
+change; §29.11 implemented the cheap half (PF/AF). This section answers the stage-2 question
+with numbers: *how much of the remaining flag cost could a `cc_op`/`cc_src`/`cc_dst`
+descriptor actually remove, and can this environment measure it?*
+
+#### What is left after stage 1
+
+With PF/AF deferred, a flag producer still materialises each remaining live flag with two
+instructions (`cset` from NZCV, `strb` into `GuestState::flags`), so CF+ZF+SF+OF is up to
+8 instructions. A temporary probe (never committed) walked the per-step flag liveness of
+every translated block of each benchmark guest and counted the generated words each step's
+`live_flags` implies — 2 per live CF/ZF/SF/OF, 4 for the PF/AF descriptor — against the
+block's total size:
+
+| guest | blocks | generated words | flag words | share | of which at the block's last step | flag-writing steps |
+| --- | --- | --- | --- | --- | --- | --- |
+| `call_guest` | 542 | 51 336 | 5 360 | **10.44 %** | 0 | 469 |
+| `vm_guest` | 526 | 48 759 | 5 256 | **10.78 %** | 0 | 459 |
+| `guest_probe` | 663 | 64 220 | 6 554 | **10.21 %** | 0 | 569 |
+
+Two facts matter. Flag materialisation is ~10.4 % of generated code on all three guests,
+i.e. roughly **11.4 words per flag-writing step** — and *none* of it happens at a block's
+last step: a block ends at a terminator (`jmp`/`jcc`/`call`/`ret`/`hlt`), which writes no
+flags, so every producer is mid-block and its flags are live to the block boundary (the
+liveness pass starts from `live_out = kFbAll`, §29.10). Nothing is being materialised
+"early" in any sense that a smarter liveness pass could remove; it is materialised because
+the block boundary demands it.
+
+#### The ceiling, and why it is not enough
+
+A `cc_op`/`cc_src`/`cc_dst` descriptor would replace the 8 CF/ZF/SF/OF words with ~3-4
+stores (op+width packed into one byte, two 64-bit operands), so the deferrable part is
+about **4.5 of the 11.4 words per producer, ≈ 4 % of executed generated code** — and that is
+an upper bound: it assumes every reader is either fused (the `cmp`+`Jcc` case, already fused)
+or paid for elsewhere. Then the calibration problem starts:
+
+* the same environment was used to A/B the *existing* PF/AF deferral, by rebuilding with
+  `emit_pf_af_store` materialising immediately (a 3-line temporary change that keeps
+  everything else identical). Two binaries, `call_guest` full run, 15 interleaved pairs:
+  median 777.8 ms (eager) vs 807.6 ms (deferred), **paired-ratio median 1.021**, per-pair
+  ratios 0.89 – 1.21. The effect of removing ~5 words per producer is *inside* this
+  environment's noise;
+* therefore a change whose ceiling is ~4 % cannot be validated here at all. Every
+  correctness risk would be taken on faith, which is the one thing this project does not do.
+
+So: **not implemented, and the reason is measurement, not effort.** A `qemu-user` build on
+an x86-64 host, with `mprotect`-dominated translation and no AArch64 pipeline model, cannot
+resolve a 4 % change; the earlier claim in §29.10 that lazy flags are "architectural" stands,
+and stage 1 was the only part with a cost worth removing.
+
+#### What implementing it would actually require
+
+Recorded so the decision can be revisited rather than re-derived. A descriptor is only the
+easy half; the surface is every place a flag can be produced or observed:
+
+* producers with non-obvious carry: `ADC`/`SBB` (CF is an *input*), shifts and rotates
+  (CF = last bit shifted out, OF defined only for shift-by-1), `MUL`/`IMUL` (CF/OF defined,
+  SF/ZF/AF undefined), `DIV`/`IDIV` (all undefined), `BSF`/`BSR` (ZF), `BT`/`BTS`
+  (CF), the decimal adjust group, `CLC`/`STC`/`CMC`, `LAHF`/`SAHF`, `PUSHF`/`POPF`;
+* consumers: all 16 conditions through `Jcc`, `CMOVcc`, `SETcc`; `ADC`/`SBB` carry-in;
+  `RCL`/`RCR`; the helper boundary (helpers read and write `GuestState::flags` directly);
+  the interpreter cold path and every unsupported opcode; `sigreturn`/signal delivery
+  (RFLAGS is pushed); fault reporting;
+* and it must be *exactly* the reference interpreter's answer, including the flags x86
+  calls undefined, because the whole test strategy is differential against tier 0.
+
+The defensible way in is to make flag effects explicit in an IR (§29.16, P14) and generate
+the descriptor from one table instead of from ~30 emitter sites. Revisit trigger: either a
+native-AArch64 measurement setup with ≤1 % noise, or P14 landing with a flag-effect table.
+
 ### 29.9 Still open from §L
 
 Items 1-5 of §L are all resolved (1 justified and pinned, 2 and 5 implemented, 3 retracted as wrong,
@@ -1824,9 +1896,13 @@ below a crossover of tens of thousands of guest instructions, compiling on first
 more than it saved, and the cache now interprets cold block starts instead. Item 10 (shadow stack) was
 measured in §29.13: the `call` side was worth implementing (direct calls are now linked by the P7
 machinery, 9 % on a call-heavy guest) and the shadow-stack half was rejected in favour of a
-return-target cache that belongs with item 14. Still open: item 8 (cross-block register allocation),
-9 stage 2 (CF/ZF/SF/OF via `cc_op`/`cc_src`/`cc_dst`), 12 (signal delivery), 13 (guest threads), 14
-(an IR and a real optimiser).
+return-target cache that belongs with item 14. Item 9 stage 2 (CF/ZF/SF/OF via
+`cc_op`/`cc_src`/`cc_dst`) was measured in §29.14: flag materialisation is 10.2–10.8 % of generated
+code, the deferrable part of it is ≈4 % of executed code, and a paired A/B of the *existing* PF/AF
+deferral cannot resolve 5 words per producer in this environment (ratio median 1.02, spread
+0.89–1.21) — so it is deferred, not attempted, with the required design recorded. Still open: item
+8 (cross-block register allocation), 12 (signal delivery), 13 (guest threads), 14 (an IR and a real
+optimiser).
 
 ---
 
