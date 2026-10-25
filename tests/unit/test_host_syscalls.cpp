@@ -35,15 +35,18 @@
 #include "harness/test_tempdir.hpp"
 #include "hyperion/guest_state.hpp"
 #include "hyperion/host_syscalls.hpp"
+#include "hyperion/sigsys_diagnostics.hpp"
 #include "hyperion/syscall.hpp"
 #include "hyperion/syscall_detail.hpp"
 
 #if defined(__linux__) && !defined(__ANDROID__)
 #define HYPERION_HAVE_SECCOMP_TESTS 1
+#include <fcntl.h>
 #include <linux/audit.h>
 #include <linux/filter.h>
 #include <linux/seccomp.h>
 #include <sys/prctl.h>
+#include <sys/stat.h>
 #include <sys/syscall.h>
 #else
 #define HYPERION_HAVE_SECCOMP_TESTS 0
@@ -265,6 +268,86 @@ HYPERION_TEST("host_syscalls", "trapped_statx_kills_the_native_path_and_not_the_
     HYPERION_CHECK(portable_child.exited);
     HYPERION_CHECK_EQ(portable_child.exit_code, 0);
     HYPERION_CHECK_EQ(portable_child.signal, 0);
+}
+
+// The last line of defence, for a syscall nobody predicted. If a future Android
+// release (or a vendor policy) traps something HYPERION issues, kAnswerEnosys
+// turns the fatal trap into the ordinary "this kernel has no such syscall"
+// answer, so one operation fails instead of the whole `hyperion run` dying with
+// exit status 159. The technique - writing -ENOSYS into the return register of
+// the delivered ucontext_t - is what bionic itself does for heapprofd.
+//
+// This test proves it on a deliberately trapped syscall, and proves it does not
+// invent success: the trapped call must report failure.
+HYPERION_TEST("host_syscalls", "a_seccomp_trap_answered_with_enosys_lets_the_process_continue") {
+#if HYPERION_HAVE_SECCOMP_TESTS
+    const ChildOutcome outcome = run_child([] {
+        hyperion::install_sigsys_diagnostics("enosys_child", hyperion::SigsysPolicy::kAnswerEnosys);
+        if (!trap_syscall(SYS_statx)) {
+            return 4; // seccomp unavailable
+        }
+        errno = 0;
+        struct statx probe{};
+        const long rc = ::syscall(SYS_statx, AT_FDCWD, ".", 0, STATX_BASIC_STATS, &probe);
+        const int saved = errno;
+        if (rc != -1) {
+            return 5; // the conversion must not look like success
+        }
+        if (saved != ENOSYS) {
+            return 6; // nor like some other failure
+        }
+        if (hyperion::sigsys_traps_converted() != 1) {
+            return 7;
+        }
+        // Still alive and functional afterwards: a second call is converted too,
+        // and a syscall that *is* allowed still works normally.
+        errno = 0;
+        const long again = ::syscall(SYS_statx, AT_FDCWD, ".", 0, STATX_BASIC_STATS, &probe);
+        if (again != -1 || errno != ENOSYS) {
+            return 8;
+        }
+        if (::write(1, "", 0) != 0) {
+            return 9;
+        }
+        return hyperion::sigsys_traps_converted() == 2 ? 0 : 10;
+    });
+    if (outcome.exited && outcome.exit_code == 4) {
+        HYPERION_SKIP("this host cannot install a seccomp filter (PR_SET_SECCOMP refused)");
+    }
+    // Any other non-zero code is a specific failure; the message names which.
+    if (outcome.exited && outcome.exit_code != 0) {
+        HYPERION_CHECK_EQ(outcome.exit_code, 0);
+    }
+    HYPERION_CHECK(outcome.exited);
+    HYPERION_CHECK_EQ(outcome.exit_code, 0);
+    HYPERION_CHECK_EQ(outcome.signal, 0); // in particular not SIGSYS
+#else
+    HYPERION_SKIP("seccomp trap reproduction requires a Linux host that may install filters");
+#endif
+}
+
+// The default policy must stay fatal: a SIGSYS is not quietly downgraded unless
+// the caller asked for it. This is what keeps an unexpected trap visible in the
+// test suite instead of turning into an ENOSYS that nobody notices.
+HYPERION_TEST("host_syscalls", "the_default_policy_still_dies_from_a_seccomp_trap") {
+#if HYPERION_HAVE_SECCOMP_TESTS
+    const ChildOutcome outcome = run_child([] {
+        hyperion::install_sigsys_diagnostics("dying_child", hyperion::SigsysPolicy::kReportAndDie);
+        if (!trap_syscall(SYS_statx)) {
+            return 4;
+        }
+        struct statx probe{};
+        (void)::syscall(SYS_statx, AT_FDCWD, ".", 0, STATX_BASIC_STATS, &probe);
+        return 0; // unreachable: the trap is fatal under this policy
+    });
+    if (outcome.exited && outcome.exit_code == 4) {
+        HYPERION_SKIP("this host cannot install a seccomp filter (PR_SET_SECCOMP refused)");
+    }
+    HYPERION_CHECK(!outcome.exited);
+    HYPERION_CHECK_EQ(outcome.signal, SIGSYS);
+#else
+    HYPERION_SKIP("seccomp trap reproduction requires a Linux host that may install filters");
+#endif
 }
 
 HYPERION_TEST("host_syscalls", "portable_statx_reports_the_same_basic_fields_as_the_kernel") {

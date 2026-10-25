@@ -270,16 +270,35 @@ no guest ever sees an artificial failure for a stat that `fstatat` could answer.
 `COMPATIBILITY.md` §5.07 records exactly which `statx` fields are and are not
 provided.
 
-### 6.1b Diagnosing a `SIGSYS`
+### 6.1b Handling a `SIGSYS`
 
-`src/core/sigsys_diagnostics.cpp` installs a `SIGSYS` handler in both the CLI and
-the test binary that prints the refused syscall's number, name and `si_code`, and
-then restores `SIG_DFL` and re-raises. The process still dies from `SIGSYS`; the
-exit status and the CTest verdict are unchanged. What changes is that the failure
-names itself instead of looking like a silent disappearance - the behaviour that
-made the Android 10 `statx` bug hard to see in the first place. The test harness
-additionally prints and flushes `[ RUN  ] <suite>.<test>` before each test, since
-buffered output is lost when a process dies from a signal.
+`src/core/sigsys_diagnostics.cpp` installs a `SIGSYS` handler with one of two
+explicitly chosen policies:
+
+| Policy | Used by | What happens to a seccomp trap |
+| --- | --- | --- |
+| `kReportAndDie` (default) | the test harness | print the syscall number, name and `si_code`, then restore `SIG_DFL` and re-raise. The process still dies from `SIGSYS`, so the exit status and the CTest verdict are unchanged - only with a reason attached |
+| `kAnswerEnosys` | the CLI | print the same line **once per syscall number**, write `-ENOSYS` into the return-value register of the delivered `ucontext_t` (`REG_RAX` on x86-64, `uc_mcontext.regs[0]` on AArch64, `arm_r0` on ARM), and resume |
+
+The kernel rolls the syscall back before delivering `SIGSYS` - the return
+register holds the syscall number, not the first argument, and nothing was
+executed - so the write is exactly what the program would have seen from a kernel
+without that syscall: `syscall()` returns `-1` with `errno == ENOSYS`, and any
+fallback the caller already has runs normally. This is the technique bionic uses
+for heapprofd (`HandleSigsysSeccompOverride`) and the one Bun adopted for Android;
+a seccomp trap is the only notification a process gets, so converting it is the
+only way to survive one.
+
+Two properties keep it honest. It is never used to claim success - the trapped
+call reports "no such syscall", which is true, and a test asserts that the return
+value is `-1`/`ENOSYS` and not `0`. And a `SIGSYS` that seccomp did not raise
+(`si_code != SYS_SECCOMP`, i.e. somebody called `kill(2)`) is never converted: it
+is re-raised under the previous disposition. On an architecture whose return
+register this file does not know, the handler does not resume at all - it says so
+and then dies from `SIGSYS`.
+
+The test harness additionally prints and flushes `[ RUN  ] <suite>.<test>` before
+each test, since buffered output is lost when a process dies from a signal.
 
 ### 6.2 What an adapter is, and what it is not
 

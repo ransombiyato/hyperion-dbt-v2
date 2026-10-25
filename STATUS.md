@@ -33,9 +33,9 @@ under a real static x86-64 BusyBox.
 
 The full measured table is in **§2 Last successful verification** below; in
 summary, on this host today: strict Clang 19 `-Werror` build of x86-64, GCC 14
-`-Werror` build of AArch64, CTest **17/17**, unit **335 passed / 0 failed / 24
-skipped** (of 359), the same suite in `HYPERION_PORTABLE_SYSCALLS=1` mode,
-ASan+UBSan **17/17** with no report, AArch64 unit **360 / 0 / 3** (of 363) under
+`-Werror` build of AArch64, CTest **17/17**, unit **337 passed / 0 failed / 24
+skipped** (of 361), the same suite in `HYPERION_PORTABLE_SYSCALLS=1` mode,
+ASan+UBSan **17/17** with no report, AArch64 unit **360 / 0 / 5** (of 365) under
 `qemu-user`, the installer regression **28/28**, a real `install.sh` run from the
 checkout with every CLI command exercised, and `clang-format-19`/`shellcheck`
 clean.
@@ -476,7 +476,7 @@ repo-cached `qemu-aarch64-static` for the cross tree):
 
 | Suite | Command | Result (measured) |
 | --- | --- | --- |
-| Native unit tests | `build-strict/tests/hyperion_unit_tests` | **335 passed, 0 failed, 24 skipped** (of 359) |
+| Native unit tests | `build-strict/tests/hyperion_unit_tests` | **337 passed, 0 failed, 24 skipped** (of 361) |
 | Full CTest tree | `ctest --test-dir build-strict` | **17/17 passed** (unit, differential, 4 CLI, 2 guest, inventory, 7 bench) |
 | Android syscall paths | `HYPERION_PORTABLE_SYSCALLS=1 ctest --test-dir build-strict -E '^cli\.install_sigsys$'` | **16/16 passed** |
 | ASan + UBSan | `cmake -B build-asan -DHYPERION_ENABLE_SANITIZERS=ON` + `ctest` | **17/17 passed**, no sanitizer report |
@@ -485,7 +485,7 @@ repo-cached `qemu-aarch64-static` for the cross tree):
 | Syscall inventory | `python3 tools/gen_syscall_inventory.py --check` | OK (0 errors, 0 warnings) |
 | Installer regression | `bash tests/cli/install_sigsys_test.sh install.sh` | 28/28 checks (also with `ninja` hidden) |
 | Dispatch microbenchmark | `benchmarks/hyperion_syscall_bench --iterations 300000 --repeats 9` | see `TESTING.md` §6 |
-| AArch64 unit tests | cross build + `qemu-aarch64-static` | **360 passed, 0 failed, 3 skipped** (of 363) |
+| AArch64 unit tests | cross build + `qemu-aarch64-static` | **360 passed, 0 failed, 5 skipped** (of 365) |
 | AArch64 differential | same | 0 passed, 0 failed, 11 skipped — correct, no x86-64 oracle on AArch64 |
 | AArch64 syscall compat, both tiers | `cross.aarch64_tests` | 11/11 checks per tier, 43 guest assertions each |
 | AArch64 tier-1 JIT evidence | compat guest at `--tier=1` | `tier 1: 1412 basic block(s) translated`, `failures 0`, 170 308 steps — same as tier 0 |

@@ -209,9 +209,14 @@ anonymous file. `hyperion probe` reports which path is in use, and
 provides. `HYPERION_PORTABLE_SYSCALLS=1` forces those paths on any host, and CI
 runs the whole suite in that mode.
 
-If some *other* syscall is trapped on a particular device, a `SIGSYS` is now
-reported with the syscall number and name instead of dying silently. The
-installer still treats a suite in which the *only* failure is `unit.native`
+If some *other* syscall is trapped on a particular device, the shipped CLI does
+not die: the trapped call returns `-ENOSYS` (the same answer a kernel without
+that syscall gives, and the same technique Android's own bionic uses), the
+implemented fallbacks run, and stderr names the syscall the first time it is
+refused. Nothing is reported as having succeeded. The test binary keeps the
+strict behaviour - a trap during a test fails that test - because a trapped
+syscall in the suite must stay loud. The installer still treats a suite in which
+the *only* failure is `unit.native`
 killed by `SIGSYS` as a decision for you rather than for itself: it explains the
 situation and asks whether to skip that single test. The default is **no**, the
 skipped test is reported as skipped rather than passed, every other test still

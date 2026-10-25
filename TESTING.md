@@ -224,7 +224,15 @@ the action Android's app policy uses - on a forked child, and requires both
   installed.
 
 If HYPERION ever goes back to issuing `statx(2)` unconditionally, the second half
-fails. The rest of the suite also runs in the portable mode in CI:
+fails.
+
+Two further cases cover the last-line-of-defence handler: with
+`SigsysPolicy::kAnswerEnosys` a trapped syscall must return `-1` with
+`errno == ENOSYS` (never `0`, so a conversion cannot masquerade as success), the
+process must survive and keep working, and `sigsys_traps_converted()` must count
+both attempts; with the default `kReportAndDie` the same trap must still kill the
+child from `SIGSYS`. The pair is what stops a future change from quietly turning
+the strict test-suite behaviour into the forgiving CLI behaviour. The rest of the suite also runs in the portable mode in CI:
 
 ```bash
 HYPERION_PORTABLE_SYSCALLS=1 ctest --test-dir build --output-on-failure -E '^cli\.install_sigsys$'
@@ -242,7 +250,7 @@ never counts it as a pass. Skips in use today:
 | Test | Skipped when | Why it is a platform limit, not a bug |
 | --- | --- | --- |
 | `host_syscalls.native_linux_reports_statx_and_memfd_usable`, `host_syscalls.an_android_api_level_below_30_disables_both` | the binary is built for Android | the API level then comes from the device (`ro.build.version.sdk`); the child-process cases exercise the same decision function everywhere |
-| `host_syscalls.trapped_statx_kills_the_native_path_and_not_the_portable_one` | the host refuses `PR_SET_SECCOMP` (seen under `qemu-user`) | the reproduction needs a filter that can be installed; the portable alternative is still covered by the `HYPERION_PORTABLE_SYSCALLS` cases |
+| `host_syscalls.trapped_statx_kills_the_native_path_and_not_the_portable_one`, `host_syscalls.a_seccomp_trap_answered_with_enosys_lets_the_process_continue`, `host_syscalls.the_default_policy_still_dies_from_a_seccomp_trap` | the host refuses `PR_SET_SECCOMP` (seen under `qemu-user`) | the reproduction needs a filter that can be installed; the portable alternative is still covered by the `HYPERION_PORTABLE_SYSCALLS` cases |
 | `translator.*`, `exec_mem.*`, `translation_cache.*` AArch64 cases (24 in total on x86-64) | the host is not AArch64 | the generated code *is* AArch64; the cross build runs them under `qemu-user` |
 | `interpreter.run_program_matches_hardware_for_a_loop` | the host is not x86-64 | the reference is real hardware execution of the same bytes |
 | `translation_cache.refuses_to_run_without_exec_support` | the host *can* execute generated code | it asserts the refusal path of a host that cannot |
@@ -300,7 +308,7 @@ toolchain and were not re-run afterwards:
 
 | Run | Result |
 | --- | --- |
-| AArch64 unit tests | **360 passed, 0 failed, 3 skipped** (of 363 registered) |
+| AArch64 unit tests | **360 passed, 0 failed, 5 skipped** (of 365 registered) |
 | AArch64 differential suite | 0 passed, 0 failed, 11 skipped (correct: no x86-64 oracle on AArch64, every case SKIPs) |
 | AArch64 guest process, tier 0 / tier 1 | passed / passed |
 | AArch64 syscall compat, tier 0 / tier 1 | 11/11 checks, 43 guest assertions each |

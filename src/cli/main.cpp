@@ -596,9 +596,14 @@ int cmd_syscall_registry(int argc, char** argv) {
 } // namespace
 
 int main(int argc, char** argv) {
-    // Report (but never swallow) a SIGSYS from the platform's seccomp policy:
-    // see hyperion/sigsys_diagnostics.hpp. The exit status is unchanged.
-    hyperion::install_sigsys_diagnostics("hyperion");
+    // A seccomp trap must not kill a running guest. Android's app policy uses
+    // SECCOMP_RET_TRAP, so one syscall outside the device allowlist would
+    // otherwise end `hyperion run` (and the guest) with exit status 159 and no
+    // result at all. Under kAnswerEnosys the trapped call reports "no such
+    // syscall", which is true, and the implemented fallbacks run normally; the
+    // conversion is printed once per syscall number so it stays visible. See
+    // hyperion/sigsys_diagnostics.hpp - nothing is silently faked.
+    hyperion::install_sigsys_diagnostics("hyperion", hyperion::SigsysPolicy::kAnswerEnosys);
     if (argc < 2) {
         print_usage(argv[0]);
         return 2;

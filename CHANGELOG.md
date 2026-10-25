@@ -99,6 +99,25 @@ Meaningful changes by milestone. Format loosely follows
   at work that was already done.
 
 ### Fixed
+- **A trapped host syscall no longer kills the CLI; it reports `-ENOSYS`.**
+  Avoiding the two syscalls Android 10 traps (above) fixes the known cases, but a
+  future release or a vendor policy can refuse something else, and with
+  `SECCOMP_RET_TRAP` there is no errno to inspect - `hyperion run` and the guest
+  simply died with exit status 159. The CLI now installs a `SIGSYS` handler
+  (`SigsysPolicy::kAnswerEnosys`) that writes `-ENOSYS` into the return-value
+  register of the delivered `ucontext_t` (`REG_RAX` on x86-64,
+  `uc_mcontext.regs[0]` on AArch64, `arm_r0` on ARM) and resumes, which is the
+  technique bionic uses for heapprofd and Bun adopted for Android. The kernel
+  rolls the syscall back before delivering the signal, so the caller sees the
+  ordinary "this kernel has no such syscall" result and its existing fallback
+  runs; nothing is ever reported as successful. The refusal is printed once per
+  syscall number, a `SIGSYS` raised by `kill(2)` rather than seccomp is
+  re-raised untouched, and on an architecture whose return register is unknown
+  the process still dies from `SIGSYS` after saying so. The **test binary keeps
+  the strict policy**: a trap during a test still fails that test, so an
+  unexpected trapped syscall cannot pass unnoticed - two new unit tests pin both
+  behaviours (`host_syscalls.a_seccomp_trap_answered_with_enosys_lets_the_process_continue`,
+  `host_syscalls.the_default_policy_still_dies_from_a_seccomp_trap`).
 - **`unit.native` could be killed by `SIGSYS` on Android 10, and worse, so could
   any guest that called `statx`.** Android builds its app seccomp policy from the
   *device's* bionic syscall list and compiles it with `SECCOMP_RET_TRAP`, so a

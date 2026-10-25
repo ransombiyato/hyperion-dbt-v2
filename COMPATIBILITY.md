@@ -548,6 +548,27 @@ What the substitutes do and do not provide:
 `HYPERION_PORTABLE_SYSCALLS=1` forces the portable paths on any host, and
 `hyperion probe` reports which path is actually in use.
 
+### If something else is trapped anyway
+
+The two syscalls above are the ones HYPERION is known to issue from this list, so
+they are avoided outright rather than trapped. Anything else a future release or
+a vendor policy refuses is handled by the `SIGSYS` handler the CLI installs
+(`SigsysPolicy::kAnswerEnosys`, `src/core/sigsys_diagnostics.cpp`): the trapped
+call returns `-ENOSYS` and execution continues, with one stderr line naming the
+syscall the first time each number is refused.
+
+| Consequence | What it means for a guest |
+| --- | --- |
+| The trapped call returns `-1`/`ENOSYS` | the operation fails with "not implemented on this device"; nothing pretends it succeeded |
+| Execution continues | one operation or one program fails instead of `hyperion run` dying with exit status 159 mid-guest |
+| stderr names the syscall | the refusal is attributable, not a silent disappearance |
+| `kill(2)`-sent `SIGSYS` is not converted | a genuine signal is still delivered (re-raised with the previous disposition) |
+| A guest that traps its own `SIGSYS` | Hyperion's handler is per-process, so a converted call is visible to the guest only as `ENOSYS`; the guest's own handler is not invoked |
+| Architectures without a known return register | the process still dies from `SIGSYS`, and says why |
+
+This is a safety net, not coverage: it does not make a guest that needs a trapped
+syscall work, it makes the failure a normal error return.
+
 ---
 
 ## 6. Host forwarding
