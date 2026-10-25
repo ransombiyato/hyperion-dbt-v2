@@ -819,6 +819,161 @@ HYPERION_TEST("translation_cache", "gating_accounts_cold_steps_against_the_step_
                          p6::run_reference(p6::kBranchHeavy, initial, /*max_steps=*/4));
 }
 
+// --- P10: call/return -------------------------------------------------------
+//
+// Measurement first (§29.13): in a call/return-heavy guest, CALL and RET are 20 %
+// of all guest instructions and every one of them used to leave generated code
+// through the shared dispatcher - 11 instructions and two jump-table loads to
+// turn a `rip` into a block pointer. A *direct* `call` has a statically known
+// block start as its destination, exactly like a `jmp`, so it is now linked by
+// the same machinery (P7); `ret` and indirect calls keep the dispatcher.
+//
+// There is deliberately no shadow stack. `ret` must read the architectural
+// stack: a guest can rewrite the return address (the second test below does),
+// `ret imm16` discards bytes, and the interpreter, a helper or a fault can
+// change `rsp` between the call and the return. A cached copy of the return
+// address is therefore not a source of truth, and once the load stays, the only
+// thing left to save is the pc-to-block lookup - which the dispatcher already
+// does with one compare and one indirect branch. §29.13 records the numbers.
+namespace p10 {
+
+struct Run {
+    hyperion::RunResult result;
+    std::size_t linked = 0;
+    std::size_t blocks = 0;
+};
+
+Run run(const std::vector<std::uint8_t>& program, const GuestState& initial) {
+    FlatMemory mem(kBase, kMemSize);
+    std::memcpy(mem.data(), program.data(), program.size());
+    TranslationCache cache;
+    // These programs are a handful of instructions run once, so every call site
+    // must actually be compiled for its exit to be linkable at all.
+    cache.set_hot_threshold(0);
+    Run out;
+    out.result = cache.run(mem, initial);
+    out.linked = cache.linked_exits();
+    out.blocks = cache.block_count();
+    return out;
+}
+
+hyperion::RunResult run_reference(const std::vector<std::uint8_t>& program,
+                                  const GuestState& initial) {
+    FlatMemory mem(kBase, kMemSize);
+    std::memcpy(mem.data(), program.data(), program.size());
+    return hyperion::run_program(mem, initial);
+}
+
+void push_imm32(std::vector<std::uint8_t>& code, std::uint64_t value) {
+    code.push_back(0x68); // push imm32 (sign-extended to 64 bits)
+    for (int i = 0; i < 4; ++i) {
+        code.push_back(static_cast<std::uint8_t>((value >> (8 * i)) & 0xFF));
+    }
+}
+
+} // namespace p10
+
+HYPERION_TEST("translation_cache", "direct_call_exits_are_linked_and_return_correctly") {
+    //   call fn / call fn / hlt        (kBase)
+    // fn: inc eax / ret                (kBase + 0xB)
+    const std::vector<std::uint8_t> program = {
+        0xE8, 0x06, 0x00, 0x00, 0x00, // call kBase+0xB   (from 0x5: rel = 6)
+        0xE8, 0x01, 0x00, 0x00, 0x00, // call kBase+0xB   (from 0xA: rel = 1)
+        0xF4,                         // hlt
+        0xFF, 0xC0,                   // inc eax
+        0xC3,                         // ret
+    };
+    GuestState initial;
+    initial.rip = kBase;
+    initial.reg(Gpr::kRsp) = kBase + 0x800;
+    const p10::Run got = p10::run(program, initial);
+    HYPERION_CHECK(got.result.status == RunStatus::kOk);
+    HYPERION_CHECK_EQ(got.result.state.reg(Gpr::kRax), std::uint64_t{2});
+    // The two `call` exits are the only statically known exits in this program,
+    // so any link at all is a call link.
+    HYPERION_CHECK(got.linked >= 1);
+    p6::check_same_state("linked calls", got.result, p10::run_reference(program, initial));
+}
+
+HYPERION_TEST("translation_cache", "a_rewritten_return_address_is_honoured") {
+    // The guest builds its own return address: `push <pc>` then `ret`, twice.
+    // Nothing about the call/return path may be cached, or this program would
+    // run the `mov eax, 99` that follows each `ret`.
+    std::vector<std::uint8_t> program;
+    p10::push_imm32(program, kBase + 0x0B); // ret -> after1
+    program.push_back(0xC3);
+    program.insert(program.end(), {0xB8, 0x63, 0x00, 0x00, 0x00}); // mov eax, 99 (skipped)
+    // after1 (kBase + 0x0B)
+    program.insert(program.end(), {0xB8, 0x07, 0x00, 0x00, 0x00}); // mov eax, 7
+    p10::push_imm32(program, kBase + 0x1B);                        // ret -> after2
+    program.push_back(0xC3);
+    program.insert(program.end(), {0xB8, 0x63, 0x00, 0x00, 0x00}); // mov eax, 99 (skipped)
+    // after2 (kBase + 0x1B)
+    program.insert(program.end(), {0x83, 0xC0, 0x23}); // add eax, 35
+    program.push_back(0xF4);                           // hlt
+    HYPERION_CHECK_EQ(program.size(), std::size_t{0x1F});
+
+    GuestState initial;
+    initial.rip = kBase;
+    initial.reg(Gpr::kRsp) = kBase + 0x800;
+    const p10::Run got = p10::run(program, initial);
+    HYPERION_CHECK(got.result.status == RunStatus::kOk);
+    HYPERION_CHECK_EQ(got.result.state.reg(Gpr::kRax), std::uint64_t{42});
+    p6::check_same_state("rewritten return", got.result, p10::run_reference(program, initial));
+}
+
+HYPERION_TEST("translation_cache", "recursive_calls_match_the_interpreter") {
+    // Four nested calls with a conditional base case: exercises a call exit that
+    // is linked and a call exit that is not (the recursive one runs from a block
+    // whose successor changes identity as the recursion unwinds).
+    //   mov edi, 4 / call rec / hlt
+    // rec: test edi, edi / je base / dec edi / call rec / add eax, 3 / ret
+    // base: mov eax, 1 / ret
+    const std::vector<std::uint8_t> program = {
+        0xBF, 0x04, 0x00, 0x00, 0x00, // mov edi, 4
+        0xE8, 0x01, 0x00, 0x00, 0x00, // call rec
+        0xF4,                         // hlt
+        0x85, 0xFF,                   // test edi, edi
+        0x74, 0x0B,                   // je base
+        0xFF, 0xCF,                   // dec edi
+        0xE8, 0xF5, 0xFF, 0xFF, 0xFF, // call rec
+        0x83, 0xC0, 0x03,             // add eax, 3
+        0xC3,                         // ret
+        0xB8, 0x01, 0x00, 0x00, 0x00, // mov eax, 1
+        0xC3,                         // ret
+    };
+    GuestState initial;
+    initial.rip = kBase;
+    initial.reg(Gpr::kRsp) = kBase + 0x800;
+    const p10::Run got = p10::run(program, initial);
+    HYPERION_CHECK(got.result.status == RunStatus::kOk);
+    HYPERION_CHECK_EQ(got.result.state.reg(Gpr::kRax), std::uint64_t{13}); // 1 + 4*3
+    HYPERION_CHECK_EQ(got.result.state.reg(Gpr::kRsp), initial.reg(Gpr::kRsp));
+    p6::check_same_state("recursion", got.result, p10::run_reference(program, initial));
+}
+
+HYPERION_TEST("translation_cache", "ret_imm_discards_bytes_from_the_guest_stack") {
+    //   push 0 / call fn / hlt / fn: mov eax, 5 / ret 8
+    // `ret 8` pops the return address and then discards the caller's junk slot,
+    // so `rsp` must be back where it started. Nothing may assume the callee's
+    // stack frame has a fixed size.
+    const std::vector<std::uint8_t> program = {
+        0x6A, 0x00,                   // push 0
+        0xE8, 0x01, 0x00, 0x00, 0x00, // call fn
+        0xF4,                         // hlt
+        0xB8, 0x05, 0x00, 0x00, 0x00, // mov eax, 5
+        0xC2, 0x08, 0x00,             // ret 8
+    };
+    GuestState initial;
+    initial.rip = kBase;
+    initial.reg(Gpr::kRsp) = kBase + 0x800;
+    const p10::Run got = p10::run(program, initial);
+    HYPERION_CHECK(got.result.status == RunStatus::kOk);
+    HYPERION_CHECK_EQ(got.result.state.reg(Gpr::kRax), std::uint64_t{5});
+    HYPERION_CHECK_EQ(got.result.state.reg(Gpr::kRsp), initial.reg(Gpr::kRsp));
+    p6::check_same_state("ret imm", got.result, p10::run_reference(program, initial));
+}
+
 #else
 
 HYPERION_TEST("translation_cache", "caches_blocks_and_agrees_with_interpreter") {
@@ -907,6 +1062,22 @@ HYPERION_TEST("translation_cache", "gating_results_match_across_tiering_transiti
 }
 
 HYPERION_TEST("translation_cache", "gating_accounts_cold_steps_against_the_step_limit") {
+    HYPERION_SKIP("generated code is AArch64; requires an AArch64 host to run");
+}
+
+HYPERION_TEST("translation_cache", "direct_call_exits_are_linked_and_return_correctly") {
+    HYPERION_SKIP("generated code is AArch64; requires an AArch64 host to run");
+}
+
+HYPERION_TEST("translation_cache", "a_rewritten_return_address_is_honoured") {
+    HYPERION_SKIP("generated code is AArch64; requires an AArch64 host to run");
+}
+
+HYPERION_TEST("translation_cache", "recursive_calls_match_the_interpreter") {
+    HYPERION_SKIP("generated code is AArch64; requires an AArch64 host to run");
+}
+
+HYPERION_TEST("translation_cache", "ret_imm_discards_bytes_from_the_guest_stack") {
     HYPERION_SKIP("generated code is AArch64; requires an AArch64 host to run");
 }
 

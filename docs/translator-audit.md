@@ -1711,6 +1711,104 @@ Rejected while investigating: gating *prefetched* successors; evicting cold bloc
 bounded cache (the cache is unbounded and code size is already down 69 %); an adaptive
 threshold based on translation-time-per-instruction (needs the profile P14 would build).
 
+### 29.13 P10 — measured: link the `call`, and why there is no shadow stack
+
+Item 10 of §L proposed a shadow stack for `ret`. The measurement below says the money in
+the call/return path is on the **call** side, not in re-reading the return address, and
+that a shadow stack is the wrong mechanism for the remaining part.
+
+#### How often, and what it costs today
+
+Opcode histograms of the benchmark guests (tier 0, counted, not estimated):
+
+| guest | guest instructions | `call` | `ret` | share of all instructions |
+| --- | --- | --- | --- | --- |
+| `call_guest` (small non-inlined functions, recursion) | 31 345 692 | 3 200 587 | 3 200 587 | **20.4 %** |
+| `guest_probe` | 555 896 | 3 256 | 3 256 | 1.2 % |
+| `vm_guest` (loop-heavy) | 102 143 873 | ~2 000 | ~2 000 | 0.002 % |
+
+Before this change every one of those exited through the shared in-JIT dispatcher
+(§9), which is 11 instructions plus two jump-table loads:
+
+```
+str x9,[state,#rip]      ; publish the target pc
+lsr x10,x9,#12  / eor / ubfx        ; 1024-entry direct-mapped index
+add/ldp x11,x12,[ctx+jump_table]    ; tag + target block
+cmp x11,x9 / b.ne miss / br x12
+```
+
+For a `call`, the destination is known at translate time whenever it is an immediate —
+it is a block start, exactly like a `jmp` destination. Nothing about the shadow stack was
+needed to remove that dispatch, and removing it is a 3-word patch to the emitter because
+§29.7's machinery already does the hard parts (patch the branch word when the successor
+appears, stay inside a 26-bit displacement, forgets everything on invalidation).
+
+#### What was implemented
+
+`call imm32` exits are registered as `ExitLink`s exactly like `jmp` exits, with the `rip`
+store emitted locally instead of relying on the dispatcher. That is +1 word per call site
+and −11 words per executed call. Indirect calls (`call r/m`) and `ret` keep the dispatcher,
+because their destination only exists at run time.
+
+#### Effect — same guest, interleaved, 15 repetitions, whole-process wall clock
+
+| guest | before | after | ratio |
+| --- | --- | --- | --- |
+| `call_guest` full run (31.3 M guest insns) | 967.0 ms median, 909.1 min, 1034.4 max | **878.3 ms median, 733.7 min, 917.5 max** | **0.908× median / 0.807× min** |
+| `guest_probe` full run (556 k) | 139.9 ms median | 142.6 ms median | 1.02× (within noise; only 3256 calls) |
+| `vm_guest` 10 M steps | 188.7 ms median | 187.4 ms median | 0.993× (no calls, as expected) |
+| generated code, `call_guest` | 183 820 B | 184 040 B | +0.12 % |
+| linked exits, `call_guest` | 379 | **525** | +146 call sites |
+
+`qemu-user` caveat as before: absolute numbers are emulated and startup-heavy; the ratios
+and the counters are the result.
+
+#### The shadow stack: rejected, with the reasoning and the size of what is left
+
+A shadow stack keeps a host-side copy of each pushed return address so `ret` need not read
+guest memory. Two ways to use it, and neither survives contact with the requirements:
+
+1. **Trust it.** Unsound, and not marginally so. A guest may rewrite its own return
+   address (`push <pc>` + `ret`, a classic obfuscation and a real calling convention in
+   some hand-written asm), `ret imm16` changes the stack by more than one slot, and `rsp`
+   can be changed between the call and the return by anything from `leave` to a signal
+   frame to the reference interpreter taking over for one instruction. The pending
+   descriptor in §29.11 is safe *because* it is a pure function of architectural register
+   values that generated code just produced; a stack cache is not.
+2. **Verify it against the architectural stack.** Then the load stays, `rsp` bookkeeping
+   stays, and the only thing saved is the pc-to-block lookup — a *return-target cache*, not
+   a shadow stack. Its ceiling is measurable from the numbers above: linking removed the
+   11-word lookup from 3.2 M calls and bought 9 % of the run (median), so removing ~6 of
+   those 11 words from 3.2 M rets is worth roughly **4–5 % of a call/return-heavy guest,
+   and nothing at all on a loop-heavy one**. Against that: per-site writable state (strict
+   W^X forbids patching a tag into the code page, §29.6), a slot-index allocator, two
+   stores on the shared dispatcher's hit path for *every* dynamic exit, and a full flush of
+   those slots on every code-epoch invalidation — because a stale slot is not a slow
+   answer, it is a jump to the wrong block. The same cache would also serve `jmp r/m` and
+   `call r/m`, which is a property of the branch architecture rather than of `ret`, so it
+   belongs with the P14 work (an IR with a real indirect-branch representation) where it
+   can be built and tested once for all three.
+
+Decision: implement the call side (measured, low risk, no new state), defer the verified
+return-target cache to P14, and record the rejection. Reopening it needs a measurement
+that shows the ret side is worth more than the ~4–5 % ceiling above.
+
+#### Tests
+
+| test | what it pins |
+| --- | --- |
+| `direct_call_exits_are_linked_and_return_correctly` | two `call imm` sites: result matches tier 0 **and** `linked_exits() >= 1`; verified to fail (`CHECK failed: got.linked >= 1`) with the emitter change reverted |
+| `a_rewritten_return_address_is_honoured` | the guest pushes its own return addresses and `ret`s to them; the skipped `mov eax, 99` after each `ret` must never execute. This is the guard that fails if anyone ever adds a trusted shadow stack |
+| `recursive_calls_match_the_interpreter` | four nested calls with a base case: linked *and* unlinked call exits, and `rsp` back at its start |
+| `ret_imm_discards_bytes_from_the_guest_stack` | `ret 8` pops the return address and discards a caller slot: `rsp` and every register match tier 0 |
+
+#### Verification
+
+* native (x86-64) clang-19: 341 passed / 0 failed / 47 skipped of 388; `ctest` 19/19
+* AArch64 (`qemu-aarch64-static`): **388 passed / 0 failed / 5 skipped of 393**
+* full runs on both tiers still print `acc=20475694797959 g=50991808` and
+  `acc=9000001 counter=0`
+
 ### 29.9 Still open from §L
 
 Items 1-5 of §L are all resolved (1 justified and pinned, 2 and 5 implemented, 3 retracted as wrong,
@@ -1723,9 +1821,12 @@ rather than by the audit's opcode estimate. Item 9 (lazy flags) was profiled in 
 concluded that a full six-flag descriptor is architectural; **stage 1 of that design (PF/AF only) is
 implemented and measured in §29.11**. Item 6 (hot-block gating) is done and measured in §29.12:
 below a crossover of tens of thousands of guest instructions, compiling on first reach was paying
-more than it saved, and the cache now interprets cold block starts instead. Still open: item 8
-(cross-block register allocation), 9 stage 2 (CF/ZF/SF/OF via `cc_op`/`cc_src`/`cc_dst`), 10 (shadow
-stack), 12 (signal delivery), 13 (guest threads), 14 (an IR and a real optimiser).
+more than it saved, and the cache now interprets cold block starts instead. Item 10 (shadow stack) was
+measured in §29.13: the `call` side was worth implementing (direct calls are now linked by the P7
+machinery, 9 % on a call-heavy guest) and the shadow-stack half was rejected in favour of a
+return-target cache that belongs with item 14. Still open: item 8 (cross-block register allocation),
+9 stage 2 (CF/ZF/SF/OF via `cc_op`/`cc_src`/`cc_dst`), 12 (signal delivery), 13 (guest threads), 14
+(an IR and a real optimiser).
 
 ---
 

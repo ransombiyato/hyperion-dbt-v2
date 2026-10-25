@@ -3594,6 +3594,19 @@ BlockTranslation translate_cached_block(const std::uint8_t* code, std::size_t si
                 store_gpr_rb(e, &ra, kB, Gpr::kRsp);
                 spill_ra();
                 e.ldr(a64::Width::k64, kA, a64::kSp, kScratchSlot1);
+                // P10: a `call`'s destination, when it is an immediate, is a
+                // statically known block start, so the exit is linkable exactly
+                // like a `jmp` (P7) - the callee entry needs the same `rip` store
+                // and nothing else. This removes the shared dispatcher
+                // (11 instructions + two jump-table loads) from every direct
+                // call. Indirect calls and `ret` keep the dispatcher: their
+                // destination is only known at run time.
+                e.str(a64::Width::k64, kA, kState, kRipOffset);
+                if (step.insn.dst.kind == OperandKind::kImmediate &&
+                    out.exit_links.size() < kMaxExitLinks) {
+                    out.exit_links.push_back(
+                        {static_cast<std::uint64_t>(e.count()) * 4, step.insn.dst.imm});
+                }
                 e.br(kDispatchReg);
                 break;
             }
