@@ -323,7 +323,7 @@ guest buffer from the host in 4 KiB chunks, accepting only the two defined
 | `waitid`(247) | ⬜ (`siginfo_t` layout differs per arch; BusyBox and glibc use `wait4`) | 6 | — |
 | `pipe`(22)/`pipe2`(293) + inheritance across `fork` | ✅ | 6 | `guest.process` (`pipe + fork IPC`, `file descriptor inheritance`) |
 | `futex`(202) | ⚠️ **stub, deliberately honest**: the value comparison is real (`-EAGAIN` when the word changed, `-EFAULT` on a bad address), `WAKE` reports 0 woken, and the paths that need a wait queue (`WAIT` on a matching value, PI, requeue) are refused with `-ENOSYS` instead of falsely reporting a wake-up | 6 | `syscall.linux_compat_futex_*` |
-| Thread creation (`clone` with `CLONE_THREAD`) | ❌ `-ENOSYS` by design | 6 | `guest.process` |
+| Thread creation (`clone` with `CLONE_THREAD`) | ❌ `-ENOSYS` by design — every shared-state flag (`CLONE_VM`/`THREAD`/`FILES`/`FS`/`SIGHAND`) and every namespace flag is refused, an unknown flag is refused rather than ignored, and the refusal leaves guest state untouched | 6 | `guest.process` (`raw_clone_flags`), `syscall.clone_*` |
 | Signals: `rt_sigaction`(13) **records and reports the guest's dispositions**, `rt_sigprocmask`(14) tracked in a guest mask (with `SIG_BLOCK`/`SIG_UNBLOCK`/`SIG_SETMASK`), handlers **not** invoked | ⚠️ partial — dispositions and masks round-trip, delivery into a guest handler is not implemented (see below) | 6 | `syscall.kill_*`, `syscall.a_blocked_signal_*`, `syscall.an_installed_handler_*` |
 | `kill`(62)/`tgkill`(234) aimed at this (single) guest process | ⚠️ synchronous self-raise only, decided by the guest's own disposition and mask: `SIG_IGN` and ignore-class defaults drop it, a **blocked** signal is held and delivered when the mask stops blocking it, a terminate-class default ends the run with status `128+signo`, and an installed handler is **not** invoked (the run ends the same way) | 6 | `syscall.kill_*`, `syscall.SIGKILL_cannot_be_blocked_or_ignored` |
 | `epoll_create1`(291)/`epoll_ctl`(233)/`epoll_wait`(232)/`epoll_pwait`(281)/`epoll_pwait2`(441) | ✅ (packed 12-byte guest `epoll_event` converted per entry) | 6 | `syscall_adapters.*`, `guest.syscall_compat` |
@@ -410,6 +410,17 @@ regress into a fake success.
 * **A forked child runs on Tier 0 by default.** The parent keeps whichever tier it
   was using. Tier 0 is the reference interpreter that the differential test
   validates Tier 1 against, so child execution is the better-understood path.
+* **Threads are not supported; processes are.** `fork`, `vfork` and a process-creating
+  `clone` each produce a real host child with a deep-copied address space and its own guest
+  state, so `%fs` (TLS), signal dispositions and signal masks are per *process* — the correct
+  POSIX meaning. Two consequences are worth stating plainly rather than leaving to be
+  discovered: `CLONE_CHILD_CLEARTID` clears the tid word in the *child's* copy only (a parent
+  polling that word never sees it, because the address spaces are not shared), and every
+  flag that asks for a shared address space is refused with `-ENOSYS` instead of being
+  downgraded to a private copy. What a thread implementation would need — per-thread
+  `GuestState` and `ExecContext`, a race-free indirect-branch table, a translation-cache
+  shootdown on code invalidation, futex wait queues and asynchronous signal delivery — is
+  listed in `docs/translator-audit.md` §29.17.
 * **Guest signal handlers are not invoked.** `rt_sigaction` records and reports
   the guest's own dispositions — ask what is installed and you get back what you
   installed — and `sigaltstack` records and reports the alternate stack, but

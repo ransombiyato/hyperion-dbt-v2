@@ -2158,6 +2158,103 @@ GuestSigaction read_sigaction(FlatMemory& memory, std::uint64_t addr) {
 
 } // namespace
 
+// --- P13: what threading this emulator supports, pinned ----------------------
+//
+// The supported model is "many processes, no threads": fork/vfork and a
+// process-creating clone each get a real host child with a *deep copy* of the
+// guest address space and its own GuestState, so TLS (fs_base), signal
+// dispositions and signal masks are per process - which is the correct POSIX
+// meaning for processes. Every clone flag that asks for shared state
+// (CLONE_VM/THREAD/FILES/FS/SIGHAND) or for a kernel feature unrooted Android
+// does not grant (namespaces, ptrace) is refused with -ENOSYS rather than
+// downgraded to a fork: a guest that asked for a shared address space and got a
+// private copy would corrupt its own memory, and that failure would be invisible.
+//
+// These tests drive the refusal paths only - a *supported* clone forks the test
+// process, so it is covered by the guest-level fixture instead
+// (tests/guest/fixtures/raw_clone_flags.c, process_test.sh).
+
+HYPERION_TEST("syscall", "clone_thread_flags_are_refused_without_touching_guest_state") {
+    GuestAddressSpace as;
+    MinimalSyscallHandler handler({}, &as);
+    FlatMemory memory(kBase, kMemSize);
+
+    // clone(CLONE_VM | CLONE_THREAD | CLONE_SIGHAND, stack != 0, ...), which is
+    // pthread_create()'s syscall. Refused, and refused *before* anything is
+    // created: no tid is written, no state changes, and rax carries -ENOSYS.
+    namespace cf = hyperion::clone_flags;
+
+    struct Case {
+        const char* what;
+        std::uint64_t flags;
+    };
+    const Case cases[] = {
+        {"CLONE_VM|CLONE_THREAD|CLONE_SIGHAND", cf::kVm | cf::kThread | cf::kSighand},
+        {"CLONE_VM alone", cf::kVm},
+        {"CLONE_FILES", cf::kFiles},
+        {"CLONE_FS", cf::kFs},
+        {"CLONE_SIGHAND", cf::kSighand},
+        {"CLONE_VM|CLONE_THREAD|CLONE_CHILD_SETTID", cf::kVm | cf::kThread | cf::kChildSetTid},
+    };
+    for (const Case& c : cases) {
+        GuestState s = syscall_state(hyperion::sysno::kClone,
+                                     {c.flags, kBase + 0x800 /*child stack*/, 0, kBase + 0x300, 0});
+        const GuestState before = s;
+        const auto r = handler.handle(s, memory);
+        HYPERION_CHECK(r.status == SyscallStatus::kHandled);
+        HYPERION_CHECK_EQ(s.reg(Gpr::kRax), static_cast<std::uint64_t>(-hyperion::kEnosys));
+        // Nothing but rax may change: a half-created thread would be worse than
+        // a refusal, because the guest would believe its memory is shared.
+        for (std::size_t i = 0; i < hyperion::kGprCount; ++i) {
+            if (s.gpr[i] != before.gpr[i] && i != static_cast<std::size_t>(Gpr::kRax)) {
+                std::fprintf(stderr, "  P13: %s changed gpr %zu\n", c.what, i);
+                HYPERION_CHECK(false);
+            }
+        }
+        HYPERION_CHECK_EQ(s.rip, before.rip);
+    }
+}
+
+HYPERION_TEST("syscall", "clone_exit_signal_other_than_sigchld_is_refused") {
+    GuestAddressSpace as;
+    MinimalSyscallHandler handler({}, &as);
+    FlatMemory memory(kBase, kMemSize);
+    // Exit signal SIGUSR1 (10): a parent would have to handle stop/continue
+    // notifications that are not implemented, so the flag is refused rather than
+    // half-honoured.
+    GuestState s = syscall_state(hyperion::sysno::kClone, {10, 0, 0, 0, 0});
+    handler.handle(s, memory);
+    HYPERION_CHECK_EQ(s.reg(Gpr::kRax), static_cast<std::uint64_t>(-hyperion::kEnosys));
+}
+
+HYPERION_TEST("syscall", "clone_validates_tid_pointers_before_creating_a_child") {
+    GuestAddressSpace as;
+    MinimalSyscallHandler handler({}, &as);
+    FlatMemory memory(kBase, kMemSize);
+    namespace cf = hyperion::clone_flags;
+    constexpr std::uint64_t kSigchld = 17;
+
+    // A supported flag set with an unmapped child_tid: -EFAULT, and crucially
+    // before the fork, so no orphan host process is created for a call that
+    // fails. kMemSize bounds the FlatMemory, so this address is unmapped.
+    GuestState s = syscall_state(
+        hyperion::sysno::kClone,
+        {cf::kChildSetTid | kSigchld, 0, 0, kBase + 0x100000 /* outside the 4 KiB flat map */, 0});
+    handler.handle(s, memory);
+    HYPERION_CHECK_EQ(s.reg(Gpr::kRax), static_cast<std::uint64_t>(-hyperion::kEfault));
+}
+
+HYPERION_TEST("syscall", "clone_settls_with_a_null_tls_is_einval") {
+    GuestAddressSpace as;
+    MinimalSyscallHandler handler({}, &as);
+    FlatMemory memory(kBase, kMemSize);
+    constexpr std::uint64_t kSigchld = 17;
+    GuestState s = syscall_state(hyperion::sysno::kClone,
+                                 {hyperion::clone_flags::kSetTid | kSigchld, 0, 0, 0, 0 /*tls*/});
+    handler.handle(s, memory);
+    HYPERION_CHECK_EQ(s.reg(Gpr::kRax), static_cast<std::uint64_t>(-hyperion::kEinval));
+}
+
 // --- P12: what a signal aimed at the guest actually does --------------------
 //
 // Before this, kill()/tgkill() with any non-zero signal ended the run

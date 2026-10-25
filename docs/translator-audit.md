@@ -2001,6 +2001,77 @@ a real `GuestState` and `FlatMemory`, so they are deterministic and host-indepen
 * no generated-code change: this item is entirely in the syscall layer, so the translator
   and its differential tests are untouched
 
+### 29.17 P13 — threads: the supported model, defined and pinned; thread creation stays refused
+
+Item 13 of §L asks what threading is supported and to implement it "incrementally". The
+honest answer after the audit is that the supported model is **many processes, no threads**,
+and that this is a design position rather than a missing afternoon of work: the emulator's
+two tiers both assume a single thread owns the whole translation cache, the TLB, the
+indirect-branch jump table and the guest address space.
+
+#### What the supported model is, exactly
+
+| property | supported behaviour |
+| --- | --- |
+| process creation | `fork`(57), `vfork`(58), `clone`(56) with an exit signal of `SIGCHLD` and only the flags `CLONE_CHILD_SETTID`, `CLONE_CHILD_CLEARTID`, `CLONE_PARENT_SETTID`, `CLONE_SETTLS`, `CLONE_UNTRACED`, `CLONE_VFORK` |
+| the child | a **real host child** with a deep copy of the guest address space (`GuestAddressSpace` copy constructor) and its own `GuestState`; it runs the guest from the instruction after the `syscall` and exits the host process with the guest's status |
+| address space | private per process. Nothing a child writes is visible to the parent, which is the POSIX meaning of `fork` |
+| TLS | `%fs` base lives in `GuestState::fs_base` (set by `arch_prctl(ARCH_SET_FS)` or `CLONE_SETTLS`) and is therefore per process — again the correct meaning for processes |
+| signal disposition and mask | recorded in `MinimalSyscallHandler`, i.e. per process |
+| translation | the parent keeps its tier; a child runs tier 0 by default (`COMPATIBILITY.md`), so no translation state is ever shared between two live processes |
+| `CLONE_CHILD_CLEARTID` | the child zeroes the tid word in **its own copy** on exit; a parent that polls the word deliberately does not see it (verified gap, see below) |
+| thread creation | refused: `-ENOSYS` for any of `CLONE_VM`, `CLONE_THREAD`, `CLONE_FILES`, `CLONE_FS`, `CLONE_SIGHAND`, `CLONE_SYSVSEM`, `CLONE_PTRACE`, `CLONE_STOP`, `CLONE_IO`, and for every namespace flag; an unknown flag is refused rather than ignored |
+
+Refusing is the safe behaviour, not a limitation to apologise for: a guest that asked for a
+shared address space and received a private copy would corrupt memory in a way it cannot
+detect. The refusal is pinned twice — end to end by a real x86-64 fixture
+(`tests/guest/fixtures/raw_clone_flags.c`, run by `process_test.sh`) and now at unit level by
+four new tests that also check the refusal **changes nothing**: `clone_thread_flags_are_refused_without_touching_guest_state`
+(every GPR except `rax` and `rip` identical after the call), `clone_exit_signal_other_than_sigchld_is_refused`,
+`clone_validates_tid_pointers_before_creating_a_child` (`-EFAULT` *before* any child exists) and
+`clone_settls_with_a_null_tls_is_einval`.
+
+#### What threads would actually require — and where the races would be
+
+Written down because "just call pthread_create" is not the shape of the problem:
+
+1. **Per-thread guest state**: `GuestState` (GPRs, `rip`, flags *and the pending PF/AF
+   descriptor of §29.11*), `fs_base` (TLS), signal mask, and the alt-stack. Dispositions are
+   shared under `CLONE_SIGHAND`; masks are not.
+2. **Per-thread JIT context**: `ExecContext` holds the `SoftTlb` and its mapping epoch, the
+   budget pointers, `jit_exit_epilogue` and the 1024-entry indirect-branch jump table. One
+   thread's TLB invalidation must not corrupt another's; today there is exactly one of these,
+   owned by the one `TranslationCache`.
+3. **Shared translation state, i.e. the race surface**: the block map, the code arena, the
+   direct-mapped block cache, and `lookup()` — which *writes* `ctx_->jump_table[jslot]` on
+   every dispatch hit. Two threads dispatching simultaneously would race on that write today.
+   The hot-block counters of §29.12 are a benign race by construction (a lost increment only
+   delays a promotion), which is worth keeping in mind as the pattern for the rest.
+4. **Code invalidation**: `invalidate_all()` runs when a syscall changes the guest's code
+   epoch (self-modifying code, `mmap`/`mprotect` of executable pages). With threads it must
+   stop every thread that could be executing a stale block — the classic translation-cache
+   shootdown — or a thread will keep running superseded code.
+5. **Synchronisation**: `futex` would need a real wait queue keyed by guest address with
+   wake-one/wake-all and priority-inheritance refusal, plus `FUTEX_WAIT` blocking the *thread*
+   rather than ending the run. Today the value comparison is real and `WAKE` honestly reports
+   0 woken, because a single-threaded guest cannot have a waiter.
+6. **Signals**: with threads there would be asynchronous delivery, per-thread masks, and a
+   `killed by a signal` path that must interact with generated code — exactly the safe-point
+   machinery §29.16 says does not exist because nothing can arrive asynchronously today.
+
+That is a phase of work with its own risk class (locking in the hottest path, memory ordering
+in the TLB, and a shootdown protocol), not an incremental change to be tacked onto this one.
+Implementing a partial version — say, `CLONE_VM|CLONE_THREAD` accepted with a shared address
+space but one execution context — would produce exactly the kind of unfounded POSIX claim that
+this project refuses to make.
+
+#### Verification
+
+* native (x86-64) clang-19: **353 passed / 0 failed / 47 skipped of 400**; `ctest` 19/19
+* AArch64 (`qemu-aarch64-static`): **400 passed / 0 failed / 5 skipped of 405**
+* the four new tests are plain `syscall` tests: deterministic, no `HYPERION_SKIP`, and they
+  create no host processes (the refusal and validation paths all return before the fork)
+
 ### 29.9 Still open from §L
 
 Items 1-5 of §L are all resolved (1 justified and pinned, 2 and 5 implemented, 3 retracted as wrong,
@@ -2026,7 +2097,12 @@ together is 6.1–6.6 % of generated code and only part of that is removable —
 measurement resolution of §29.14, so it is designed but deferred. Item 12 (signals) is audited and partly
 implemented in §29.16: `kill`/`tgkill` now honour the guest's disposition and mask instead of
 ending every run, with handler invocation (the x86-64 frame plus `rt_sigreturn`) and asynchronous
-delivery documented as absent. Still open: 13 (guest threads), 14 (an IR and a real optimiser).
+delivery documented as absent. Item 13 (guest threads) is audited in §29.17: the supported model is
+"many processes, no threads", every shared-state clone flag is refused (and the refusal is now
+pinned at unit level as well as end to end), and the six things a thread implementation would need
+- per-thread state and JIT context, a write-race-free dispatcher, a translation-cache shootdown,
+futex wait queues and asynchronous signals - are written down instead of approximated. Still open:
+14 (an IR and a real optimiser).
 
 ---
 
