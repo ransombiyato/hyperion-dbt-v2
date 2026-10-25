@@ -56,6 +56,7 @@ struct TranslateTimer {
 };
 
 bool jit_exec_complex(ExecContext* ctx, GuestState* state, const Instruction* insn) noexcept {
+    ++ctx->helper_calls;
     return execute_cached_helper(*insn, *state, *ctx->memory, &ctx->tlb);
 }
 
@@ -202,6 +203,10 @@ const CachedBlock* TranslationCache::translate_one(Memory& memory, std::uint64_t
     install(raw);
     translated_guest_instructions_ += translated.guest_instruction_count;
     return raw;
+}
+
+std::uint64_t TranslationCache::helper_calls() const {
+    return ctx_ != nullptr ? ctx_->helper_calls : 0;
 }
 
 std::size_t TranslationCache::total_code_bytes() const {

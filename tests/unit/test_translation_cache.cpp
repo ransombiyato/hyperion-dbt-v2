@@ -10,6 +10,7 @@
 // the interpreter lives in test_translator.cpp, where the rest of the
 // translation pipeline is covered.
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <vector>
 
@@ -157,6 +158,182 @@ HYPERION_TEST("translation_cache", "exits_are_linked_to_successors_and_stay_corr
     HYPERION_CHECK(cache.linked_exits() <= cache.block_count() * 2);
 }
 
+HYPERION_TEST("translation_cache", "eight_and_sixteen_bit_alu_flags_match_interpreter") {
+    // 8- and 16-bit ALU/CMP/TEST used to reach the per-instruction C++ helper
+    // whenever more than ZF/CF was live, which measurement showed was ~95% of all
+    // helper calls on a real guest. They are now inlined, and inlining them means
+    // reproducing six flags that AArch64 cannot produce directly at that width:
+    // a 32-bit SUBS of zero-extended bytes gets CF and ZF right but leaves SF on
+    // bit 31 and OF at 32-bit width, both wrong. Each case below therefore runs
+    // the same bytes through tier 0 (the reference interpreter, which is the
+    // definition of the answer) and tier 1, and compares all six flags, every
+    // GPR, rip and the retired-step count.
+    //
+    // The values are the interesting ones, not a sample: 0x7f/0x80 straddle the
+    // sign boundary, 0x00/0x01 exercise borrow and zero results, 0xff is all ones
+    // (parity, AF), and 0x80 - 0x01 is the signed-overflow case a 32-bit SUBS
+    // cannot see.
+    struct Case {
+        const char* what;
+        std::vector<std::uint8_t> code;
+        bool touches_memory;
+    };
+    // Encodings verified with as/objdump.
+    const std::vector<Case> cases = {
+        {"cmp al, 0x80", {0x3C, 0x80}, false},
+        {"cmp al, bl", {0x38, 0xD8}, false},
+        {"test al, 0x01", {0xA8, 0x01}, false},
+        {"test al, bl", {0x84, 0xD8}, false},
+        {"and al, 0x0f", {0x24, 0x0F}, false},
+        {"or al, bl", {0x08, 0xD8}, false},
+        {"xor al, al", {0x30, 0xC0}, false},
+        {"test ah, bh", {0x84, 0xFC}, false}, // high-byte registers
+        {"and byte [rbx], 0x0f", {0x80, 0x23, 0x0F}, true},
+        {"cmp byte [rbx], 0x80", {0x80, 0x3B, 0x80}, true},
+        {"cmp byte [rbx], al", {0x38, 0x03}, true},
+        {"test byte [rbx], 0x01", {0xF6, 0x03, 0x01}, true},
+        {"cmp ax, 0x8000", {0x66, 0x3D, 0x00, 0x80}, false},
+        {"test ax, bx", {0x66, 0x85, 0xD8}, false},
+        {"and ax, 0xff00", {0x66, 0x25, 0x00, 0xFF}, false},
+        {"or ax, bx", {0x66, 0x09, 0xD8}, false},
+        {"or ax, 0x1234", {0x66, 0x0D, 0x34, 0x12}, false},
+        {"xor ax, bx", {0x66, 0x31, 0xD8}, false},
+        {"cmp ax, bx", {0x66, 0x39, 0xD8}, false},
+        {"cmp word [rbx], 0x8000", {0x66, 0x81, 0x3B, 0x00, 0x80}, true},
+    };
+    const std::uint64_t kPatterns[] = {0x00, 0x01, 0x7F, 0x80, 0xFF};
+    constexpr std::uint64_t kData = kBase + 0x100;
+
+    for (const Case& c : cases) {
+        for (std::uint64_t a : kPatterns) {
+            for (std::uint64_t b : kPatterns) {
+                // rax holds the byte in al (and 0xBBBB in ah to prove the high-byte
+                // path does not disturb the neighbouring byte), rbx the second
+                // operand and the memory pointer.
+                const std::uint64_t rax = (a & 0xFFULL) | (0xBBULL << 8);
+                const std::uint64_t rbx = (b & 0xFFULL) | 0xAA00ULL;
+
+                std::vector<std::uint8_t> program = c.code;
+                program.push_back(0xF4); // hlt: ends the block with every flag live
+
+                FlatMemory interp_mem(kBase, kMemSize);
+                std::memcpy(interp_mem.data(), program.data(), program.size());
+                interp_mem.data()[kData - kBase] = static_cast<std::uint8_t>(a);
+                GuestState initial;
+                initial.rip = kBase;
+                initial.reg(Gpr::kRax) = rax;
+                initial.reg(Gpr::kRbx) = c.touches_memory ? kData : rbx;
+                const hyperion::RunResult expected = hyperion::run_program(interp_mem, initial);
+
+                FlatMemory cache_mem(kBase, kMemSize);
+                std::memcpy(cache_mem.data(), program.data(), program.size());
+                cache_mem.data()[kData - kBase] = static_cast<std::uint8_t>(a);
+                TranslationCache cache;
+                const hyperion::RunResult actual = cache.run(cache_mem, initial);
+
+                // Inlined, not merely correct: a fallback to the C++ helper
+                // would produce the same flags and hide a regression in the new
+                // code path behind the old one.
+                HYPERION_CHECK_EQ(cache.helper_calls(), std::uint64_t{0});
+
+                if (!(actual.status == RunStatus::kOk) || actual.steps != expected.steps ||
+                    actual.state.reg(Gpr::kRax) != expected.state.reg(Gpr::kRax) ||
+                    actual.state.reg(Gpr::kRbx) != expected.state.reg(Gpr::kRbx) ||
+                    actual.state.flags.cf != expected.state.flags.cf ||
+                    actual.state.flags.pf != expected.state.flags.pf ||
+                    actual.state.flags.af != expected.state.flags.af ||
+                    actual.state.flags.zf != expected.state.flags.zf ||
+                    actual.state.flags.sf != expected.state.flags.sf ||
+                    actual.state.flags.of != expected.state.flags.of) {
+                    std::fprintf(
+                        stderr,
+                        "  mismatch: %s a=0x%02llx b=0x%02llx\n"
+                        "    tier1 cf/pf/af/zf/sf/of = %d%d%d%d%d%d  rax=0x%llx\n"
+                        "    tier0 cf/pf/af/zf/sf/of = %d%d%d%d%d%d  rax=0x%llx\n",
+                        c.what, static_cast<unsigned long long>(a),
+                        static_cast<unsigned long long>(b), actual.state.flags.cf,
+                        actual.state.flags.pf, actual.state.flags.af, actual.state.flags.zf,
+                        actual.state.flags.sf, actual.state.flags.of,
+                        static_cast<unsigned long long>(actual.state.reg(Gpr::kRax)),
+                        expected.state.flags.cf, expected.state.flags.pf, expected.state.flags.af,
+                        expected.state.flags.zf, expected.state.flags.sf, expected.state.flags.of,
+                        static_cast<unsigned long long>(expected.state.reg(Gpr::kRax)));
+                    HYPERION_CHECK(false);
+                    return;
+                }
+                // A memory destination must have been written back to guest memory.
+                if (c.touches_memory) {
+                    HYPERION_CHECK_EQ(cache_mem.data()[kData - kBase],
+                                      interp_mem.data()[kData - kBase]);
+                }
+            }
+        }
+    }
+    // One flag combination per case is checked above; this loop covers every
+    // operand pair in {0,1,0x7f,0x80,0xff}^2, which is where the truncation,
+    // borrow, parity and signed-overflow cases live.
+}
+
+HYPERION_TEST("translation_cache", "narrow_alu_updates_a_register_allocated_host_register") {
+    // The 8-bit ALU write-back has two paths: a store into GuestState, and - when
+    // the host register allocator has taken the guest register - a bitfield
+    // insert into the borrowed host register. A one-instruction block never
+    // allocates (the allocator only takes registers referenced more than twice),
+    // so the table test above exercises the store path only. This program
+    // references al enough times to allocate rax, then checks the byte result,
+    // all six flags, and that the neighbouring bits survived the insert.
+    //   and al,0x0f (x5) ; hlt
+    const std::vector<std::uint8_t> program = {
+        0x24, 0x0F, 0x24, 0x0F, 0x24, 0x0F, 0x24, 0x0F, 0x24, 0x0F, 0xF4,
+    };
+    const std::uint64_t patterns[] = {0x00, 0x0F, 0x80, 0xFF, 0xFFFFFFFFFFFFFFFFULL};
+    for (std::uint64_t value : patterns) {
+        FlatMemory interp_mem(kBase, kMemSize);
+        std::memcpy(interp_mem.data(), program.data(), program.size());
+        GuestState initial;
+        initial.rip = kBase;
+        initial.reg(Gpr::kRax) = value;
+        const hyperion::RunResult expected = hyperion::run_program(interp_mem, initial);
+
+        FlatMemory cache_mem(kBase, kMemSize);
+        std::memcpy(cache_mem.data(), program.data(), program.size());
+        TranslationCache cache;
+        const hyperion::RunResult actual = cache.run(cache_mem, initial);
+
+        HYPERION_CHECK(actual.status == RunStatus::kOk);
+        HYPERION_CHECK_EQ(actual.state.reg(Gpr::kRax), expected.state.reg(Gpr::kRax));
+        HYPERION_CHECK_EQ(actual.state.flags.zf, expected.state.flags.zf);
+        HYPERION_CHECK_EQ(actual.state.flags.sf, expected.state.flags.sf);
+        HYPERION_CHECK_EQ(actual.state.flags.pf, expected.state.flags.pf);
+        HYPERION_CHECK_EQ(actual.state.flags.cf, expected.state.flags.cf);
+        HYPERION_CHECK_EQ(actual.state.flags.of, expected.state.flags.of);
+        HYPERION_CHECK_EQ(actual.state.flags.af, expected.state.flags.af);
+        HYPERION_CHECK_EQ(cache.helper_calls(), std::uint64_t{0});
+    }
+}
+
+HYPERION_TEST("translation_cache", "helper_counter_is_not_always_zero") {
+    // The companion to the test above: if helper_calls() were stuck at zero, the
+    // assertion there would pass for the wrong reason. An SSE2 and a DIV are
+    // still helper opcodes, so this proves the counter observes real fallbacks.
+    //   mov eax, 1 / div ecx / hlt   (div is deliberately not inlined)
+    const std::vector<std::uint8_t> program = {
+        0xB8, 0x01, 0x00, 0x00, 0x00, // mov eax, 1
+        0xF7, 0xF1,                   // div ecx
+        0xF4,                         // hlt
+    };
+    FlatMemory mem(kBase, kMemSize);
+    std::memcpy(mem.data(), program.data(), program.size());
+    GuestState initial;
+    initial.rip = kBase;
+    initial.reg(Gpr::kRcx) = 2;
+    TranslationCache cache;
+    const hyperion::RunResult r = cache.run(mem, initial);
+    HYPERION_CHECK(r.status == RunStatus::kOk);
+    HYPERION_CHECK_EQ(r.state.reg(Gpr::kRax), std::uint64_t{0}); // 1 / 2 = 0
+    HYPERION_CHECK(cache.helper_calls() >= 1);
+}
+
 HYPERION_TEST("translation_cache",
               "self_loop_superblock_matches_interpreter_with_and_without_step_limit") {
     // Tight self-loop exercising both full completion and mid-loop step-budget
@@ -212,6 +389,18 @@ HYPERION_TEST("translation_cache", "direct_map_collision_falls_back_to_map") {
 }
 
 HYPERION_TEST("translation_cache", "exits_are_linked_to_successors_and_stay_correct") {
+    HYPERION_SKIP("generated code is AArch64; requires an AArch64 host to run");
+}
+
+HYPERION_TEST("translation_cache", "eight_and_sixteen_bit_alu_flags_match_interpreter") {
+    HYPERION_SKIP("generated code is AArch64; requires an AArch64 host to run");
+}
+
+HYPERION_TEST("translation_cache", "narrow_alu_updates_a_register_allocated_host_register") {
+    HYPERION_SKIP("generated code is AArch64; requires an AArch64 host to run");
+}
+
+HYPERION_TEST("translation_cache", "helper_counter_is_not_always_zero") {
     HYPERION_SKIP("generated code is AArch64; requires an AArch64 host to run");
 }
 

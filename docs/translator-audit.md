@@ -995,7 +995,7 @@ In rough order of value/effort:
 | 8 | Cross-block register allocation with spilling | Medium-High | Biggest codegen win; needs liveness over the CFG |
 | 9 | Lazy flags (keep `NZCV`, materialise on demand) | Medium | Removes 6 byte-stores per ALU op |
 | 10 | Shadow stack for `call`/`ret` | Medium | 16 instructions per call/return |
-| 11 | Inline the remaining integer helper opcodes | Low | 15% of opcodes currently pay a C++ call |
+| 11 | Inline the remaining integer helper opcodes | Low | 15% of opcodes currently pay a C++ call | **Done, §29.8.** Measurement said the 15 % was really 8/16-bit six-flag ALU: 9 012 090 → 257 helper calls (−71 % wall time on a byte-comparing guest, no change on two others), code size −4.5 %. |
 | 12 | Signal delivery infrastructure | High | Unlocks real programs; needs `rip` at every instruction |
 | 13 | Guest threads | Very High | Architectural; needed for anything concurrent |
 | 14 | An IR + real optimizer | Very High | The correct long-term shape; nothing above requires it |
@@ -1093,10 +1093,10 @@ attempt to do so was made.
 
 | Host | What ran | Result |
 | --- | --- | --- |
-| x86-64 Linux, native | `build-strict` unit suite | **341 passed / 0 failed / 25 skipped (of 366)** |
+| x86-64 Linux, native | `build-strict` unit suite | **341 passed / 0 failed / 28 skipped (of 369)** |
 | x86-64 Linux, native | `ctest` | 19/19 (two new tests: `translate_bench.smoke`, `translate_bench.rejects_single_sample`) |
 | x86-64 Linux, native | dynamic-loader guest (`PT_INTERP` → `ld-linux`, exercises the RELRO `mprotect` path) | OK after the fix |
-| AArch64, cross-built, **`qemu-aarch64-static`** (no hardware) | unit suite | **366 passed / 0 failed / 5 skipped (of 371)** |
+| AArch64, cross-built, **`qemu-aarch64-static`** (no hardware) | unit suite | **369 passed / 0 failed / 5 skipped (of 374)** |
 | AArch64 under qemu | `hyperion_tier_bench` | 436.55 ns/guest-ins Tier 0 vs 3.6895 Tier 1, both correct |
 | AArch64 under qemu | sieve, 200 000 | Tier 0 1332 ms vs Tier 1 458 ms |
 
@@ -1267,16 +1267,79 @@ being emulated, on an x86-64 host. They show the change is a real and large win 
 this measurement and that it does not regress the self-loop path; they are not an
 AArch64 hardware measurement, which remains unavailable here.
 
-### 29.8 Still open from §L
+### 29.8 P11 done — the remaining helper-call opcodes, chosen by measurement
+
+The audit's item 11 was "inline the remaining integer helper opcodes, 15% of opcodes currently pay a
+C++ call". That estimate was not used. Instead the question was answered by counting, with a
+throw-away counter inside `jit_exec_complex` on a real guest (551k retired instructions, Tier 1 under
+qemu): of 12 214 helper calls, **69 % were 8-bit `cmp` and 25 % 8-bit `test` plus 8-bit
+`and`/`or`/`xor`** — together ~95 %. SSE2 was 3 %, `adc` 1 %, and `div`/`mul`/`cpuid`/`cmpxchg`
+rounding errors. A second run printing operand shapes and flag masks showed why they were falling
+back: all of them were **8- or 16-bit ALU with all six flags live** (mask `0x3f`), which the existing
+inline path deliberately declined because AArch64 cannot set NZCV at 8/16 bits.
+
+That is an inherent property, not a pessimistic liveness analysis: a block that ends without a
+flag-consuming branch leaves every flag architecturally live, so byte compares cannot be treated as
+"ZF only". So the fix inlines the full six-flag semantics instead of the opcode list:
+
+* New `emit_flags_wide()` in `translator.cpp`. A 32-bit `SUBS` of two zero-extended bytes gets CF and
+  ZF right — truncation cannot turn a non-zero byte into zero, and the borrow out of bit 7 is the
+  borrow out of bit 31 — but it leaves SF on bit 31 (not bit 7) and OF at 32-bit width, where an
+  8-bit overflow is invisible. SF, OF, AF and PF are therefore computed from the *truncated* result,
+  with non-flag-setting instructions, so the NZCV-consuming stores can be emitted in any order.
+* The 8/16-bit `cmp`/`test`/`and`/`or`/`xor` path in `emit_cached_body_insn` now emits the arithmetic
+  and calls it, for every flag mask, with register, immediate, memory and high-byte operands. The
+  result is only truncated when SF/OF/AF/PF is live or the result is stored.
+* `TranslationCache::helper_calls()` and an `ExecContext::helper_calls` counter (slow path only, zero
+  cost in generated code) so "this opcode is inlined now" is an assertion a test can make, printed by
+  `hyperion run --tier=1`.
+
+**The new test found a real bug in my first implementation**, which is worth recording: I used the
+addition overflow identity `(a ^ r) & (b ^ r)` for subtraction as well. It agrees with the correct
+`(a ^ r) & (a ^ b)` in most cases and disagrees exactly on the overflow cases — `0x00 - 0x80`
+overflows a byte but not a word, so the 32-bit V flag is clear and nothing else catches it. The
+table test below failed on the first sweep with `of` mismatched before the code was ever committed.
+
+Measured effect, exact counters first (same guest, Tier 1 under qemu):
+
+| guest | helper calls before | helper calls after | generated code before → after |
+| --- | --- | --- | --- |
+| branch-heavy VM-style, 102M retired insns | 9 012 090 | **257** | 642 140 → 612 244 B (−4.7 %) |
+| mixed guest (fib, brk/mmap), 551k retired insns | 12 213 | **579** | 687 176 → 656 388 B (−4.5 %) |
+
+Wall time, item 11 binary vs the P7 binary, run alternately, 3 rounds each, Tier 1 under
+`qemu-aarch64-static` on this x86-64 host:
+
+| guest | before (P7) | after | effect |
+| --- | --- | --- | --- |
+| branch-heavy VM-style | 6145 / 6006 / 6453 ms | **1770 / 1784 / 1812 ms** | **−71 %** (medians 6145 → 1784) |
+| mixed guest | 336 / 330 / 338 ms | 380 / 330 / 329 ms | no change outside noise |
+| `tier_bench` self-loop | 3.11 / 3.13 / 3.27 ns/ins | 3.08 / 3.13 / 3.14 ns/ins | no change |
+
+The two null results are the honest part of the report. The mixed guest only ever made 12 213 helper
+calls in a 551k-instruction run (2 %), and its 330 ms is dominated by process start-up, so nothing
+should move — and nothing did. The self-loop benchmark contains no 8/16-bit ALU at all, so it cannot
+show this win; that is the same reason it could not show P7's.
+
+The 3.4× on the branch-heavy guest is large but explained by the counters: that guest is a bytecode
+interpreter whose dispatch is a `switch` on `unsigned char`, so it was making one C++ helper call per
+loop iteration (9.0 M of them), each one synchronising all of `GuestState` and doing a TLB-checked
+byte load. It is a real workload shape, but it is the *best* case for this change: a guest that
+compares bytes in its inner loop. Do not read 3.4× as a general figure. Correctness of that number
+is separately established: both binaries retire exactly 102 139 313 guest instructions and print
+`acc=9000001 counter=0`, which is what Tier 0 produces.
+
+### 29.9 Still open from §L
 
 Items 1-5 of §L are all resolved (1 justified and pinned, 2 and 5 implemented, 3 retracted as wrong,
 4 implemented), and item 7 (direct linking) is implemented as well — §29.7 — because P5's write
 window made it cheap. §26 rows 1, 2, 3, 4, 5 should be read with §29 in mind; the rest of the table
 stands.
 
-Still open: item 6 (hot-block gating), 8 (cross-block register allocation), 9 (lazy flags), 10
-(shadow stack), 11 (inlining the remaining helper opcodes), 12 (signal delivery), 13 (guest
-threads), 14 (an IR and a real optimiser).
+Item 11 (inline the remaining helper opcodes) is done — §29.8 — with the work chosen by counting
+rather than by the audit's opcode estimate. Still open: item 6 (hot-block gating), 8 (cross-block
+register allocation), 9 (lazy flags), 10 (shadow stack), 12 (signal delivery), 13 (guest threads), 14
+(an IR and a real optimiser).
 
 ---
 

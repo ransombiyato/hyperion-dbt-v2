@@ -121,6 +121,11 @@ struct alignas(64) ExecContext {
     SoftTlb tlb{};                                      // +0x1000 (read @ +0x1000, write @ +0x3000)
     std::uint8_t tlb_pad_[0x1000 - sizeof(uint64_t)]{}; // align jump_table to +0x6000
     DirectJumpEntry jump_table[kDirectJumpSize]{};      // +0x6000
+    // Instructions that fell back to the C++ helper. Diagnostic only, written on
+    // the slow path, so it costs nothing in generated code; it exists so
+    // "this opcode is inlined now" is an assertion a test can make rather than a
+    // claim in a comment.
+    std::uint64_t helper_calls = 0;
 
     void flush_jump_table() noexcept {
         for (auto& e : jump_table) {

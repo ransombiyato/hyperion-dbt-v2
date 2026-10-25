@@ -348,6 +348,81 @@ void emit_flags_logical(a64::Encoder& e, a64::Width w, std::uint8_t mask, a64::R
     }
 }
 
+// Exact CF/PF/AF/ZF/SF/OF for an 8- or 16-bit ALU/CMP/TEST, given the flags a
+// 32-bit ADDS/SUBS (arithmetic) or ANDS (logical) of the same operands produced.
+//
+// AArch64 can only set NZCV at 32 or 64 bits wide, so a 32-bit SUBS of two
+// zero-extended 8/16-bit operands gives the right CF and ZF but the wrong SF and
+// OF: bit 31 is not bit 7, and an 8-bit overflow cannot set 32-bit V. `result`
+// therefore has to be the *truncated* result, and SF/OF/AF/PF are computed from
+// it directly. Everything here uses non-flag-setting instructions except the
+// UBFX after ands/eor (which does not touch NZCV in its non-S form), so the
+// NZCV-consuming stores can be emitted in any order.
+//
+// `result`, `a` and `b` all hold zero-extended w-bit values. Returns nothing:
+// like emit_flags_from_nzcv, flags outside `mask` keep their previous value.
+void emit_flags_wide(a64::Encoder& e, bool is_logical, bool is_sub, std::uint8_t mask,
+                     unsigned bits, a64::Reg result, a64::Reg a, a64::Reg b, a64::Reg t,
+                     a64::Reg t2) {
+    if (is_logical && (mask & (kFbZf | kFbSf)) != 0) {
+        // Logical ops have no flag-setting form here (the encoder has no ANDS);
+        // a compare against zero sets N and Z from the result, exactly as
+        // emit_flags_logical does for the 32/64-bit case. Z is all that is read
+        // back: SF is taken from bit w-1 below, because bit 31 is not bit 7.
+        e.cmp_imm(a64::Width::k32, result, 0);
+    }
+    if (mask & kFbZf) {
+        e.cset(a64::Width::k32, t, a64::Cond::kEq); // Z survives truncation
+        e.strb(t, kState, kZfOffset);
+    }
+    if (mask & kFbCf) {
+        if (is_logical) {
+            e.strb(a64::kXzr, kState, kCfOffset); // logical ops clear CF
+        } else {
+            e.cset(a64::Width::k32, t, is_sub ? a64::Cond::kCc : a64::Cond::kCs);
+            e.strb(t, kState, kCfOffset);
+        }
+    }
+    if (mask & kFbSf) {
+        e.ubfx(a64::Width::k32, t, result, bits - 1, 1); // SF is bit w-1, not bit 31
+        e.strb(t, kState, kSfOffset);
+    }
+    if (mask & kFbOf) {
+        if (is_logical) {
+            e.strb(a64::kXzr, kState, kOfOffset);
+        } else {
+            // OF is the sign bit of (a ^ r) & (a ^ b) for subtraction and of
+            // (a ^ r) & (b ^ r) for addition. At native width AArch64's V flag is
+            // already correct, which is why the 32/64-bit path does not need
+            // this; at 8/16 bits V comes from a 32-bit operation and cannot see
+            // an overflow that does not reach bit 31 (0x00 - 0x80 overflows a
+            // byte, not a word). The test that found this is
+            // translation_cache.eight_and_sixteen_bit_alu_flags_match_interpreter.
+            e.eor(a64::Width::k32, t, a, result);
+            e.eor(a64::Width::k32, t2, is_sub ? a : b, is_sub ? b : result);
+            e.and_(a64::Width::k32, t, t, t2);
+            e.ubfx(a64::Width::k32, t, t, bits - 1, 1);
+            e.strb(t, kState, kOfOffset);
+        }
+    }
+    if (mask & kFbAf) {
+        if (is_logical) {
+            e.strb(a64::kXzr, kState, kAfOffset);
+        } else {
+            // AF = carry out of bit 3 = bit 4 of (a ^ b ^ r); bit 4 is inside the
+            // 8-bit operand, so truncation does not affect it.
+            e.eor(a64::Width::k32, t, a, b);
+            e.eor(a64::Width::k32, t, t, result);
+            e.ubfx(a64::Width::k32, t, t, 4, 1);
+            e.strb(t, kState, kAfOffset);
+        }
+    }
+    if (mask & kFbPf) {
+        emit_parity(e, t, result); // parity of the low byte of the truncated result
+        e.strb(t, kState, kPfOffset);
+    }
+}
+
 // Whether `value` fits the AArch64 ADD/SUB 12-bit immediate form (imm12,
 // optionally shifted left by 12). If so, fills `imm12`/`shift12`.
 bool encode_imm12(std::uint64_t value, std::uint32_t& imm12, bool& shift12) {
@@ -2397,32 +2472,79 @@ BlockTranslation translate_cached_block(const std::uint8_t* code, std::size_t si
                 }
                 return TranslateError::kNone;
             }
-            // Fast 8/16-bit CMP / TEST / ALU when only ZF or no flags live (`cmp byte [p], 0; je`)!
-            if ((in.opcode == Opcode::kCmp || in.opcode == Opcode::kTest) &&
-                (lflags & ~(kFbZf | kFbCf)) == 0) {
-                const a64::Label flbl =
-                    (in.dst.kind == OperandKind::kMemory || in.src.kind == OperandKind::kMemory)
-                        ? make_fault_label(idx)
-                        : a64::Label{0};
-                if (in.dst.kind == OperandKind::kMemory) {
-                    emit_effective_address_jit(e, ra, in.dst.mem, next_rip, kB, kT0);
-                    emit_inline_tlb_read(e, kB, kA, bytes, flbl, read_stubs);
-                    load_any_op(in.src, kB, flbl);
-                } else {
-                    load_any_op(in.src, kB, flbl);
-                    read_gpr_sized_jit(e, ra, in.dst.reg, in.dst.size, in.dst.high_byte, kA);
+            // 8/16-bit CMP / TEST / AND / OR / XOR, inlined with exact six-flag
+            // semantics.
+            //
+            // These used to reach the per-instruction C++ helper whenever more
+            // than ZF/CF was live, and measurement said that is where almost all
+            // helper calls come from: on a real guest (551k retired instructions)
+            // 95% of them were 8-bit `cmp`/`test` with all six flags live, because
+            // a block that ends without a flag-consuming branch leaves every flag
+            // architecturally live. Byte compares are not exotic - a decompressor,
+            // a string routine or any `char` classification is full of them - so
+            // paying a full GuestState-synchronising call for each was expensive.
+            //
+            // The arithmetic is the 32/64-bit case's, with the flags fixed up
+            // afterwards by emit_flags_wide: CF and ZF survive truncation, SF/OF
+            // do not.
+            const bool writes_dst = (in.opcode != Opcode::kCmp && in.opcode != Opcode::kTest);
+            const bool is_logical = (in.opcode == Opcode::kAnd || in.opcode == Opcode::kOr ||
+                                     in.opcode == Opcode::kXor || in.opcode == Opcode::kTest);
+            const bool is_sub = (in.opcode == Opcode::kCmp);
+            // SF/OF/AF/PF all read the truncated result, so it only costs
+            // anything when one of them is live or the result is stored.
+            const bool need_result = writes_dst || (lflags & (kFbSf | kFbOf | kFbAf | kFbPf)) != 0;
+
+            const a64::Label flbl =
+                (in.dst.kind == OperandKind::kMemory || in.src.kind == OperandKind::kMemory)
+                    ? make_fault_label(idx)
+                    : a64::Label{0};
+            if (in.dst.kind == OperandKind::kMemory) {
+                emit_effective_address_jit(e, ra, in.dst.mem, next_rip, kB, kT0);
+                if (writes_dst) {
+                    e.str(a64::Width::k64, kB, a64::kSp, kScratchSlot1);
                 }
-                e.ubfx(a64::Width::k32, kB, kB, 0, static_cast<unsigned>(bits));
-                if (in.opcode == Opcode::kTest) {
-                    e.and_(a64::Width::k32, kR, kA, kB);
-                    emit_flags_logical(e, a64::Width::k32, lflags, kR);
-                } else {
-                    e.subs(a64::Width::k32, kR, kA, kB);
-                    emit_flags_from_nzcv(e, /*is_sub=*/true, lflags, kT2, kR);
-                }
-                return TranslateError::kNone;
+                emit_inline_tlb_read(e, kB, kA, bytes, flbl, read_stubs);
+                load_any_op(in.src, kB, flbl);
+            } else {
+                load_any_op(in.src, kB, flbl);
+                read_gpr_sized_jit(e, ra, in.dst.reg, in.dst.size, in.dst.high_byte, kA);
             }
-            break; // full 6-flag 8/16-bit ALU -> exact Tier B helper below
+            e.ubfx(a64::Width::k32, kB, kB, 0, static_cast<unsigned>(bits));
+            if (is_logical) {
+                switch (in.opcode) {
+                case Opcode::kAnd:
+                case Opcode::kTest:
+                    e.and_(a64::Width::k32, kR, kA, kB);
+                    break;
+                case Opcode::kOr:
+                    e.orr(a64::Width::k32, kR, kA, kB);
+                    break;
+                default:
+                    e.eor(a64::Width::k32, kR, kA, kB);
+                    break;
+                }
+            } else {
+                e.subs(a64::Width::k32, kR, kA, kB);
+            }
+            if (need_result) {
+                if (bits == 8) {
+                    e.ubfx(a64::Width::k32, kR, kR, 0, 8);
+                } else {
+                    e.ubfx(a64::Width::k32, kR, kR, 0, 16);
+                }
+            }
+            emit_flags_wide(e, is_logical, is_sub, lflags, static_cast<unsigned>(bits), kR, kA, kB,
+                            kT1, kT2);
+            if (writes_dst) {
+                if (in.dst.kind == OperandKind::kMemory) {
+                    e.ldr(a64::Width::k64, kB, a64::kSp, kScratchSlot1);
+                    emit_inline_tlb_write(e, kB, kR, bytes, flbl, write_stubs);
+                } else {
+                    write_gpr_sized_jit(e, ra, in.dst.reg, in.dst.size, in.dst.high_byte, kR, kT0);
+                }
+            }
+            return TranslateError::kNone;
         }
 
         case Opcode::kNot: {

@@ -75,6 +75,8 @@ public:
     // Exits repointed straight at their successor's entry, removing the hash
     // probe from that transition (audit §26 row 5).
     std::size_t linked_exits() const { return linked_exits_; }
+    // Guest instructions executed through the C++ helper instead of inlined code.
+    std::uint64_t helper_calls() const;
 
     void invalidate_all();
 

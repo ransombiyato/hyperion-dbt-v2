@@ -171,6 +171,10 @@ void print_tier1_stats(const hyperion::TranslationCache& cache) {
                 "%zu exit(s) linked directly\n",
                 static_cast<unsigned long long>(cache.protection_changes()), blocks,
                 cache.prefetched_blocks(), cache.linked_exits());
+    // Instructions the inlined codegen could not cover, i.e. how much of the run
+    // still crosses into C++ per instruction.
+    std::printf("tier 1: %llu instruction(s) executed through the helper\n",
+                static_cast<unsigned long long>(cache.helper_calls()));
     if (blocks != 0) {
         const std::uint64_t ns = cache.translation_ns();
         std::printf("tier 1: translation %.3f ms wall (%.1f ns per translated guest "
