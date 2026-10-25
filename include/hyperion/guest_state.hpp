@@ -103,6 +103,31 @@ struct GuestState {
     std::uint16_t fpu_sw = 0;
     std::uint8_t fpu_top = 0;
     bool df = false; // RFLAGS.DF direction flag (0 = forward, 1 = backward)
+
+    // --- Pending PF/AF descriptor (P9 stage 1; not architectural state) ------
+    //
+    // PF and AF are the only two flags that are expensive to materialise (PF is a
+    // byte-wide parity fold) and that almost nothing reads: in a whole-program
+    // profile of the benchmark guests, PF/AF are producers' most expensive flags
+    // yet are *read* about seventy times less often than ZF. Generated AArch64
+    // code therefore records these two bytes instead of computing the flags, and
+    // materialises them at the few forced points (the JIT-to-C++ exit epilogue,
+    // before a helper re-enters the interpreter, and before a consumer such as
+    // JP/JNP reads PF). See docs/translator-audit.md §29.11.
+    //
+    // Both flags are derivable from the same two bytes of the *last* flag-writing
+    // instruction, for add and subtract alike:
+    //   PF = parity(result & 0xFF)
+    //   AF = ((a ^ b ^ result) >> 4) & 1   (the carry/borrow into bit 4; for
+    //                                       logical ops AF is defined to be 0)
+    // `pf_af_pending` says which of the two cached bytes are still authoritative:
+    // when a bit is clear, the corresponding field of `flags` is definitive and
+    // these bytes are stale. Nothing outside src/core/translator.cpp should read
+    // them; interpreter code must call flush_pending_flags() first.
+    std::uint8_t pf_af_pending = 0;
+    std::uint8_t pf_af_res_low = 0; // result & 0xFF
+    std::uint8_t pf_af_xor_low = 0; // (a ^ b ^ result) & 0xFF; bit 4 is AF
+
     double fpu_st[8] = {};
     XmmReg xmm[kXmmCount] = {};
 
@@ -111,6 +136,31 @@ struct GuestState {
 };
 
 std::string to_string(const GuestState& state);
+
+// --- Pending PF/AF descriptor ----------------------------------------------
+//
+// `GuestState::pf_af_pending` bits: a set bit means "the corresponding field of
+// `flags` has not been recomputed yet, use the cached bytes". The bit positions
+// deliberately match the translator's internal flag-bit mask (bit 1 = PF, bit 2
+// = AF), so generated code can use one value both to select the flags it writes
+// and to record which ones are pending.
+inline constexpr std::uint8_t kPfAfPendingPf = 1u << 1;
+inline constexpr std::uint8_t kPfAfPendingAf = 1u << 2;
+inline constexpr std::uint8_t kPfAfPendingBoth =
+    static_cast<std::uint8_t>(kPfAfPendingPf | kPfAfPendingAf);
+
+// Materialise any pending PF/AF into `state.flags` and clear the pending bits.
+// Cheap and idempotent when nothing is pending; returns true if it did work.
+// This is the C++ mirror of the generated-code epilogue in src/core/translator.cpp
+// and must run before anything on the C++ side observes `state.flags`.
+bool flush_pending_flags(GuestState& state);
+
+// The descriptor lives in what used to be alignment padding, so adding it must
+// not move any field that generated code hard-codes an offset for.
+static_assert(offsetof(GuestState, fpu_st) == offsetof(GuestState, df) + 7,
+              "pending PF/AF descriptor must fit the existing padding after `df`");
+static_assert(offsetof(GuestState, pf_af_pending) == offsetof(GuestState, df) + 1,
+              "pending PF/AF descriptor must start immediately after `df`");
 
 const char* to_string(Gpr r);
 

@@ -175,6 +175,13 @@ void print_tier1_stats(const hyperion::TranslationCache& cache) {
     // still crosses into C++ per instruction.
     std::printf("tier 1: %llu instruction(s) executed through the helper\n",
                 static_cast<unsigned long long>(cache.helper_calls()));
+    // P9 stage 1: PF/AF are recorded as a pending descriptor instead of being
+    // materialised at every producer, and only materialised when something can
+    // observe them.
+    std::printf("tier 1: %llu pending PF/AF descriptor(s) recorded, %llu flush(es) at the "
+                "helper boundary\n",
+                static_cast<unsigned long long>(cache.pf_af_deferred()),
+                static_cast<unsigned long long>(cache.pf_af_flushes()));
     if (blocks != 0) {
         const std::uint64_t ns = cache.translation_ns();
         std::printf("tier 1: translation %.3f ms wall (%.1f ns per translated guest "

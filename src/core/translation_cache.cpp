@@ -57,6 +57,14 @@ struct TranslateTimer {
 
 bool jit_exec_complex(ExecContext* ctx, GuestState* state, const Instruction* insn) noexcept {
     ++ctx->helper_calls;
+    // Force point 2 of 3 (see docs/translator-audit.md §29.11): the helper runs
+    // the reference interpreter, which reads `state.flags` directly, so any
+    // pending PF/AF descriptor has to be materialised before it can be observed.
+    // The exit epilogue has already flushed on the way out of the block, so this
+    // only fires for a descriptor recorded earlier in the *same* block.
+    if (flush_pending_flags(*state)) {
+        ++ctx->pf_af_flushes;
+    }
     return execute_cached_helper(*insn, *state, *ctx->memory, &ctx->tlb);
 }
 
@@ -196,6 +204,7 @@ const CachedBlock* TranslationCache::translate_one(Memory& memory, std::uint64_t
     block->target = translated.target;
     block->guest_instruction_count = translated.guest_instruction_count;
     block->code_bytes = translated.code.size();
+    block->pf_af_deferred = translated.pf_af_deferred;
 
     const CachedBlock* raw = block.get();
     window_blocks_.push_back(const_cast<CachedBlock*>(raw));
@@ -207,6 +216,18 @@ const CachedBlock* TranslationCache::translate_one(Memory& memory, std::uint64_t
 
 std::uint64_t TranslationCache::helper_calls() const {
     return ctx_ != nullptr ? ctx_->helper_calls : 0;
+}
+
+std::uint64_t TranslationCache::pf_af_flushes() const {
+    return ctx_ != nullptr ? ctx_->pf_af_flushes : 0;
+}
+
+std::uint64_t TranslationCache::pf_af_deferred() const {
+    std::uint64_t total = 0;
+    for (const auto& entry : blocks_) {
+        total += entry.second->pf_af_deferred;
+    }
+    return total;
 }
 
 std::size_t TranslationCache::total_code_bytes() const {

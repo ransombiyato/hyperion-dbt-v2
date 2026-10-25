@@ -33,6 +33,9 @@ struct CachedBlock {
     std::vector<ExitLink> exit_links;
     std::size_t guest_instruction_count = 0;
     std::size_t code_bytes = 0;
+    // PF/AF results recorded as a pending descriptor instead of materialised in
+    // generated code (P9 stage 1).
+    std::uint32_t pf_af_deferred = 0;
 };
 
 class TranslationCache {
@@ -77,6 +80,13 @@ public:
     std::size_t linked_exits() const { return linked_exits_; }
     // Guest instructions executed through the C++ helper instead of inlined code.
     std::uint64_t helper_calls() const;
+    // PF/AF results recorded as pending descriptors rather than materialised
+    // (P9 stage 1), summed over every translated block.
+    std::uint64_t pf_af_deferred() const;
+    // Times a live pending descriptor had to be materialised because a helper was
+    // about to read the flags (P9 stage 1). Materialisations done by generated
+    // code (exit epilogue, PF/AF consumers) are not counted here.
+    std::uint64_t pf_af_flushes() const;
 
     void invalidate_all();
 

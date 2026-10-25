@@ -66,6 +66,22 @@ Flags unpack_flags(std::uint64_t rflags) {
     return flags;
 }
 
+bool flush_pending_flags(GuestState& state) {
+    const std::uint8_t pending = state.pf_af_pending;
+    if (pending == 0) {
+        return false;
+    }
+    if ((pending & kPfAfPendingPf) != 0) {
+        // x86 PF is set when the low byte has an even number of set bits.
+        state.flags.pf = __builtin_parity(static_cast<unsigned>(state.pf_af_res_low)) == 0;
+    }
+    if ((pending & kPfAfPendingAf) != 0) {
+        state.flags.af = ((state.pf_af_xor_low >> 4) & 1u) != 0;
+    }
+    state.pf_af_pending = static_cast<std::uint8_t>(pending & ~kPfAfPendingBoth);
+    return true;
+}
+
 std::string to_string(const GuestState& state) {
     std::string out;
     char line[64];

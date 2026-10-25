@@ -993,7 +993,7 @@ In rough order of value/effort:
 | 6 | Hot-block gating (interpret → promote) | Medium | Makes Tier 1 a win on short programs; §11 |
 | 7 | Direct linking of block exits | Medium | ~20 → ~1 instructions per transition | **Done, §29.7** — piggybacks on P5's write window; 19 % on a branch-heavy guest under qemu, no regression on the self-loop workload. |
 | 8 | Cross-block register allocation with spilling | Medium-High | Biggest codegen win; needs liveness over the CFG |
-| 9 | Lazy flags (keep `NZCV`, materialise on demand) | Medium | Removes 6 byte-stores per ALU op |
+| 9 | Lazy flags (keep `NZCV`, materialise on demand) | Medium | Removes 6 byte-stores per ALU op | **Stage 1 done, §29.11** (PF/AF only): descriptor + three forced points, code size −2.6 %, PF/AF materialisations 30.0 M → 575 on a branch-heavy guest, runtime unchanged. CF/ZF/SF/OF stay eager (stage 2, still open). |
 | 10 | Shadow stack for `call`/`ret` | Medium | 16 instructions per call/return |
 | 11 | Inline the remaining integer helper opcodes | Low | 15% of opcodes currently pay a C++ call | **Done, §29.8.** Measurement said the 15 % was really 8/16-bit six-flag ALU: 9 012 090 → 257 helper calls (−71 % wall time on a byte-comparing guest, no change on two others), code size −4.5 %. |
 | 12 | Signal delivery infrastructure | High | Unlocks real programs; needs `rip` at every instruction |
@@ -1430,6 +1430,159 @@ profile above says they are read on 1-2 % of producers, so the ceiling is the ~3
 per event that CF/ZF/SF/OF cost. This is the version that would need the invalidation
 protocol above in full.
 
+### 29.11 P9 stage 1 done — PF/AF deferral behind a 3-byte descriptor
+
+§29.10 measured P9 and concluded that a full six-flag descriptor is architectural. The
+following is the cheapest version that is *not*: defer exactly the two flags that are
+expensive to produce and almost never read, and keep the other four eager. Per the
+stage plan in §29.10 this is stage 1 only — no `cc_op`/`cc_src`/`cc_dst`, no P8, no P14.
+
+#### The descriptor
+
+`GuestState` gains three bytes in what used to be alignment padding after `df`, so no
+existing layout offset moves:
+
+```c++
+std::uint8_t pf_af_pending = 0;  // bit 1 = PF stale, bit 2 = AF stale
+std::uint8_t pf_af_res_low = 0;  // result & 0xFF
+std::uint8_t pf_af_xor_low = 0;  // (a ^ b ^ result) & 0xFF; bit 4 is AF
+```
+
+Both flags come out of those two bytes for addition *and* subtraction, because bit 4 of
+`a ^ b ^ r` is exactly the carry/borrow into bit 4 — the same identity the eager code
+already used for AF. Logical ops store a zero xor byte (x86 clears AF there). The
+pending bits deliberately use the same numbering as the translator's flag mask
+(`kFbPf` = bit 1, `kFbAf` = bit 2), so one value both selects what to write and records
+what is stale. A producer emits **4 instructions** (two `strb`, `movz`, `strb`) instead
+of the ~9 that PF+AF cost (5-instruction parity fold + 3 for AF + stores).
+
+#### Forced materialisation — audited, not assumed
+
+Every site that can read or write `GuestState::flags` was enumerated before writing code:
+
+| writer | where | treatment |
+| --- | --- | --- |
+| inline ALU (`emit_one` 32/64-bit, imm-folded, INC/DEC) | `translator.cpp` fast path | descriptor (`emit_pf_af_store`) |
+| inline ALU (block-level 32/64-bit, NEG/INC/DEC) | `kAdd..kTest`, `kNeg..kDec` | descriptor |
+| inline 8/16-bit ALU (P11) | `emit_flags_wide` caller | descriptor; bit 4 and the result low byte are width-independent |
+| self-loop / fast-loop exit flags | 2 specialisation paths | descriptor |
+| helper (`execute_cached_helper` → interpreter) | C++ | writes `flags` directly; pending is flushed on entry |
+| `emit_flags_from_nzcv` / `emit_flags_logical` / `emit_flags_wide` | shared | PF/AF removed from all three; only CF/ZF/SF/OF are emitted eagerly |
+
+| reader | where | how it is forced |
+| --- | --- | --- |
+| `JP`/`JNP` branch | `emit_cond_branch` | `emit_pf_af_guard` before the `ldrb` of PF |
+| `SETP`/`SETNP` | `emit_eval_cond_to_reg` | `emit_pf_af_guard` |
+| interpreter / syscalls / tests / fork / trace | C++ after `cache.run()` | shared exit epilogue flush (`build_jit_trampolines`) and `emit_return` for the direct-`ret` path |
+| any helper re-entering the interpreter | `jit_exec_complex` | `flush_pending_flags()` before the call |
+| `LAHF`/`SAHF`/`PUSHF`/`POPF` | — | not implemented by this front end, so there is no such consumer (`grep` for `kLahf`/`kPushf`/`kSahf` is empty) |
+
+The forced points are therefore three, not five: **exit epilogue**, **helper boundary**,
+**PF/AF consumer**. Two properties make them sufficient:
+
+* The dispatcher's jump-table hit path (`br xT3`) stays inside generated code and does
+  *not* flush, so a linked transition carries the descriptor forward — that is where the
+  saving comes from.
+* Every path that leaves generated code for C++ (block return, halt, syscall, fault,
+  budget exhaustion, dispatcher miss) reaches the same exit-epilogue trampoline, so the
+  "never let C++ see a stale flag" rule is one site. A test asserts
+  `pf_af_pending == 0` after every run, so a future path that bypasses it fails loudly.
+
+AF is *not* representable on its own: PF and AF are always written as a pair by every
+instruction this front end models, so `live_flags & (kFbPf|kFbAf)` is all-or-nothing.
+`emit_pf_af_store` handles the impossible partial case by materialising immediately
+rather than leaving half a descriptor live, and `flush_pending_flags` (the C++ mirror)
+clears only the bits it materialised. Nothing here weakens a test: the descriptor is
+never allowed to be the answer, it is only allowed to be *late*.
+
+#### Measurements
+
+Both guests are the same unmodified binaries used in §29.7/§29.8, run under
+`qemu-aarch64-static` on the x86-64 host with `env -i` (`env` matters: a different
+environment changes the guest's own libc start-up, which shifts every count — that is
+why an earlier A/B of this change looked like a 100-block difference). Baseline is
+`0d2a00d` built with the same compiler, flags and CMake options. Five interleaved runs
+each.
+
+| workload | metric | before | after |
+| --- | --- | --- | --- |
+| `/tmp/vm_guest_x64` (branch-heavy bytecode interpreter, 102 134 745 retired) | generated code | 604 696 B | **589 196 B** (−2.6 %) |
+| | PF/AF descriptor stores executed | — | 30 025 889 |
+| | PF/AF **materialisations** executed (exit epilogue 465 + helper boundary 110) | ≳ 30.0 M parity folds | **575** |
+| | helper calls | 214 | 214 |
+| | wall clock, 2 rounds of 5 (median) | 1 026 / 1 096 ms | 1 060 / 1 054 ms |
+| | guest output / retired instructions | `acc=9000001 counter=0` / 102 134 745 | identical |
+| `/tmp/guest_probe_x64` (mixed C workload, 546 821 retired) | generated code | 649 428 B | **632 452 B** (−2.6 %) |
+| | descriptor stores executed | — | 75 407 |
+| | PF/AF materialisations executed | ≳ 75 k | **652** (526 + 126) |
+| | helper calls | 252 | 252 |
+| | wall clock, 2 rounds of 5 (median) | 226 / 236 ms | 249 / 269 ms |
+| `hyperion_tier_bench` (self-loop, tier 1) | ns per guest instruction (3 runs) | 1.881 / 1.789 / 1.714 | 1.965 / 1.643 / 1.730 |
+
+Reading these honestly:
+
+* **The win is code size and work removed, not wall clock.** −2.6 % of generated code,
+  and the number of executed PF/AF materialisations collapses by ~4-5 orders of
+  magnitude (30.0 M → 575), because the parity fold now runs only when something can
+  observe PF/AF instead of at every producer execution.
+* **No throughput claim.** Wall clock moved in *both* directions across two rounds of
+  five interleaved runs (+3 % and −4 % on `vm_guest`, +10 % and +14 % on
+  `guest_probe`), while single runs of one unchanged binary span 208-370 ms. The
+  difference is inside the noise, and `hyperion_tier_bench` (1.789 → 1.730 ns per guest
+  instruction, medians of three) did not regress. Under qemu-user the host's own
+  translation dominates, so instructions removed from generated code are close to
+  invisible; this is a size-and-work result until it is measured on real AArch64
+  hardware.
+* The 4-instruction descriptor store is *cheaper* than the 9 it replaces for a producer
+  whose PF/AF is never read, and the extra 3 instructions in the exit epilogue only run
+  when a descriptor is actually pending.
+
+#### Tests
+
+Ten differential tests (`tests/unit/test_translation_cache.cpp`, `pending_pf_af_*`,
+`pf_consumer_*`, `setp_and_setnp_*`, `helper_boundary_*`, `partial_flag_update_*`) run
+each program through tier 0 and tier 1 and require the *entire* architectural result —
+all 16 GPRs, `rip`, step count and all six flags — to agree, then assert
+`pf_af_pending == 0` and that the case really did defer something. Coverage per forcing
+path:
+
+| forcing path | test | what fails without the forcing |
+| --- | --- | --- |
+| exit epilogue, AF=1 | `pending_pf_af_is_materialised_at_the_exit_epilogue` | incoming PF/AF are the opposite of the result, so a skipped flush gives the wrong bits |
+| exit epilogue, AF=0 | `pending_pf_af_af_zero_case_reaches_the_exit_epilogue` | AF must be *cleared*, not left set |
+| consumer in the same block | `pf_consumer_forces_materialisation_inside_a_block` (taken and not-taken) | JP takes the wrong side, `rcx` differs |
+| `SETP`/`SETNP` | `setp_and_setnp_force_materialisation` | `al`/`bl` hold the stale PF |
+| helper between producer and consumer | `helper_boundary_forces_materialisation_of_pf_and_af` | PF/AF after `div` come out stale |
+| helper *writes* PF | `helper_writing_pf_cannot_resurrect_a_stale_descriptor` | the exit flush overwrites the helper's PF with the producer's |
+| partial update (INC keeps CF) | `partial_flag_update_keeps_cf_and_defers_pf_af` | CF corrupted, or the descriptor clobbers a flag INC does not write |
+| self-loop + link | `pending_pf_af_survives_a_self_loop_and_a_link` | descriptor lost across the fast-loop back edge |
+| direct-linked exit | `pending_pf_af_crosses_a_directly_linked_exit` | descriptor lost across a linked transition |
+| consumer in the successor block | `pf_consumer_in_the_successor_block_forces_materialisation` | PF read before it is materialised after a block transition |
+
+Each test was verified to be able to fail, by mutating the implementation and rebuilding:
+
+| mutation | outcome |
+| --- | --- |
+| remove the `jit_exec_complex` flush | `helper_writing_pf_*` fails on PF (1 vs 0), `helper_boundary_*` fails on the flush counter |
+| remove the exit-epilogue and `emit_return` flush | 3 tests fail, incl. `pf_af_pending == 6` observed by C++ |
+| remove both consumer guards | 4 tests fail (JP direction, `setp`, self-loop, successor block) |
+| (accidentally, during development) `tbz` on the wrong pending bit | 5 tests fail — the guards became inert |
+
+#### Verification
+
+* native (x86-64): 341 passed / 0 failed / 38 skipped of 379; `ctest` 19/19
+* AArch64 under `qemu-aarch64-static`: 379 passed / 0 failed / 5 skipped of 384
+* `clang-format-19` clean on every changed file
+* strict W^X, P5 successor prefetch and P7 direct linking untouched; the descriptor lives
+  in plain `GuestState` memory, so no new executable mapping, and no new helper call.
+
+Platform limit, stated rather than implied: the JIT is AArch64 and was executed under
+`qemu-user` on an x86-64 host. That validates semantics, counts and code size; it does
+not measure AArch64 pipeline behaviour, where removing 5 instructions per producer is
+expected to matter more than it does here.
+
+Not done, deliberately: CF/ZF/SF/OF stay eager (§29.10 stage 2), no IR, no P8, no P14.
+
 ### 29.9 Still open from §L
 
 Items 1-5 of §L are all resolved (1 justified and pinned, 2 and 5 implemented, 3 retracted as wrong,
@@ -1438,11 +1591,11 @@ window made it cheap. §26 rows 1, 2, 3, 4, 5 should be read with §29 in mind; 
 stands.
 
 Item 11 (inline the remaining helper opcodes) is done — §29.8 — with the work chosen by counting
-rather than by the audit's opcode estimate. Item 9 (lazy flags) was profiled and turned out to be an
-architectural change rather than a local one; §29.10 records the measurements and a three-stage
-design, with no code written. Still open: item 6 (hot-block gating), 8 (cross-block register
-allocation), 9 (lazy flags, staged), 10 (shadow stack), 12 (signal delivery), 13 (guest threads), 14
-(an IR and a real optimiser).
+rather than by the audit's opcode estimate. Item 9 (lazy flags) was profiled in §29.10, which
+concluded that a full six-flag descriptor is architectural; **stage 1 of that design (PF/AF only) is
+implemented and measured in §29.11**. Still open: item 6 (hot-block gating), 8 (cross-block register
+allocation), 9 stage 2 (CF/ZF/SF/OF via `cc_op`/`cc_src`/`cc_dst`), 10 (shadow stack), 12 (signal
+delivery), 13 (guest threads), 14 (an IR and a real optimiser).
 
 ---
 

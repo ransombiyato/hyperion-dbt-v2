@@ -80,6 +80,10 @@ constexpr unsigned kAfOffset = offsetof(GuestState, flags) + offsetof(Flags, af)
 constexpr unsigned kZfOffset = offsetof(GuestState, flags) + offsetof(Flags, zf);
 constexpr unsigned kSfOffset = offsetof(GuestState, flags) + offsetof(Flags, sf);
 constexpr unsigned kOfOffset = offsetof(GuestState, flags) + offsetof(Flags, of);
+// P9 stage 1 pending PF/AF descriptor (see the flag section below).
+constexpr unsigned kPfAfPendingOffset = offsetof(GuestState, pf_af_pending);
+constexpr unsigned kPfAfResLowOffset = offsetof(GuestState, pf_af_res_low);
+constexpr unsigned kPfAfXorLowOffset = offsetof(GuestState, pf_af_xor_low);
 
 static_assert(std::is_trivially_copyable_v<GuestState>,
               "generated code relies on GuestState being a plain memory image");
@@ -303,18 +307,12 @@ void emit_flags_from_nzcv(a64::Encoder& e, bool is_sub, std::uint8_t mask, a64::
         e.cset(a64::Width::k32, kT1, a64::Cond::kVs); // OF = V
         e.strb(kT1, kState, kOfOffset);
     }
-    if (mask & kFbAf) {
-        // AF: carry out of bit 3. For both ADD and SUB, AF == bit 4 of
-        // (a ^ b ^ r).
-        e.ubfx(a64::Width::k32, kT1, t2, 4, 1);
-        e.strb(kT1, kState, kAfOffset);
-    }
-    if (mask & kFbPf) {
-        // Parity is computed last: it clobbers the condition flags, which the
-        // csets above need.
-        emit_parity(e, kT1, result);
-        e.strb(kT1, kState, kPfOffset);
-    }
+    // PF and AF are *not* materialised here any more: the caller records the
+    // pending descriptor with emit_pf_af_store() instead (P9 stage 1). `t2`,
+    // which used to carry (a ^ b ^ r) for AF, is now only needed by the caller
+    // for that store, and `result` is unused.
+    (void)t2;
+    (void)result;
 }
 
 // Logical ops (AND/OR/XOR) clear CF, OF and AF, and set SF/ZF/PF from the
@@ -331,21 +329,14 @@ void emit_flags_logical(a64::Encoder& e, a64::Width w, std::uint8_t mask, a64::R
         e.cset(a64::Width::k32, kT1, a64::Cond::kMi);
         e.strb(kT1, kState, kSfOffset);
     }
-    if (mask & (kFbCf | kFbOf | kFbAf)) {
-        if (mask & kFbCf) {
-            e.strb(a64::kXzr, kState, kCfOffset);
-        }
-        if (mask & kFbOf) {
-            e.strb(a64::kXzr, kState, kOfOffset);
-        }
-        if (mask & kFbAf) {
-            e.strb(a64::kXzr, kState, kAfOffset);
-        }
+    if (mask & kFbCf) {
+        e.strb(a64::kXzr, kState, kCfOffset);
     }
-    if (mask & kFbPf) {
-        emit_parity(e, kT1, result);
-        e.strb(kT1, kState, kPfOffset);
+    if (mask & kFbOf) {
+        e.strb(a64::kXzr, kState, kOfOffset);
     }
+    // PF/AF are deferred; the caller stores the descriptor (AF is statically
+    // cleared there by passing a zero xor byte to emit_pf_af_store()).
 }
 
 // Exact CF/PF/AF/ZF/SF/OF for an 8- or 16-bit ALU/CMP/TEST, given the flags a
@@ -405,22 +396,145 @@ void emit_flags_wide(a64::Encoder& e, bool is_logical, bool is_sub, std::uint8_t
             e.strb(t, kState, kOfOffset);
         }
     }
-    if (mask & kFbAf) {
-        if (is_logical) {
-            e.strb(a64::kXzr, kState, kAfOffset);
-        } else {
-            // AF = carry out of bit 3 = bit 4 of (a ^ b ^ r); bit 4 is inside the
-            // 8-bit operand, so truncation does not affect it.
-            e.eor(a64::Width::k32, t, a, b);
-            e.eor(a64::Width::k32, t, t, result);
-            e.ubfx(a64::Width::k32, t, t, 4, 1);
-            e.strb(t, kState, kAfOffset);
-        }
+    // PF and AF are deferred to the pending descriptor (P9 stage 1): bit 4 of
+    // (a ^ b ^ r) and the low byte of the result are width-independent, so the
+    // 8/16-bit caller records them with emit_pf_af_store() exactly like the
+    // 32/64-bit paths do.
+}
+
+// --- Pending PF/AF descriptor (P9 stage 1) ----------------------------------
+//
+// PF and AF are the two flags with a poor cost/benefit ratio: PF costs a
+// five-instruction parity fold, AF three more instructions to derive from
+// (a ^ b ^ result), and between them they are read about seventy times less
+// often than ZF across the benchmark guests (docs/translator-audit.md §29.10).
+// Materialising them eagerly at every producer is therefore almost always work
+// whose result is either overwritten or never read.
+//
+// Instead, a producer stores the two bytes both flags are derivable from:
+//
+//   pf_af_res_low  = result & 0xFF
+//   pf_af_xor_low  = (a ^ b ^ result) & 0xFF   -- bit 4 is AF for add *and* sub,
+//                                                 because bit 4 of (a ^ b ^ r) is
+//                                                 exactly the carry/borrow into
+//                                                 bit 4. Logical ops store 0, as
+//                                                 x86 clears AF there.
+//
+// and sets `pf_af_pending`. Flags are then materialised only at the points that
+// can actually observe them:
+//
+//   1. the shared JIT-to-C++ exit epilogue (`build_jit_trampolines`), which every
+//      block exit, budget exhaustion, dispatcher miss and fault path funnels
+//      through, so C++ (interpreter, syscalls, tests) never sees a stale flag;
+//   2. `jit_exec_complex`, before a helper re-enters the interpreter (C++ side);
+//   3. `emit_pf_af_guard`, emitted in front of every PF/AF *consumer* in
+//      generated code (JP/JNP, SETP/SETNP).
+//
+// CF/ZF/SF/OF are deliberately untouched: they are read constantly, so their
+// materialisation must stay eager (§29.10 stage 2 is the full descriptor).
+//
+// Cost per producer: 4 instructions (2 stores, a movz, a store) instead of the
+// ~9 that PF+AF used to take. PF/AF are always written as a pair by every
+// instruction in this front end, so a mask naming only one of them cannot occur;
+// `emit_pf_af_store` handles it anyway by materialising immediately.
+constexpr std::uint8_t kFbPfAf = static_cast<std::uint8_t>(kFbPf | kFbAf);
+
+// Where PF and AF live in the pending byte. These are the bit *indices* of the
+// two mask bits above, which is what `strb`/`tbz` need: the descriptor uses the
+// same numbering as the flag mask so a mask can be stored as a pending mask.
+constexpr unsigned kPfAfPendingBitPf = 1;
+constexpr unsigned kPfAfPendingBitAf = 2;
+
+// Diagnostics: how many descriptors the block currently being translated
+// records. A cache is per-thread and never translates two blocks at once, so a
+// thread_local counter is enough; the scope guard below publishes it, which is
+// what lets a test assert that PF/AF really are being deferred.
+thread_local std::uint32_t tl_pf_af_deferred = 0;
+
+struct PfAfDeferScope {
+    BlockTranslation& out;
+    std::uint32_t outer;
+    explicit PfAfDeferScope(BlockTranslation& target) : out(target), outer(tl_pf_af_deferred) {
+        tl_pf_af_deferred = 0;
     }
-    if (mask & kFbPf) {
-        emit_parity(e, t, result); // parity of the low byte of the truncated result
-        e.strb(t, kState, kPfOffset);
+    ~PfAfDeferScope() {
+        out.pf_af_deferred = tl_pf_af_deferred;
+        tl_pf_af_deferred = outer;
     }
+    PfAfDeferScope(const PfAfDeferScope&) = delete;
+    PfAfDeferScope& operator=(const PfAfDeferScope&) = delete;
+};
+
+// Materialise the pending flags in `bits` from the descriptor and clear those
+// pending bits. Preserves NZCV (only ldrb/strb/eor/mvn/ubfx/and_/movz), so it is
+// safe before a `cset` sequence or a fused compare. Clobbers kT2/kT3.
+void emit_pf_af_materialise(a64::Encoder& e, std::uint8_t bits, a64::Reg base = kState) {
+    if ((bits & kFbPf) != 0) {
+        e.ldrb(kT2, base, kPfAfResLowOffset);
+        emit_parity(e, kT2, kT2);
+        e.strb(kT2, base, kPfOffset);
+    }
+    if ((bits & kFbAf) != 0) {
+        e.ldrb(kT2, base, kPfAfXorLowOffset);
+        e.ubfx(a64::Width::k32, kT2, kT2, 4, 1);
+        e.strb(kT2, base, kAfOffset);
+    }
+    if (bits == kFbPfAf) {
+        e.strb(a64::kXzr, base, kPfAfPendingOffset);
+    } else {
+        // Partial clear: pending &= ~bits. Cannot happen for the instructions
+        // this front end models (PF and AF are always written together), but
+        // keeping it exact means a half-live descriptor can never be exposed.
+        e.ldrb(kT2, base, kPfAfPendingOffset);
+        e.movz(a64::Width::k32, kT3, static_cast<std::uint16_t>(bits));
+        e.mvn(a64::Width::k32, kT3, kT3);
+        e.and_(a64::Width::k32, kT2, kT2, kT3);
+        e.strb(kT2, base, kPfAfPendingOffset);
+    }
+}
+
+// Record the pending PF/AF descriptor for the flags in `mask` instead of
+// computing them. `result` holds the result (its low byte is enough), and
+// `xor_low_value` holds (a ^ b ^ result) -- or `a64::kXzr` when AF is statically
+// zero, which is the case for logical ops and for immediate forms whose low
+// nibble is zero. Clobbers kT3 (and kT2 in the partial-mask fallback).
+void emit_pf_af_store(a64::Encoder& e, std::uint8_t mask, a64::Reg result, a64::Reg xor_low_value,
+                      a64::Reg base = kState) {
+    const auto bits = static_cast<std::uint8_t>(mask & kFbPfAf);
+    if (bits == 0) {
+        return;
+    }
+    ++tl_pf_af_deferred;
+    e.strb(result, base, kPfAfResLowOffset);
+    e.strb(xor_low_value, base, kPfAfXorLowOffset);
+    e.movz(a64::Width::k32, kT3, static_cast<std::uint16_t>(bits));
+    e.strb(kT3, base, kPfAfPendingOffset);
+    if (bits != kFbPfAf) {
+        emit_pf_af_materialise(e, bits, base); // see the note above: unreachable today
+    }
+}
+
+// Emitted immediately before generated code reads PF/AF. Skips the
+// materialisation entirely when nothing is pending, which is the common case
+// once the flags have been flushed at an exit. Preserves NZCV.
+void emit_pf_af_guard(a64::Encoder& e, std::uint8_t bits, a64::Reg base = kState) {
+    bits = static_cast<std::uint8_t>(bits & kFbPfAf);
+    if (bits == 0) {
+        return;
+    }
+    const a64::Label done = e.new_label();
+    e.ldrb(kT2, base, kPfAfPendingOffset);
+    if (bits == kFbPf) {
+        e.tbz(kT2, kPfAfPendingBitPf, done);
+    } else if (bits == kFbAf) {
+        e.tbz(kT2, kPfAfPendingBitAf, done);
+    } else {
+        e.movz(a64::Width::k32, kT3, static_cast<std::uint16_t>(bits));
+        e.and_(a64::Width::k32, kT2, kT2, kT3);
+        e.cbz(a64::Width::k32, kT2, done);
+    }
+    emit_pf_af_materialise(e, bits, base);
+    e.bind(done);
 }
 
 // Whether `value` fits the AArch64 ADD/SUB 12-bit immediate form (imm12,
@@ -485,6 +599,11 @@ void emit_return(a64::Encoder& e, BlockResult result, const RegAlloc* ra = nullp
             e.ldp_post(ra->allocated[2 * i - 2], ra->allocated[2 * i - 1], 31, 16);
         }
     }
+    // Control is about to leave generated code, so any pending PF/AF descriptor
+    // has to be materialised before C++ (or the test harness) can read
+    // `GuestState::flags`. Same forcing rule as the shared exit epilogue, which
+    // this is the direct-`ret` equivalent of.
+    emit_pf_af_guard(e, kFbPfAf, kState);
     if (set_single_run) {
         e.movz(a64::Width::k64, 1, 1);
     }
@@ -637,6 +756,10 @@ void emit_cond_branch(a64::Encoder& e, Condition c, a64::Label taken) {
         return;
     case Condition::kP:
     case Condition::kNp:
+        // PF is only materialised on demand (P9 stage 1), so a consumer has to
+        // flush the pending descriptor first. The guard is a single load and a
+        // test on the fast path.
+        emit_pf_af_guard(e, kFbPf);
         load(kT0, kPfOffset);
         branch_if(kT0, c == Condition::kP);
         return;
@@ -899,11 +1022,18 @@ TranslateError emit_one(a64::Encoder& e, const Instruction& insn, bool write_rip
             }
             if (mask != 0) {
                 emit_flags_logical(e, w, mask, R);
+                // Logical ops define AF as 0, so a zero xor byte is exact.
+                emit_pf_af_store(e, mask, R, a64::kXzr);
             }
         } else if (imm_folded) {
             const auto imm_nibble = static_cast<std::uint32_t>(imm_value & 0xFULL);
+            const bool pfaf_live = (mask & kFbPfAf) != 0;
+            // AF = bit 4 of (a ^ imm ^ r). When the immediate's low nibble is
+            // zero, no carry can enter bit 4, so AF is identically 0 and the
+            // descriptor's xor byte can be the zero register.
+            const bool af_from_xor = pfaf_live && imm_nibble != 0;
             a64::Reg prev_a = A;
-            if ((mask & kFbAf) != 0 && imm_nibble != 0 && R == A) {
+            if (af_from_xor && R == A) {
                 e.mov_reg(a64::Width::k64, kT2, A);
                 prev_a = kT2;
             }
@@ -912,26 +1042,24 @@ TranslateError emit_one(a64::Encoder& e, const Instruction& insn, bool write_rip
             } else {
                 e.adds_imm(w, R, A, imm12, shift12);
             }
-            if ((mask & kFbAf) != 0) {
-                if (imm_nibble == 0) {
-                    e.strb(a64::kXzr, kState, kAfOffset);
-                } else {
-                    // AF == ((a ^ imm ^ r) >> 4) & 1; EOR/MVN/UBFX preserve NZCV!
-                    e.eor(a64::Width::k64, kT2, prev_a, R);
-                    if ((imm_value & 0x10ULL) != 0) {
-                        e.mvn(a64::Width::k32, kT2, kT2);
-                    }
-                    e.ubfx(a64::Width::k32, kT2, kT2, 4, 1);
-                    e.strb(kT2, kState, kAfOffset);
+            if (af_from_xor) {
+                // xor byte = a ^ r, with bit 4 toggled when bit 4 of the
+                // immediate is set. Complementing the whole word is the cheap
+                // way to do that: only bit 4 of the xor byte is read back.
+                e.eor(a64::Width::k64, kT2, prev_a, R);
+                if ((imm_value & 0x10ULL) != 0) {
+                    e.mvn(a64::Width::k32, kT2, kT2);
                 }
             }
-            const auto non_af_mask = static_cast<std::uint8_t>(mask & ~kFbAf);
-            if (non_af_mask != 0) {
-                emit_flags_from_nzcv(e, is_sub, non_af_mask, kT2, R);
+            const auto eager_mask = static_cast<std::uint8_t>(mask & ~kFbPfAf);
+            if (eager_mask != 0) {
+                emit_flags_from_nzcv(e, is_sub, eager_mask, kT2, R);
             }
+            emit_pf_af_store(e, mask, R, af_from_xor ? kT2 : a64::kXzr);
         } else {
-            if (mask & kFbAf) {
-                // t2 = a ^ b, completed to (a ^ b ^ r) after the op for AF.
+            const bool pfaf_live = (mask & kFbPfAf) != 0;
+            if (pfaf_live) {
+                // t2 = a ^ b, completed to (a ^ b ^ r) after the op: bit 4 is AF.
                 e.eor(a64::Width::k64, kT2, A, B);
             }
             if (is_sub) {
@@ -939,12 +1067,14 @@ TranslateError emit_one(a64::Encoder& e, const Instruction& insn, bool write_rip
             } else {
                 e.adds(w, R, A, B);
             }
-            if (mask != 0) {
-                if (mask & kFbAf) {
-                    e.eor(a64::Width::k64, kT2, kT2, R);
-                }
-                emit_flags_from_nzcv(e, is_sub, mask, kT2, R);
+            if (pfaf_live) {
+                e.eor(a64::Width::k64, kT2, kT2, R);
             }
+            const auto eager_mask = static_cast<std::uint8_t>(mask & ~kFbPfAf);
+            if (eager_mask != 0) {
+                emit_flags_from_nzcv(e, is_sub, eager_mask, kT2, R);
+            }
+            emit_pf_af_store(e, mask, R, kT2);
         }
 
         if (writes_dst && R == kR) {
@@ -974,8 +1104,9 @@ TranslateError emit_one(a64::Encoder& e, const Instruction& insn, bool write_rip
             static_cast<std::uint8_t>(flags_written(insn.opcode) & live_flags);
         const a64::Reg R =
             (ra != nullptr && ra->mapped(insn.dst.reg)) ? ra->host(insn.dst.reg) : kR;
+        const bool pfaf_live = (mask & kFbPfAf) != 0;
         a64::Reg prev_a = A;
-        if ((mask & kFbAf) != 0 && R == A) {
+        if (pfaf_live && R == A) {
             e.mov_reg(a64::Width::k64, kT2, A);
             prev_a = kT2;
         }
@@ -984,12 +1115,14 @@ TranslateError emit_one(a64::Encoder& e, const Instruction& insn, bool write_rip
         } else {
             e.adds_imm(w, R, A, 1);
         }
-        if (mask != 0) {
-            if (mask & kFbAf) {
-                e.eor(a64::Width::k64, kT2, prev_a, R);
-            }
-            emit_flags_from_nzcv(e, is_sub, mask, kT2, R);
+        if (pfaf_live) {
+            e.eor(a64::Width::k64, kT2, prev_a, R); // bit 4 = AF
         }
+        const auto eager_mask = static_cast<std::uint8_t>(mask & ~kFbPfAf);
+        if (eager_mask != 0) {
+            emit_flags_from_nzcv(e, is_sub, eager_mask, kT2, R);
+        }
+        emit_pf_af_store(e, mask, R, kT2);
         if (R == kR) {
             store_gpr_rb(e, ra, kR, insn.dst.reg);
         }
@@ -1437,28 +1570,32 @@ BlockTranslation translate_block(const std::uint8_t* code, std::size_t size,
         e.str(a64::Width::k64, kT0, kState, kRipOffset);
         const std::uint8_t exit_mask = flags_written(cmp_or_alu.opcode);
         const std::uint64_t af_imm = is_inc_dec ? 1ULL : loop_imm_val;
+        const auto loop_eager_mask = static_cast<std::uint8_t>(exit_mask & ~kFbPfAf);
         if (is_logical) {
-            emit_flags_logical(e, w, exit_mask, R);
+            emit_flags_logical(e, w, loop_eager_mask, R);
+            emit_pf_af_store(e, exit_mask, R, a64::kXzr); // logical: AF is 0
         } else if (is_inc_dec || loop_imm_folded) {
-            if ((exit_mask & kFbAf) != 0) {
-                if ((af_imm & 0xFULL) == 0) {
-                    e.strb(a64::kXzr, kState, kAfOffset);
-                } else {
-                    e.eor(a64::Width::k64, kT2, kLoopA, R);
-                    if ((af_imm & 0x10ULL) != 0) {
-                        e.mvn(a64::Width::k32, kT2, kT2);
-                    }
-                    e.ubfx(a64::Width::k32, kT2, kT2, 4, 1);
-                    e.strb(kT2, kState, kAfOffset);
+            const bool af_from_xor = (exit_mask & kFbPfAf) != 0 && (af_imm & 0xFULL) != 0;
+            if (af_from_xor) {
+                e.eor(a64::Width::k64, kT2, kLoopA, R);
+                if ((af_imm & 0x10ULL) != 0) {
+                    e.mvn(a64::Width::k32, kT2, kT2);
                 }
             }
-            emit_flags_from_nzcv(e, is_sub, static_cast<std::uint8_t>(exit_mask & ~kFbAf), kT2, R);
+            if (loop_eager_mask != 0) {
+                emit_flags_from_nzcv(e, is_sub, loop_eager_mask, kT2, R);
+            }
+            emit_pf_af_store(e, exit_mask, R, af_from_xor ? kT2 : a64::kXzr);
         } else {
-            if ((exit_mask & kFbAf) != 0) {
+            const bool pfaf_live = (exit_mask & kFbPfAf) != 0;
+            if (pfaf_live) {
                 e.eor(a64::Width::k64, kT2, kLoopA, kLoopB);
                 e.eor(a64::Width::k64, kT2, kT2, R);
             }
-            emit_flags_from_nzcv(e, is_sub, exit_mask, kT2, R);
+            if (loop_eager_mask != 0) {
+                emit_flags_from_nzcv(e, is_sub, loop_eager_mask, kT2, R);
+            }
+            emit_pf_af_store(e, exit_mask, R, kT2);
         }
         emit_return(e, BlockResult::kOk, &ra, /*set_single_run=*/false);
 
@@ -2027,9 +2164,11 @@ void emit_eval_cond_to_reg(a64::Encoder& e, Condition c, a64::Reg dst) {
         e.ubfx(a64::Width::k32, dst, dst, 0, 1);
         return;
     case Condition::kP:
+        emit_pf_af_guard(e, kFbPf); // see emit_cond_branch: PF may be pending
         e.ldrb(dst, kState, kPfOffset);
         return;
     case Condition::kNp:
+        emit_pf_af_guard(e, kFbPf);
         e.ldrb(dst, kState, kPfOffset);
         e.mvn(a64::Width::k32, dst, dst);
         e.ubfx(a64::Width::k32, dst, dst, 0, 1);
@@ -2166,6 +2305,14 @@ JitTrampolines build_jit_trampolines() {
     // 3. Shared exit epilogue (`ctx->jit_exit_epilogue`): expects `x0` = `BlockResult`.
     {
         a64::Encoder e;
+        // Materialise any pending PF/AF *before* control reaches C++: this is the
+        // one funnel every block exit, budget exhaustion, dispatcher miss and
+        // fault path goes through, so the interpreter, syscall layer and tests can
+        // never observe a stale `GuestState::flags`. Costs two instructions when
+        // nothing is pending. Deliberately not emitted on the dispatcher's
+        // jump-table hit path, which stays inside generated code: a linked block
+        // that does not read PF/AF keeps the descriptor alive.
+        emit_pf_af_guard(e, kFbPfAf, kSavedState);
         e.sub(a64::Width::k64, 1, kInitBudget, kRemBudget); // x1 = retired guest insns
         e.ldp_off(19, 20, a64::kSp, 16);
         e.ldp_off(21, 22, a64::kSp, 32);
@@ -2188,6 +2335,7 @@ constexpr std::size_t kMaxExitLinks = 8;
 BlockTranslation translate_cached_block(const std::uint8_t* code, std::size_t size,
                                         const Instruction& first) {
     BlockTranslation out;
+    const PfAfDeferScope pf_af_scope(out);
     constexpr std::size_t kMaxCachedBlockInsns = 256;
 
     struct Step {
@@ -2444,9 +2592,11 @@ BlockTranslation translate_cached_block(const std::uint8_t* code, std::size_t si
                     }
                     if (lflags != 0) {
                         emit_flags_logical(e, w, lflags, kR);
+                        emit_pf_af_store(e, lflags, kR, a64::kXzr); // AF is 0
                     }
                 } else {
-                    if ((lflags & kFbAf) != 0) {
+                    const bool pfaf_live = (lflags & kFbPfAf) != 0;
+                    if (pfaf_live) {
                         e.eor(a64::Width::k64, kT2, kA, kB);
                     }
                     if (is_sub) {
@@ -2454,12 +2604,14 @@ BlockTranslation translate_cached_block(const std::uint8_t* code, std::size_t si
                     } else {
                         e.adds(w, kR, kA, kB);
                     }
-                    if (lflags != 0) {
-                        if ((lflags & kFbAf) != 0) {
-                            e.eor(a64::Width::k64, kT2, kT2, kR);
-                        }
-                        emit_flags_from_nzcv(e, is_sub, lflags, kT2, kR);
+                    if (pfaf_live) {
+                        e.eor(a64::Width::k64, kT2, kT2, kR); // bit 4 = AF
                     }
+                    const auto eager_mask = static_cast<std::uint8_t>(lflags & ~kFbPfAf);
+                    if (eager_mask != 0) {
+                        emit_flags_from_nzcv(e, is_sub, eager_mask, kT2, kR);
+                    }
+                    emit_pf_af_store(e, lflags, kR, kT2);
                 }
 
                 if (writes_dst) {
@@ -2536,6 +2688,17 @@ BlockTranslation translate_cached_block(const std::uint8_t* code, std::size_t si
             }
             emit_flags_wide(e, is_logical, is_sub, lflags, static_cast<unsigned>(bits), kR, kA, kB,
                             kT1, kT2);
+            if ((lflags & kFbPfAf) != 0) {
+                // Record the pending PF/AF descriptor. Bit 4 of (a ^ b ^ r) lies
+                // inside the 8/16-bit operand, so it survives truncation, and the
+                // parity input is the low byte of the truncated result. Computed
+                // after emit_flags_wide, which uses kT1 as its own scratch.
+                if (!is_logical) {
+                    e.eor(a64::Width::k32, kT1, kA, kB);
+                    e.eor(a64::Width::k32, kT1, kT1, kR);
+                }
+                emit_pf_af_store(e, lflags, kR, is_logical ? a64::kXzr : kT1);
+            }
             if (writes_dst) {
                 if (in.dst.kind == OperandKind::kMemory) {
                     e.ldr(a64::Width::k64, kB, a64::kSp, kScratchSlot1);
@@ -2582,26 +2745,32 @@ BlockTranslation translate_cached_block(const std::uint8_t* code, std::size_t si
                     read_gpr_sized_jit(e, ra, in.dst.reg, in.dst.size, false, kA);
                 }
                 if (in.opcode == Opcode::kNeg) {
+                    const bool pfaf_live = (lflags & kFbPfAf) != 0;
                     e.subs(w, kR, a64::kXzr, kA);
-                    if (lflags != 0) {
-                        if ((lflags & kFbAf) != 0) {
-                            e.eor(a64::Width::k64, kT2, kA, kR);
-                        }
-                        emit_flags_from_nzcv(e, /*is_sub=*/true, lflags, kT2, kR);
+                    if (pfaf_live) {
+                        e.eor(a64::Width::k64, kT2, kA, kR); // 0 ^ a ^ r; bit 4 = AF
                     }
+                    const auto eager_mask = static_cast<std::uint8_t>(lflags & ~kFbPfAf);
+                    if (eager_mask != 0) {
+                        emit_flags_from_nzcv(e, /*is_sub=*/true, eager_mask, kT2, kR);
+                    }
+                    emit_pf_af_store(e, lflags, kR, kT2);
                 } else {
                     const bool is_sub = (in.opcode == Opcode::kDec);
+                    const bool pfaf_live = (lflags & kFbPfAf) != 0;
                     if (is_sub) {
                         e.subs_imm(w, kR, kA, 1);
                     } else {
                         e.adds_imm(w, kR, kA, 1);
                     }
-                    if (lflags != 0) {
-                        if ((lflags & kFbAf) != 0) {
-                            e.eor(a64::Width::k64, kT2, kA, kR);
-                        }
-                        emit_flags_from_nzcv(e, is_sub, lflags, kT2, kR);
+                    if (pfaf_live) {
+                        e.eor(a64::Width::k64, kT2, kA, kR); // a ^ 1 ^ r; bit 4 = AF
                     }
+                    const auto eager_mask = static_cast<std::uint8_t>(lflags & ~kFbPfAf);
+                    if (eager_mask != 0) {
+                        emit_flags_from_nzcv(e, is_sub, eager_mask, kT2, kR);
+                    }
+                    emit_pf_af_store(e, lflags, kR, kT2);
                 }
                 if (in.dst.kind == OperandKind::kMemory) {
                     e.ldr(a64::Width::k64, kB, a64::kSp, kScratchSlot1);
@@ -3314,26 +3483,32 @@ BlockTranslation translate_cached_block(const std::uint8_t* code, std::size_t si
         e.mov_imm64(kA, target); // next PC is fallthrough past Jcc!
 
         e.bind(emit_flags_common);
+        const auto loop_eager_mask = static_cast<std::uint8_t>(exit_mask & ~kFbPfAf);
         if (is_logical) {
-            emit_flags_logical(e, w, exit_mask, R);
+            emit_flags_logical(e, w, loop_eager_mask, R);
+            emit_pf_af_store(e, exit_mask, R, a64::kXzr); // logical: AF is 0
         } else if (folded_imm) {
-            const auto imm_nibble = static_cast<std::uint32_t>(imm_val & 0xFULL);
-            if (imm_nibble == 0) {
-                e.strb(a64::kXzr, kState, kAfOffset);
-            } else {
+            const bool af_from_xor = (exit_mask & kFbPfAf) != 0 && (imm_val & 0xFULL) != 0;
+            if (af_from_xor) {
                 e.eor(a64::Width::k64, kT2, kLoopA, R);
                 if ((imm_val & 0x10ULL) != 0) {
                     e.mvn(a64::Width::k32, kT2, kT2);
                 }
-                e.ubfx(a64::Width::k32, kT2, kT2, 4, 1);
-                e.strb(kT2, kState, kAfOffset);
             }
-            const auto non_af = static_cast<std::uint8_t>(exit_mask & ~kFbAf);
-            emit_flags_from_nzcv(e, is_sub, non_af, kT2, R);
+            if (loop_eager_mask != 0) {
+                emit_flags_from_nzcv(e, is_sub, loop_eager_mask, kT2, R);
+            }
+            emit_pf_af_store(e, exit_mask, R, af_from_xor ? kT2 : a64::kXzr);
         } else {
-            e.eor(a64::Width::k64, kT2, kLoopA, kLoopB);
-            e.eor(a64::Width::k64, kT2, kT2, R);
-            emit_flags_from_nzcv(e, is_sub, exit_mask, kT2, R);
+            const bool pfaf_live = (exit_mask & kFbPfAf) != 0;
+            if (pfaf_live) {
+                e.eor(a64::Width::k64, kT2, kLoopA, kLoopB);
+                e.eor(a64::Width::k64, kT2, kT2, R);
+            }
+            if (loop_eager_mask != 0) {
+                emit_flags_from_nzcv(e, is_sub, loop_eager_mask, kT2, R);
+            }
+            emit_pf_af_store(e, exit_mask, R, kT2);
         }
         spill_ra();
         e.br(kDispatchReg); // chain directly into post-loop block!

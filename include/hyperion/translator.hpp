@@ -83,6 +83,12 @@ struct BlockTranslation {
     // Direct-linkable exit sites, in code order.
     std::vector<ExitLink> exit_links;
 
+    // P9 stage 1: how many PF/AF results this block records as a pending
+    // descriptor instead of materialising. Carried out of the translator so a
+    // test can assert that the deferral is actually happening, rather than
+    // trusting a comment.
+    std::uint32_t pf_af_deferred = 0;
+
     bool ok() const { return error == TranslateError::kNone; }
 };
 
@@ -126,6 +132,9 @@ struct alignas(64) ExecContext {
     // "this opcode is inlined now" is an assertion a test can make rather than a
     // claim in a comment.
     std::uint64_t helper_calls = 0;
+    // Times a live pending PF/AF descriptor had to be materialised at the
+    // JIT-to-C++ helper boundary (P9 stage 1). Diagnostic only.
+    std::uint64_t pf_af_flushes = 0;
 
     void flush_jump_table() noexcept {
         for (auto& e : jump_table) {

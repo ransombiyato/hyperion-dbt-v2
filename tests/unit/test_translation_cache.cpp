@@ -378,6 +378,255 @@ HYPERION_TEST("translation_cache",
     }
 }
 
+// --- P9 stage 1: pending PF/AF descriptor ------------------------------------
+//
+// Generated code no longer computes PF and AF at every producer; it records two
+// bytes from which both are derivable (`GuestState::pf_af_res_low` /
+// `pf_af_xor_low`) and materialises them at the forced points: the JIT-to-C++
+// exit epilogue, a helper re-entering the interpreter, and a PF/AF consumer in
+// generated code (JP/JNP, SETP/SETNP). These tests are differential: every case
+// is run through the interpreter and through the cache and the *whole*
+// architectural result must agree, so a missed forced point shows up as a wrong
+// PF/AF or a wrong branch.
+namespace p9 {
+
+struct Outcome {
+    hyperion::RunResult result;
+    std::uint64_t deferred = 0;
+    std::uint64_t flushes = 0;
+};
+
+Outcome run_cached(const std::vector<std::uint8_t>& program, const GuestState& initial) {
+    FlatMemory mem(kBase, kMemSize);
+    std::memcpy(mem.data(), program.data(), program.size());
+    TranslationCache cache;
+    Outcome out;
+    out.result = cache.run(mem, initial);
+    out.deferred = cache.pf_af_deferred();
+    out.flushes = cache.pf_af_flushes();
+    return out;
+}
+
+hyperion::RunResult run_interp(const std::vector<std::uint8_t>& program,
+                               const GuestState& initial) {
+    FlatMemory mem(kBase, kMemSize);
+    std::memcpy(mem.data(), program.data(), program.size());
+    return hyperion::run_program(mem, initial);
+}
+
+// Compare the entire architectural result of the two tiers. `want_deferred`
+// pins the expectation that this program really does defer PF/AF, so a future
+// change that silently reverts to eager materialisation cannot turn these tests
+// into tautologies.
+void check_matches(const char* what, const std::vector<std::uint8_t>& program,
+                   const GuestState& initial, bool want_deferred = true) {
+    const hyperion::RunResult expected = run_interp(program, initial);
+    const Outcome actual = run_cached(program, initial);
+    const GuestState& got = actual.result.state;
+    const GuestState& want = expected.state;
+
+    bool same = actual.result.status == expected.status && got.rip == want.rip &&
+                actual.result.steps == expected.steps && got.flags == want.flags;
+    for (std::size_t i = 0; i < hyperion::kGprCount; ++i) {
+        same = same && got.gpr[i] == want.gpr[i];
+    }
+    if (!same) {
+        std::fprintf(stderr,
+                     "  P9 mismatch in %s: steps %llu/%llu rip 0x%llx/0x%llx\n"
+                     "    tier1 cf/pf/af/zf/sf/of = %d%d%d%d%d%d  rax=0x%llx rcx=0x%llx\n"
+                     "    tier0 cf/pf/af/zf/sf/of = %d%d%d%d%d%d  rax=0x%llx rcx=0x%llx\n",
+                     what, static_cast<unsigned long long>(actual.result.steps),
+                     static_cast<unsigned long long>(expected.steps),
+                     static_cast<unsigned long long>(got.rip),
+                     static_cast<unsigned long long>(want.rip), got.flags.cf, got.flags.pf,
+                     got.flags.af, got.flags.zf, got.flags.sf, got.flags.of,
+                     static_cast<unsigned long long>(got.reg(Gpr::kRax)),
+                     static_cast<unsigned long long>(got.reg(Gpr::kRcx)), want.flags.cf,
+                     want.flags.pf, want.flags.af, want.flags.zf, want.flags.sf, want.flags.of,
+                     static_cast<unsigned long long>(want.reg(Gpr::kRax)),
+                     static_cast<unsigned long long>(want.reg(Gpr::kRcx)));
+        HYPERION_CHECK(false);
+        return;
+    }
+    // Leaving generated code must always publish the descriptor: if a pending
+    // descriptor survived into C++, the next reader of `state.flags` (the
+    // interpreter, a syscall, this test) would see a stale PF/AF.
+    HYPERION_CHECK_EQ(static_cast<unsigned>(got.pf_af_pending), 0u);
+    if (want_deferred) {
+        HYPERION_CHECK(actual.deferred >= 1);
+    }
+}
+
+// A state whose PF and AF are the *opposite* of what the program computes, so a
+// forced point that never runs cannot accidentally agree with the interpreter.
+GuestState opposite_pf_af() {
+    GuestState s;
+    s.rip = kBase;
+    s.flags.pf = true;
+    s.flags.af = true;
+    return s;
+}
+
+} // namespace p9
+
+HYPERION_TEST("translation_cache", "pending_pf_af_is_materialised_at_the_exit_epilogue") {
+    // add eax, ebx ; hlt
+    // 0xff + 0x01 = 0x100: PF = parity(0x00) = 1, AF = carry out of bit 3 = 1.
+    // Both are the opposite of the incoming state, so this only passes if the
+    // exit epilogue really did materialise the descriptor before returning to
+    // C++.
+    const std::vector<std::uint8_t> program = {0x01, 0xD8, 0xF4}; // add eax, ebx ; hlt
+    GuestState initial = p9::opposite_pf_af();
+    initial.reg(Gpr::kRax) = 0xFF;
+    initial.reg(Gpr::kRbx) = 0x01;
+    p9::check_matches("exit epilogue add", program, initial);
+}
+
+HYPERION_TEST("translation_cache", "pending_pf_af_af_zero_case_reaches_the_exit_epilogue") {
+    // add eax, ebx ; hlt   with 0x10 + 0x01 = 0x11: AF = 0 (no nibble carry),
+    // PF = parity(0x11) = 1. Incoming AF = 1, so a skipped materialisation leaves
+    // the wrong bit set.
+    const std::vector<std::uint8_t> program = {0x01, 0xD8, 0xF4};
+    GuestState initial = p9::opposite_pf_af();
+    initial.flags.pf = false;
+    initial.reg(Gpr::kRax) = 0x10;
+    initial.reg(Gpr::kRbx) = 0x01;
+    p9::check_matches("add with zero AF", program, initial);
+}
+
+HYPERION_TEST("translation_cache", "pf_consumer_forces_materialisation_inside_a_block") {
+    // mov eax,0xff ; add eax,1 ; jp L1 ; mov ecx,0x1111 ; L1: mov ecx,0x2222 ; hlt
+    //
+    // The JP reads PF *inside* the block, before any exit epilogue runs, so this
+    // is decided by the consumer guard alone: the incoming PF is false and the
+    // correct PF is true, and the two make the branch go opposite ways. A missing
+    // guard leaves ecx = 0x1111 here.
+    const std::vector<std::uint8_t> taken = {0xB8, 0xFF, 0x00, 0x00, 0x00, 0x83, 0xC0,
+                                             0x01, 0x7A, 0x05, 0xB9, 0x11, 0x11, 0x00,
+                                             0x00, 0xB9, 0x22, 0x22, 0x00, 0x00, 0xF4};
+    GuestState initial = p9::opposite_pf_af();
+    initial.flags.pf = false; // stale value; the add makes PF true
+    p9::check_matches("jp taken", taken, initial);
+
+    // Same shape, but 0xff + 2 = 0x101 -> PF = parity(0x01) = 0, so JP must fall
+    // through. Incoming PF = true makes a skipped materialisation take the branch.
+    const std::vector<std::uint8_t> not_taken = {0xB8, 0xFF, 0x00, 0x00, 0x00, 0x83, 0xC0,
+                                                 0x02, 0x7A, 0x05, 0xB9, 0x11, 0x11, 0x00,
+                                                 0x00, 0xB9, 0x22, 0x22, 0x00, 0x00, 0xF4};
+    GuestState falling = p9::opposite_pf_af();
+    falling.flags.pf = true;
+    p9::check_matches("jp not taken", not_taken, falling);
+}
+
+HYPERION_TEST("translation_cache", "setp_and_setnp_force_materialisation") {
+    // mov eax,0xff ; add eax,1 ; setp al ; setnp bl ; hlt
+    // PF = 1 for a result of 0x100, so al must become 1 and bl 0.
+    const std::vector<std::uint8_t> program = {0xB8, 0xFF, 0x00, 0x00, 0x00, 0x83, 0xC0, 0x01,
+                                               0x0F, 0x9A, 0xC0, 0x0F, 0x9B, 0xC3, 0xF4};
+    GuestState initial = p9::opposite_pf_af();
+    initial.flags.pf = false;
+    initial.reg(Gpr::kRbx) = 0xAA;
+    p9::check_matches("setp/setnp", program, initial);
+}
+
+HYPERION_TEST("translation_cache", "helper_boundary_forces_materialisation_of_pf_and_af") {
+    // mov eax,0xff ; add eax,1 ; mov edx,0 ; mov eax,100 ; mov ecx,3 ; div ecx ;
+    // jp L1 ; mov esi,0x1111 ; hlt ; L1: mov esi,0x2222 ; hlt
+    //
+    // DIV runs in the C++ helper, which executes the reference interpreter and
+    // therefore reads `state.flags` directly. It also leaves PF/AF untouched, so
+    // the descriptor recorded by `add` is what PF/AF must still be after the
+    // helper - proving the flush happens *before* the helper runs rather than
+    // after. 100/3 = 33 with a remainder, so CF/OF are set by DIV as well.
+    const std::vector<std::uint8_t> program = {
+        0xB8, 0xFF, 0x00, 0x00, 0x00, 0x83, 0xC0, 0x01, 0xBA, 0x00, 0x00, 0x00, 0x00,
+        0xB8, 0x64, 0x00, 0x00, 0x00, 0xB9, 0x03, 0x00, 0x00, 0x00, 0xF7, 0xF1, 0x7A,
+        0x06, 0xBE, 0x11, 0x11, 0x00, 0x00, 0xF4, 0xBE, 0x22, 0x22, 0x00, 0x00, 0xF4};
+    GuestState initial = p9::opposite_pf_af();
+    initial.flags.pf = false;
+    const p9::Outcome cached = p9::run_cached(program, initial);
+    p9::check_matches("helper boundary", program, initial);
+    // The helper path is the only place that reports a dynamic flush count.
+    HYPERION_CHECK(cached.flushes >= 1);
+}
+
+HYPERION_TEST("translation_cache", "helper_writing_pf_cannot_resurrect_a_stale_descriptor") {
+    // mov eax,1 ; add eax,2 ; shr eax,1 ; hlt
+    //
+    // ADD produces 3 (PF = 1); SHR produces 1 (PF = 0) and runs in the C++ helper,
+    // which rewrites PF from its own result. If the helper does not flush the
+    // descriptor first, ADD's descriptor is still pending when the block exits and
+    // the exit epilogue overwrites the helper's PF with ADD's value. SHR leaves AF
+    // alone, so AF still has to come from the ADD.
+    const std::vector<std::uint8_t> program = {0xB8, 0x01, 0x00, 0x00, 0x00, 0x83,
+                                               0xC0, 0x02, 0xD1, 0xE8, 0xF4};
+    GuestState initial = p9::opposite_pf_af();
+    p9::check_matches("helper writes pf", program, initial);
+    HYPERION_CHECK(p9::run_cached(program, initial).result.state.flags.pf == false);
+}
+
+HYPERION_TEST("translation_cache", "partial_flag_update_keeps_cf_and_defers_pf_af") {
+    // mov eax,-1 ; add eax,1 ; inc ebx ; hlt     with ebx = 0x7f
+    // The ADD sets CF=ZF=AF=PF=1. INC then rewrites PF/AF/ZF/SF/OF but must leave
+    // CF alone: the descriptor covers only the flags INC writes, so CF has to
+    // survive both the deferral and the materialisation.
+    const std::vector<std::uint8_t> program = {0xB8, 0xFF, 0xFF, 0xFF, 0xFF, 0x83,
+                                               0xC0, 0x01, 0xFF, 0xC3, 0xF4};
+    GuestState initial;
+    initial.rip = kBase;
+    initial.flags.cf = false;
+    initial.flags.pf = false;
+    initial.reg(Gpr::kRbx) = 0x7F;
+    p9::check_matches("inc preserves cf", program, initial);
+}
+
+HYPERION_TEST("translation_cache", "pending_pf_af_survives_a_self_loop_and_a_link") {
+    // mov ecx,3 ; L: dec ecx ; jnz L ; jp X ; mov edx,7 ; X: hlt
+    // `dec ecx ; jnz L` is the self-loop fast path, so the descriptor is recorded
+    // by the loop body and must survive the back edges. The final DEC makes
+    // ecx = 0 (ZF=1, PF=1, AF=1) and the JP after the loop consumes PF in the
+    // *next* block, after a transition.
+    const std::vector<std::uint8_t> program = {0xB9, 0x03, 0x00, 0x00, 0x00, 0xFF, 0xC9, 0x75, 0xFC,
+                                               0x7A, 0x05, 0xBA, 0x07, 0x00, 0x00, 0x00, 0xF4};
+    GuestState initial = p9::opposite_pf_af();
+    initial.flags.pf = false;
+    initial.reg(Gpr::kRdx) = 0;
+    p9::check_matches("self loop + link", program, initial);
+}
+
+HYPERION_TEST("translation_cache", "pending_pf_af_crosses_a_directly_linked_exit") {
+    // add eax,ebx ; jmp done ; mov edi,0x99 ; done: mov esi,0x1234 ; hlt
+    // The JMP exit is linked straight at its successor (P7), so the successor is
+    // entered with the descriptor still pending and nothing reads PF there: the
+    // flush must happen on the way out to C++.
+    const std::vector<std::uint8_t> program = {0x01, 0xD8, 0xEB, 0x05, 0xBF, 0x99, 0x00, 0x00,
+                                               0x00, 0xBE, 0x34, 0x12, 0x00, 0x00, 0xF4};
+    GuestState initial = p9::opposite_pf_af();
+    initial.reg(Gpr::kRax) = 0xFF;
+    initial.reg(Gpr::kRbx) = 0x01;
+    p9::check_matches("linked exit", program, initial);
+}
+
+HYPERION_TEST("translation_cache", "pf_consumer_in_the_successor_block_forces_materialisation") {
+    // mov ecx,3 ; cmp ecx,3 ; jne bad ; jp X ; bad: mov edx,0x1111 ; X: mov edx,0x2222 ; hlt
+    //
+    // CMP 3,3 -> PF = parity(3) = 1. The JP is the first instruction of the next
+    // block, so PF has to be materialised in the *successor*, from a descriptor
+    // recorded by a block that has already exited. The incoming PF is false, so a
+    // missing guard jumps to the wrong place.
+    const std::vector<std::uint8_t> program = {0xB9, 0x03, 0x00, 0x00, 0x00, // mov ecx,3
+                                               0x83, 0xF9, 0x03,             // cmp ecx,3
+                                               0x75, 0x05,                   // jne bad (+5)
+                                               0x7A, 0x05,                   // jp X (+5)
+                                               0xBA, 0x11, 0x11, 0x00, 0x00, // bad: mov edx,0x1111
+                                               0xBA, 0x22, 0x22, 0x00, 0x00, // X:   mov edx,0x2222
+                                               0xF4};
+    GuestState initial = p9::opposite_pf_af();
+    initial.flags.pf = false;
+    initial.reg(Gpr::kRdx) = 0;
+    p9::check_matches("successor consumer", program, initial);
+}
+
 #else
 
 HYPERION_TEST("translation_cache", "caches_blocks_and_agrees_with_interpreter") {
@@ -406,6 +655,46 @@ HYPERION_TEST("translation_cache", "helper_counter_is_not_always_zero") {
 
 HYPERION_TEST("translation_cache",
               "self_loop_superblock_matches_interpreter_with_and_without_step_limit") {
+    HYPERION_SKIP("generated code is AArch64; requires an AArch64 host to run");
+}
+
+HYPERION_TEST("translation_cache", "pending_pf_af_is_materialised_at_the_exit_epilogue") {
+    HYPERION_SKIP("generated code is AArch64; requires an AArch64 host to run");
+}
+
+HYPERION_TEST("translation_cache", "pending_pf_af_af_zero_case_reaches_the_exit_epilogue") {
+    HYPERION_SKIP("generated code is AArch64; requires an AArch64 host to run");
+}
+
+HYPERION_TEST("translation_cache", "pf_consumer_forces_materialisation_inside_a_block") {
+    HYPERION_SKIP("generated code is AArch64; requires an AArch64 host to run");
+}
+
+HYPERION_TEST("translation_cache", "setp_and_setnp_force_materialisation") {
+    HYPERION_SKIP("generated code is AArch64; requires an AArch64 host to run");
+}
+
+HYPERION_TEST("translation_cache", "helper_boundary_forces_materialisation_of_pf_and_af") {
+    HYPERION_SKIP("generated code is AArch64; requires an AArch64 host to run");
+}
+
+HYPERION_TEST("translation_cache", "helper_writing_pf_cannot_resurrect_a_stale_descriptor") {
+    HYPERION_SKIP("generated code is AArch64; requires an AArch64 host to run");
+}
+
+HYPERION_TEST("translation_cache", "partial_flag_update_keeps_cf_and_defers_pf_af") {
+    HYPERION_SKIP("generated code is AArch64; requires an AArch64 host to run");
+}
+
+HYPERION_TEST("translation_cache", "pending_pf_af_survives_a_self_loop_and_a_link") {
+    HYPERION_SKIP("generated code is AArch64; requires an AArch64 host to run");
+}
+
+HYPERION_TEST("translation_cache", "pending_pf_af_crosses_a_directly_linked_exit") {
+    HYPERION_SKIP("generated code is AArch64; requires an AArch64 host to run");
+}
+
+HYPERION_TEST("translation_cache", "pf_consumer_in_the_successor_block_forces_materialisation") {
     HYPERION_SKIP("generated code is AArch64; requires an AArch64 host to run");
 }
 
