@@ -2072,6 +2072,71 @@ this project refuses to make.
 * the four new tests are plain `syscall` tests: deterministic, no `HYPERION_SKIP`, and they
   create no host processes (the refusal and validation paths all return before the fork)
 
+### 29.18 P14 — there is no IR today; here is the staged one, and the criterion for building it
+
+Item 14 of §L proposes an incremental IR. It is the one item in this batch that is
+deliberately *not* implemented, and the reason is in §29.14: an IR is a means to measurable
+optimisations, and the two optimisations queued behind it (CF/ZF/SF/OF deferral, a return-target
+cache) both have ceilings below this environment's noise floor. Building the IR now would be
+structural churn with a claim attached that could not be verified.
+
+#### What the translator is today
+
+There is no IR. Translation is a three-pass pipeline over a decoded straight-line vector, twice
+over (a legacy single-instruction path and the production cached path), plus a separate direct
+switch interpreter:
+
+| component | lines | role |
+| --- | --- | --- |
+| `src/core/decoder.cpp` | 2 262 | x86-64 → `Instruction` (opcode, operands, size, length) |
+| `src/core/translator.cpp` | 3 788 | one-pass AArch64 emission, with block-level register allocation and flag liveness in front of it |
+| `src/core/interpreter.cpp` | 3 150 | the reference semantics; every optimisation is validated against it |
+
+`translate_cached_block` is: **pass 1** decode up to the terminator (`Step { Instruction,
+live_flags }`), **pass 1.5** per-block register allocation (pin a guest register in `x19..x23`
+when a block references it more than twice), **pass 2** exact backward flag liveness across the
+ISA, **pass 3** emit — and emission is the only place that knows the machine-level details, so
+every fact an optimisation needs is re-derived at the point of use.
+
+ISA knowledge is therefore spread across predicates that ~28 call sites consult independently:
+`flags_written`, `flags_written_full`, `flags_read_full`, `flags_killed_full`,
+`is_classic_fast_alu`, `condition_flags`, `try_nzcv_cond`, and the `emit_one` switch itself.
+That is exactly the shape a `cc_op` descriptor must *not* be added to: §29.14's list of
+producers and consumers would have to be reproduced at ~30 emitter sites.
+
+#### The staged proposal
+
+| stage | content | acceptance criterion |
+| --- | --- | --- |
+| 0 (implicit, exists) | `std::vector<Step>` + flag liveness is already a mini-IR | — |
+| **1** | `IrBlock`/`IrInsn`: the decoded instruction plus, computed *once*, the facts every later pass needs — flags read / written / killed, GPR read and write masks, `writes_memory`/`reads_memory`, terminator kind, fault-PC and step-weight. `translate_cached_block` builds it in the existing pass 1 and keeps registering it into the allocator and liveness passes | **generated code is byte-for-byte identical** on a corpus of blocks (compare `total_code_bytes()` and the emitted bytes), all tests green, no timing change beyond noise. A pure refactor that cannot be wrong in a way the tests do not see. |
+| **2** | first consumer: flag-materialisation sinking/DSE inside a block, driven by the facts instead of by per-site guesses (this is what §29.14's stage 2 needs, and it is worth testing on its own before any six-flag descriptor) | differential parity with the interpreter on the full ISA corpus **and** a measured win above the noise floor (§29.14 sets that bar); the current emitter stays as a fallback until both hold |
+| **3** | effective-address folding and a branch representation that can carry an indirect target cache (§29.13's deferred ret/`jmp r/m` optimisation), which needs an IR-level notion of a branch rather than a code-offset patch list | differential parity plus a measured win |
+| **4** | retire the legacy `translate_block`/`translate_instruction` paths once the cached path is the only one exercised, so there is one emitter and one reference | the tests that reach the legacy path by name are re-pointed at the cached path, not deleted |
+
+Invariants any IR pass must preserve, because they are what makes the current design verifiable:
+
+* **one `Instruction` = one retired guest instruction** in the budget accounting, including
+  instructions that fault (the step is un-retired on the fault path);
+* **faults report the faulting instruction's own pc**, not the block's;
+* **memory ordering and the `SoftTlb` epoch checks stay in emission**, not in the IR: an IR pass
+  may not reorder or elide guest loads/stores across a fault point;
+* **the pending PF/AF descriptor (§29.11) stays valid at every boundary** — helper entry, block
+  exit, consumer guard — because it is C++-visible state, so a pass that moves or removes a
+  store must re-derive it rather than assume it;
+* **direct-link and call-link offsets (`exit_links`, `code_offset`) are emitted-code offsets**,
+  so a pass that changes code layout must keep them consistent — which is another reason stage 1
+  is defined as "no output change".
+
+#### Decision
+
+Proposal recorded, stages 1–4 not implemented here, because the item's own acceptance criterion
+is "measurable value" and the two optimisations behind it are both under the measurement floor
+of this setup (§29.13: a ret-target cache is worth ~4–5 % on call-heavy code only; §29.14: the
+remaining flags are ~4 %). The work is not rejected — it is sequenced: it becomes worthwhile the
+moment either a native-AArch64 measurement rig with ≤1 % noise exists, or stage 2 can be justified
+by a specific pass whose own measurement clears the bar.
+
 ### 29.9 Still open from §L
 
 Items 1-5 of §L are all resolved (1 justified and pinned, 2 and 5 implemented, 3 retracted as wrong,
@@ -2101,8 +2166,36 @@ delivery documented as absent. Item 13 (guest threads) is audited in §29.17: th
 "many processes, no threads", every shared-state clone flag is refused (and the refusal is now
 pinned at unit level as well as end to end), and the six things a thread implementation would need
 - per-thread state and JIT context, a write-race-free dispatcher, a translation-cache shootdown,
-futex wait queues and asynchronous signals - are written down instead of approximated. Still open:
-14 (an IR and a real optimiser).
+futex wait queues and asynchronous signals - are written down instead of approximated. Item 14 (an IR) is proposed and staged in §29.18 —
+inspection, a four-stage plan with an acceptance criterion per stage, the invariants every pass
+must preserve, and the explicit reason it is sequenced rather than implemented now. Nothing in
+§L items 6–14 is left unaddressed; §30 is the summary.
+
+---
+
+---
+
+## 30. Status after items 6–14
+
+| item | outcome | where |
+| --- | --- | --- |
+| 6 hot-block gating | **implemented** — cold block starts execute in the interpreter; 14–35 % faster from 10 k guest instructions up, 69 % less generated code | §29.12 |
+| 8 cross-block register allocation | **measured, deferred** — 0.65–0.75 registers pinned per block, so all boundary traffic is 6.1–6.6 % of code and only part of it is removable | §29.15 |
+| 9 stage 2 (CF/ZF/SF/OF) | **measured, deferred** — flag materialisation is 10.2–10.8 % of code, the deferrable part ≈ 4 %, under this environment's noise floor | §29.14 |
+| 10 shadow stack | **half implemented** — direct `call` exits are linked (9 % on a call-heavy guest); the shadow stack itself is rejected, a verified ret-target cache deferred to P14 | §29.13 |
+| 12 signals | **audited and partly implemented** — `kill`/`tgkill` honour disposition and mask; handler invocation, `rt_sigreturn` and asynchronous delivery documented as absent | §29.16 |
+| 13 threads | **audited and pinned** — "many processes, no threads"; every shared-state clone flag refused, the six pieces a thread implementation needs written down | §29.17 |
+| 14 IR | **proposed and staged** — four stages with acceptance criteria and invariants; sequenced behind a measurement rig | §29.18 |
+
+Verification for the batch, at `2303e54`: native (x86-64, clang-19) 353 passed / 0 failed / 47
+skipped of 400, `ctest` 19/19; AArch64 under `qemu-aarch64-static` 400 passed / 0 failed / 5
+skipped of 405; GCC and clang strict builds (`HYPERION_WARNINGS_AS_ERRORS=ON`) clean; full guest
+runs on both tiers byte-identical (`acc=9000001 counter=0`, `acc=20475694797959 g=50991808`).
+
+Two measurements in this batch are negative results that matter for planning: the PF/AF deferral
+of §29.11 does not separate from noise on this setup (paired-ratio median 1.02, spread 0.89–1.21),
+and flag materialisation as a whole is ~10 % of generated code. Any further flag work should wait
+for a measurement rig that can see it.
 
 ---
 
@@ -2120,9 +2213,9 @@ futex wait queues and asynchronous signals - are written down instead of approxi
 | 16 KiB flush per syscall | `interpreter.hpp:38-55` (512×16 B ×2); `translation_cache.cpp:241`; `interpreter.cpp:2320`; measured 744 ns vs 131 ns dispatch — **now conditional, see §29.2** |
 | LOCK ignored | `decoder.cpp:656-666` sets `insn.lock`; no reader anywhere — **benign, see §29.1** |
 | Threads refused | `process.cpp:371-375`, `:604-606` |
-| Signals never delivered | `syscall.cpp:2042-2095` (record only); comment at `:2045-2050`; no `rt_sigreturn` |
+| Signals never delivered | **partly superseded by §29.16** (P12): `kill`/`tgkill` now honour disposition and mask, but no frame is ever built and there is still no `rt_sigreturn` |
 | fork = host fork + deep copy + full retranslate | `process.cpp:407,437,508,556` |
-| No hot-block detection | `translation_cache.cpp` entire file; counters unused |
+| No hot-block detection | **superseded by §29.12** (P6): a per-PC count gates cold block starts to the interpreter; the only thing still absent is an execution-frequency profile feeding *other* decisions |
 | Tier 1 aborts on untranslatable block | `translation_cache.cpp:184-190` |
 | No exception boundary | `grep try/catch src/cli/main.cpp src/core/translation_cache.cpp` → none |
-| 24 AArch64-gated tests skip on x86-64 | `hyperion_unit_tests` SKIP list (still 24 after the post-audit change; 5 skip under qemu) |
+| AArch64-gated tests skip on x86-64 | `hyperion_unit_tests` SKIP list — 47 skip natively / 5 under qemu at `2303e54`, each with its reason printed |
