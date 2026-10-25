@@ -41,6 +41,7 @@
 
 #include <cerrno>
 #include <cstdlib>
+#include <cstdio>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -172,8 +173,13 @@ public:
         have_saved_ = true;
     }
     ~ScopedCwd() {
-        if (have_saved_) {
-            (void)::chdir(saved_);
+        // glibc declares chdir() with warn_unused_result, which a (void) cast
+        // does not silence - and rightly so: failing to get back to the original
+        // directory would leave the rest of the binary in the wrong place, which
+        // is the bug this class exists to prevent. A destructor cannot throw, so
+        // report instead of pretending.
+        if (have_saved_ && ::chdir(saved_) != 0) {
+            std::fputs("hyperion tests: could not restore the working directory\n", stderr);
         }
     }
     ScopedCwd(const ScopedCwd&) = delete;
