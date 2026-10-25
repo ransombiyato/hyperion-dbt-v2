@@ -1881,6 +1881,51 @@ The defensible way in is to make flag effects explicit in an IR (§29.16, P14) a
 the descriptor from one table instead of from ~30 emitter sites. Revisit trigger: either a
 native-AArch64 measurement setup with ≤1 % noise, or P14 landing with a flag-effect table.
 
+### 29.15 P8 — measured: there is almost nothing to keep across a block boundary
+
+Item 8 of §L ("cross-block register allocation") assumed the block boundary is where the
+register traffic is. A temporary probe (never committed) counted, over every translated
+block of each benchmark guest, the generated words attributable to *crossing a boundary*:
+the prologue's guest-register loads, every `spill_ra()`/`reload_ra()` the block emits (exit
+spills, helper boundaries, fault exits), against the block's total size. It also counted
+how many guest registers the allocator actually pins per block.
+
+| guest | blocks | generated words | prologue | exit/helper spills | reloads | boundary share | allocated regs |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `call_guest` | 542 | 51 336 | 625 | 2 002 | 498 | **6.09 %** | 360 (0.66/block) |
+| `vm_guest` | 526 | 48 759 | 594 | 1 900 | 482 | **6.10 %** | 343 (0.65/block) |
+| `guest_probe` | 663 | 64 237 | 927 | 2 675 | 626 | **6.58 %** | 494 (0.75/block) |
+
+The reason the number is small is the allocator itself: it pins a guest register only when
+the block references it more than twice (`refs[i] > 2`, "strictly saves ≥ 1 word over 1 load
++ 1 store"), and at ~4.7 guest instructions per block that condition is rarely met — **0.65
+to 0.75 registers per block**. A block therefore pays about one `ldr` on entry and one `str`
+per exit for guest state, and the rest of its operands already go straight to and from
+`GuestState`.
+
+#### The smallest safe design, and why it still is not worth it
+
+The design that would remove that traffic is a *canonical* assignment: a fixed guest→host
+map used by every block (so a linked successor needs no reload), guest values written back
+only at the C++ funnel (the exit epilogue stores the whole canonical set — cheap, because
+C++ exits are rare), and link patching refusing to link blocks whose assumptions disagree.
+It is incremental in the sense that it does not touch the emitter, only the prologue,
+the exit epilogue and the allocator.
+
+But the prize is the 6 % above, and only part of it is removable: a linked successor still
+needs values its predecessor did not keep, the exit epilogue has to store the canonical set
+anyway, and helper boundaries must keep the write-back discipline that §29.3 established
+(that is the invariant P3 retracted, and it is not negotiable). Realistically 3–4 % of
+generated code — below the measurement resolution established in §29.14 (paired-ratio spread
+0.89–1.21 for a 5-word-per-producer change), for a redesign of the one invariant that makes
+guest state visible at every exit, helper call, fault and signal.
+
+Deferred, with a trigger that is honest about *why* the number is small: if the allocator is
+ever made more aggressive (always pinning `rsp`, `rbp`, `rax`, say, which is a separate
+decision with its own cost), the boundary cost rises and this becomes worth measuring again.
+As it stands, P11 (inlining the remaining helper opcodes) and P6 (not translating cold
+blocks) attacked the same overhead from the side that actually pays.
+
 ### 29.9 Still open from §L
 
 Items 1-5 of §L are all resolved (1 justified and pinned, 2 and 5 implemented, 3 retracted as wrong,
@@ -1900,9 +1945,11 @@ return-target cache that belongs with item 14. Item 9 stage 2 (CF/ZF/SF/OF via
 `cc_op`/`cc_src`/`cc_dst`) was measured in §29.14: flag materialisation is 10.2–10.8 % of generated
 code, the deferrable part of it is ≈4 % of executed code, and a paired A/B of the *existing* PF/AF
 deferral cannot resolve 5 words per producer in this environment (ratio median 1.02, spread
-0.89–1.21) — so it is deferred, not attempted, with the required design recorded. Still open: item
-8 (cross-block register allocation), 12 (signal delivery), 13 (guest threads), 14 (an IR and a real
-optimiser).
+0.89–1.21) — so it is deferred, not attempted, with the required design recorded. Item 8 (cross-block register allocation) was
+measured in §29.15: the allocator pins 0.65–0.75 registers per block, so all boundary traffic
+together is 6.1–6.6 % of generated code and only part of that is removable — below the
+measurement resolution of §29.14, so it is designed but deferred. Still open: 12 (signal delivery),
+13 (guest threads), 14 (an IR and a real optimiser).
 
 ---
 
