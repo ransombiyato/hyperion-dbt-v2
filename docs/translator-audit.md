@@ -1329,6 +1329,107 @@ compares bytes in its inner loop. Do not read 3.4× as a general figure. Correct
 is separately established: both binaries retire exactly 102 139 313 guest instructions and print
 `acc=9000001 counter=0`, which is what Tier 0 produces.
 
+### 29.10 P9 (lazy flags) — measured, not started: it is an architectural change
+
+P9 was investigated before any code was changed, and the measurement says this item
+cannot be done the way the previous four were. Nothing was rewritten; this section is
+the evidence and the proposed staged design.
+
+#### How flags are represented today
+
+`GuestState::flags` is six `bool`s (`guest_state.hpp:59-72`). They are stored to
+individually as bytes (`strb` to `kCfOffset` … `kOfOffset`, `translator.cpp:77-82`),
+and every consumer — `Jcc`, `Setcc`, `Cmovcc`, `Adc`/`Sbb`, and the C++ helper and
+interpreter — reads them back from those bytes. There are three emitters:
+`emit_flags_from_nzcv` (arithmetic), `emit_flags_logical`, and `emit_flags_wide` (the
+8/16-bit one added in §29.8). Backward liveness (`flags_read_full`/`flags_written_full`)
+already decides *whether* to materialise, and `live_out` at a block exit is `kFbAll`,
+because the successor block's needs are not knowable at translation time.
+
+#### What the profile says (tier 1 under `qemu-aarch64-static`, x86-64 host)
+
+Counted with a throw-away profiler in the translator (translation-time events, so the
+counts are exact and noise-free), then removed:
+
+| | mixed guest (551k retired insns, 1721 blocks) | branch-heavy guest (102M retired insns) |
+| --- | --- | --- |
+| flag-materialisation events | **1483** | 1396 |
+| … with all six flags (mask `0x3f`) | 1483 (**100 %**) | 1396 (100 %) |
+| … at a block exit | 4 | 3 |
+| producers with flags live | 1522 | 1433 |
+| … whose materialisation is dead (consumed only by a fused `Jcc`) | **0** | **0** |
+| words emitted for materialisation | **21 397** (14.4 per event) | 20 110 |
+| … as a share of generated code | **11.7 %** | — |
+| flag reads by consumers | cf 250, zf 1088, sf 102, of 70, **pf 20, af 20** | cf 241, zf 1032, sf 107, of 76, **pf 22, af 22** |
+
+Three conclusions follow directly, and they are the reason this section exists:
+
+1. **There is nothing to win inside a block.** Zero producers have a materialisation
+   that a fused `Jcc` makes dead. The earlier hope — that `cmp; jcc` pairs materialise
+   flags the fused branch then ignores — is false, because the flags are live *past*
+   the branch: x86 keeps flags across `jcc`, so the successor block may read them. The
+   cost is not in-block eagerness, it is the block boundary.
+2. **PF and AF dominate the cost and are almost never read.** `emit_parity` is six
+   instructions plus a store, and AF is four; together ~11 of the 14.4 words per event,
+   i.e. roughly 76 % of flag code and ~8.9 % of all generated code — for flags that
+   consumers read 20 times in a 551k-instruction run. The only in-program readers
+   found are variable shifts and string ops, which read `kFbAll` only because
+   `flags_read_full` is conservative for them (`cl == 0` leaves flags untouched).
+3. **PF and AF are observable outside generated code.** A throw-away build that simply
+   stopped computing them did not just change flags: the branch-heavy guest's retired
+   instruction count moved from 102 139 313 to 102 145 026. The helper path
+   (`execute_cached_helper` → `execute_decoded`) reads `GuestState.flags` as
+   materialised bools, so any deferred representation leaks into C++ the moment a
+   helper runs. That is the correctness surface, and it is real rather than
+   theoretical.
+
+#### Why that makes P9 architectural
+
+A lazy scheme has to carry a descriptor (operation kind + operands) instead of six
+materialised bytes, which changes what `GuestState::flags` *means* between the moment a
+producer runs and the moment something reads them. Concretely it touches:
+
+| surface | why | count |
+| --- | --- | --- |
+| `GuestState` + its offset asserts | new pending state; `flags` no longer always authoritative | `guest_state.hpp`, `translator.hpp:136-146` |
+| flag emitters | store the descriptor instead of PF/AF (and for a full scheme, all six) | 3 functions, 7 call sites |
+| forced materialisation | must run before anything that reads the bytes | shared exit epilogue (1), every helper-call site, every non-fused flag consumer |
+| invalidation | helpers rewrite `flags` and know nothing about the descriptor | helper call return path |
+| interpreter / tier 0 | must never observe a pending descriptor | unchanged only if every JIT→C++ exit forces |
+
+The good news for staging: every JIT→C++ transition already funnels through a single
+shared epilogue (`translator.cpp:2166`, reached from the syscall, halt, fault, budget
+and dispatcher-miss paths at `:3358`, `:3367`, `:3451`, `:3570`, `:2152`), so
+"force on exit to C++" is one site, not five. Helper calls are the other site, and P11
+has made those rare (257–579 per run on these guests).
+
+Per the instruction to stop rather than half-implement an architectural change, no P9
+code was written. The staged design proposed:
+
+**Stage 0 — cheaper materialisation (no semantics change, ~1 day).** Replace
+`emit_parity`'s six-instruction fold with a 256-byte parity table (`adrp`/`ldrb`, or a
+table pointer hoisted into `ExecContext`), and skip the `eor`/`eor` prefix of AF when
+`lflags & kFbAf` is clear. Strictly local, no new state, verifiable with the existing
+differential tests. Expected: ~4-5 words off each of ~1483 materialisations
+(~3 % of generated code), **no claim about runtime** until measured.
+
+**Stage 1 — deferral of PF and AF only (~2-3 days).** These are the expensive flags and
+the rarely-read ones. Producer emits a 3-byte descriptor (`result_low8`, `xor_low8`,
+`pending`) instead of ~11 words of parity/AF code; a `force_pf_af` sequence (~11 words)
+materialises on demand and clears `pending`. Forced at: the shared exit epilogue, before
+every helper call, and at any consumer whose condition needs PF (`jp`/`jnp`) or that
+reads AF. Soundness argument: PF = parity(result low byte) and AF = bit 4 of
+`a ^ b ^ r`, both recoverable from the two bytes; every other flag is untouched, so
+`Jcc`/`Adc`/`Sbb` and tier 0 are unaffected. Test plan: extend the §29.8 differential
+table with `jp`/`jnp`/`setp`/`lahf`, sequences that put a helper call between a producer
+and a PF consumer, and a producer immediately followed by a block exit.
+
+**Stage 2 — full six-flag descriptor (QEMU-style `cc_op`/`cc_src`/`cc_dst`, ~1 week).**
+Only worth it if Stage 1's measurements show the remaining four flags matter; the
+profile above says they are read on 1-2 % of producers, so the ceiling is the ~3 words
+per event that CF/ZF/SF/OF cost. This is the version that would need the invalidation
+protocol above in full.
+
 ### 29.9 Still open from §L
 
 Items 1-5 of §L are all resolved (1 justified and pinned, 2 and 5 implemented, 3 retracted as wrong,
@@ -1337,8 +1438,10 @@ window made it cheap. §26 rows 1, 2, 3, 4, 5 should be read with §29 in mind; 
 stands.
 
 Item 11 (inline the remaining helper opcodes) is done — §29.8 — with the work chosen by counting
-rather than by the audit's opcode estimate. Still open: item 6 (hot-block gating), 8 (cross-block
-register allocation), 9 (lazy flags), 10 (shadow stack), 12 (signal delivery), 13 (guest threads), 14
+rather than by the audit's opcode estimate. Item 9 (lazy flags) was profiled and turned out to be an
+architectural change rather than a local one; §29.10 records the measurements and a three-stage
+design, with no code written. Still open: item 6 (hot-block gating), 8 (cross-block register
+allocation), 9 (lazy flags, staged), 10 (shadow stack), 12 (signal delivery), 13 (guest threads), 14
 (an IR and a real optimiser).
 
 ---
