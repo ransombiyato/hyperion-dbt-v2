@@ -58,10 +58,23 @@ private:
     bool finalized_ = false;
 };
 
-// Reusable W^X arena for translated basic blocks. Allocates multi-page slabs
-// once instead of calling mmap/mprotect per 64-byte basic block, switching the
-// active slab RW only during `allocate()` and immediately restoring RX +
-// I-cache coherency over the newly written slice before returning.
+// Reusable W^X arena for translated basic blocks.
+//
+// Slabs are created read-write. Code written into a slab stays writable and
+// non-executable until `publish()` flips the pages it occupies to read-execute:
+// no page is ever both writable and executable, so this is W^X in the strict
+// page-table sense, not W^X-by-alias.
+//
+// The write window exists because a published page cannot be written again. One
+// `publish()` therefore has to cover everything that should become executable
+// together: with a ~156-byte basic block, publishing per block costs two
+// protection changes per block (audit §29.6: 2.787 us, 99.8% of the cost of
+// publishing a block), while publishing a window's worth of blocks costs one.
+//
+// Contract: memory handed out while a window is open is NOT executable until
+// `publish()` returns. Callers that execute generated code must publish first.
+// `allocate()` without an open window does both, so the simple one-block use is
+// unchanged and cannot be mistaken for the batched one.
 class ExecArena {
 public:
     explicit ExecArena(std::size_t slab_bytes = 64ULL * 1024ULL);
@@ -69,8 +82,26 @@ public:
     ExecArena(const ExecArena&) = delete;
     ExecArena& operator=(const ExecArena&) = delete;
 
-    // Copy `size` bytes (4-byte aligned) into RX memory and return entry ptr.
+    // Copy `size` bytes into the arena and return their address. With no write
+    // window open this also publishes, so the result is executable on return;
+    // inside a window (see begin_write()) the memory stays writable and
+    // non-executable until publish().
     void* allocate(const std::uint8_t* code, std::size_t size);
+
+    // Open a write window: subsequent allocate() calls are writable but not
+    // executable, and are made executable together by publish().
+    void begin_write() noexcept { window_open_ = true; }
+    bool write_window_open() const noexcept { return window_open_; }
+
+    // Flip everything written since the last publish() to read-execute and flush
+    // the instruction cache. Idempotent; a window with nothing new written costs
+    // nothing. Any bytes left in a published page become unusable, so a window
+    // should cover enough code to fill the pages it touches.
+    void publish();
+
+    // Number of mprotect calls the arena has made. Exposed so a benchmark can
+    // report the cost the audit is about instead of asserting it (§29.6).
+    std::uint64_t protection_changes() const noexcept { return protection_changes_; }
 
     // Drop all live allocations and reuse the first slab on subsequent runs.
     void reset() noexcept;
@@ -80,12 +111,20 @@ private:
         std::uint8_t* base = nullptr;
         std::size_t capacity = 0;
         std::size_t used = 0;
+        // Bytes of this slab already flipped to RX. Always page-aligned; the
+        // cursor never moves backwards, so published bytes are never rewritten.
+        std::size_t published = 0;
     };
+
+    void resize_slabs(std::size_t next_cap);
 
     std::size_t slab_bytes_ = 0;
     Slab* slabs_ = nullptr;
     std::size_t slab_count_ = 0;
     std::size_t slab_cap_ = 0;
+    bool window_open_ = false;
+    bool dirty_ = false;
+    std::uint64_t protection_changes_ = 0;
 };
 
 } // namespace hyperion

@@ -25,6 +25,9 @@ struct CachedBlock {
     BlockExit exit = BlockExit::kFallThrough;
     std::uint64_t start = 0;
     std::uint64_t target = 0;
+    // kJcc only: the branch destination (the other possible successor).
+    std::uint64_t alternate = 0;
+    bool has_alternate = false;
     std::size_t guest_instruction_count = 0;
     std::size_t code_bytes = 0;
 };
@@ -59,6 +62,14 @@ public:
     std::uint64_t translation_ns() const { return translation_ns_; }
     std::uint64_t translated_guest_instructions() const { return translated_guest_instructions_; }
 
+    // mprotect calls made by the code arena. One publish covers every block in a
+    // write window, so this is the counter that shows the audit §29.6 fix
+    // working: it should grow per window, not per translated block.
+    std::uint64_t protection_changes() const { return arena_.protection_changes(); }
+    // Blocks translated ahead of execution (successor prefetch). Counted
+    // separately from block_count() so the cost of a wrong guess is visible.
+    std::size_t prefetched_blocks() const { return prefetched_blocks_; }
+
     void invalidate_all();
 
 private:
@@ -66,6 +77,14 @@ private:
 
     void ensure_trampolines();
     const CachedBlock* translate_at(Memory& memory, std::uint64_t pc, TranslateFailure& failure);
+    // Translate one block (decode, translate, allocate, install). Returns nullptr
+    // and sets `failure` on failure. Does NOT publish: the caller owns the write
+    // window.
+    const CachedBlock* translate_one(Memory& memory, std::uint64_t pc, TranslateFailure& failure);
+    // Translate the successors of a freshly translated block into the same write
+    // window, within a bounded budget. A translation that fails is skipped
+    // silently: it is a guess, not a requirement.
+    void prefetch_successors(Memory& memory, const CachedBlock& block);
     const CachedBlock* lookup(std::uint64_t pc);
     void install(const CachedBlock* block);
 
@@ -86,6 +105,7 @@ private:
 
     std::uint64_t translation_ns_ = 0;
     std::uint64_t translated_guest_instructions_ = 0;
+    std::size_t prefetched_blocks_ = 0;
 
     std::vector<std::uint8_t> fetch_;
 };

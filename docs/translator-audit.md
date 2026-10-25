@@ -711,7 +711,7 @@ implemented.
 | # | Overhead | Location | Impact |
 | --- | --- | --- | --- |
 | 1 | ~~**Unconditional 16 KiB SoftTlb flush after every syscall**~~ — **FIXED, see §29** | was `translation_cache.cpp:241`, `interpreter.cpp:2320` | measured 725 → ~390 ns per guest `getpid` (1.85×) after the fix |
-| 2 | **Two `mprotect` + `clear_cache` per translated block** | `exec_mem.cpp:170-190` | dominates startup of every Tier 1 run — **measured at 99.8 % of publish cost, 2.787 µs/block, see §29.6** |
+| 2 | ~~**Two `mprotect` + `clear_cache` per translated block**~~ — **FIXED, see §29.6** | was `exec_mem.cpp:170-190` | was 99.8 % of publish cost (2.787 µs/block); now one publish per write window, 0.31 mprotect calls per block measured |
 | 3 | **Register spills on every block transition** (5 stores + 5 loads) | `spill_ra`/`reload_ra` | ~10 memory ops per block, forever (no cross-block allocation) |
 | 4 | ~~**Redundant spill/reload around helper calls**~~ — **RETRACTED, see §29: these stores are required** | `:3013-3020` | not overhead: `execute_cached_helper` re-reads `GuestState`, so the spills are the state sync point |
 | 5 | **No direct linking** — hash lookup on every block exit | `:2054-2073` | ~10 instructions per transition instead of 1 |
@@ -989,7 +989,7 @@ In rough order of value/effort:
 | 2 | Conditional SoftTlb flush | Low | ~600 ns × every syscall, measured | **Done, §29.2.** 725 → ~390 ns per guest `getpid`. This exposed a pre-existing latent stale-TLB bug that the unconditional flush had been masking (new `mapping_epoch()`). |
 | 3 | Drop redundant spills around helper calls | None | Free | **RETRACTED, §29.3 — do not do it.** The spills are the required `GuestState` write-back before the helper re-reads state. |
 | 4 | Metrics: report existing counters + add a translation-cost and syscall-heavy benchmark | None | Everything after this needs a baseline; §27 | **Done, §29.5.** Translation cost is now measured (11 608 ns/guest-instruction under qemu), syscall-heavy guest benchmarked end to end, counters printed by `hyperion run --tier=1`. |
-| 5 | Slab-level W^X | Low | Largest translation-time cost | **Measured, deliberately not implemented, §29.6.** Cost confirmed (99.8 % of publish time) but every removal option costs something real: A changes pinned block counts, B costs ~25× arena memory, C weakens documented W^X. |
+| 5 | Slab-level W^X | Low | Largest translation-time cost | **Done via option A, §29.6** (not the "low risk" version the audit implied): one mprotect per write window instead of two per block, 2.00 → 0.31 calls/block on a real guest, strict W^X kept. Cost: bounded successor prefetch (16 blocks / 3584 bytes per window). |
 | 6 | Hot-block gating (interpret → promote) | Medium | Makes Tier 1 a win on short programs; §11 |
 | 7 | Direct linking of block exits | Medium | ~20 → ~1 instructions per transition |
 | 8 | Cross-block register allocation with spilling | Medium-High | Biggest codegen win; needs liveness over the CFG |
@@ -1093,10 +1093,10 @@ attempt to do so was made.
 
 | Host | What ran | Result |
 | --- | --- | --- |
-| x86-64 Linux, native | `build-strict` unit suite | **339 passed / 0 failed / 24 skipped (of 363)** |
+| x86-64 Linux, native | `build-strict` unit suite | **340 passed / 0 failed / 24 skipped (of 364)** |
 | x86-64 Linux, native | `ctest` | 19/19 (two new tests: `translate_bench.smoke`, `translate_bench.rejects_single_sample`) |
 | x86-64 Linux, native | dynamic-loader guest (`PT_INTERP` → `ld-linux`, exercises the RELRO `mprotect` path) | OK after the fix |
-| AArch64, cross-built, **`qemu-aarch64-static`** (no hardware) | unit suite | **362 passed / 0 failed / 5 skipped (of 367)** |
+| AArch64, cross-built, **`qemu-aarch64-static`** (no hardware) | unit suite | **364 passed / 0 failed / 5 skipped (of 369)** |
 | AArch64 under qemu | `hyperion_tier_bench` | 436.55 ns/guest-ins Tier 0 vs 3.6895 Tier 1, both correct |
 | AArch64 under qemu | sieve, 200 000 | Tier 0 1332 ms vs Tier 1 458 ms |
 
@@ -1180,14 +1180,58 @@ give up strict W^X:
 | C. dual mapping (`memfd_create` + RW alias + RX alias) | write through the RW alias, execute through the RX alias; no `mprotect` per block at all | ~50×+ | the same physical bytes are writable and executable simultaneously — **strictly weaker than the W^X property this project documents** (SECURITY.md, DECISIONS.md D-016) |
 
 None of these is "low risk" in the sense §L claimed: A changes pinned observable behaviour, B
-multiplies arena memory by ~25×, C trades away a documented security property. This needs a
-decision, not a unilateral edit, so P5 was **measured and specified but not implemented**.
+multiplies arena memory by ~25×, C trades away a documented security property.
+
+**Option A was chosen and implemented.** The arena now has a write window:
+
+* `ExecArena::begin_write()` / `publish()` — slabs are mapped writable and non-executable; `publish()`
+  flips every page written since the last publish to read-execute and flushes the I-cache. No page is
+  ever writable *and* executable, so this is still strict W^X, not W^X-by-alias (option C was rejected
+  on exactly that ground). `allocate()` outside a window still publishes immediately, so the
+  one-block use cannot silently hand back non-executable code.
+* On a cache miss the dispatcher opens one window, translates the entry block, translates its
+  successors (fall-through, plus the branch destination for a `Jcc` — carried out of the translator
+  as the new `BlockTranslation::alternate`), then publishes once. The prefetch is bounded: 16 blocks
+  and 3584 generated bytes per window, so a wrong guess cannot translate an unbounded amount of dead
+  code, and the byte budget is sized to fill the page the window touches (unused tail of a published
+  page is unusable).
+* `CachedBlock`/`BlockTranslation` gained `alternate`/`has_alternate`; `ExecArena::protection_changes()`
+  counts the mprotect calls so this is reported, not asserted; `TranslationCache::prefetched_blocks()`
+  counts speculative translations so the cost of a wrong guess is visible.
+
+Measured on the AArch64 tree under qemu (deterministic counters, unlike the wall-clock figures):
+
+| workload (x86-64 guest, translated by the AArch64 JIT) | blocks translated | mprotect calls | per block |
+| --- | --- | --- | --- |
+| 3-block micro workload (`hyperion_translate_bench`) | 3 | 2 | 0.67 |
+| real guest, 551k retired instructions (`guest_probe`) | 1848 | 571 | **0.31** |
+| same code before this change | any | 2 per allocation | 2.00 |
+
+So the protection churn drops by roughly **6×** on a real guest. 1279 of the 1848 blocks were
+translated ahead of execution, which is the cost side of the trade: about 1.4 blocks of speculative
+work per miss on that guest, inside the byte budget.
+
+The qemu wall-clock translation figures are too noisy to attribute a precise win (the same 3-block
+workload measured 168 µs, 192 µs and 302 µs across runs, IQR fraction 0.15-0.38), so the honest
+statement is: the number of protection changes — measured exactly — fell 6×, and on this x86-64 host
+each `mprotect`-pair costs 2.787 µs per block, so the expected saving on hardware is ~1.9 µs per
+translated block (~3.3 ms for a 1848-block guest). **No AArch64 hardware timing backs that estimate;
+it is arithmetic on the host proxy plus the counter.**
+
+Test consequences, as predicted, were smaller than the audit feared: the pinned block counts in
+`test_translation_cache.cpp` and `test_translator.cpp` did **not** change (those guests already
+translated every successor), so no assertion had to be updated. Two new tests pin the contract
+instead: `exec_mem.arena_write_window_defers_one_mprotect_per_window` (portable: zero protection
+changes inside a window, one per publish, none for an empty window) and
+`exec_mem.arena_published_blocks_are_executable_and_reset_rearms_the_slab` (AArch64: published code
+actually runs, and `reset()` makes the surviving slab writable again).
 
 ### 29.7 Still open from §L
 
-P5 is specified but unimplemented (§29.6) pending a choice between options A, B and C. Everything
-else in §L from item 1 to item 5 is either done, retracted or measured-and-blocked as recorded
-above. §26 rows 1, 3 and 4 should be read with §29 in mind; the rest of the table stands.
+Items 1-5 of §L are now all resolved: 1 justified and pinned, 2 and 5 implemented, 3 retracted as
+wrong, 4 implemented. §26 rows 1-5 should be read with §29 in mind; the rest of the table stands.
+Items 6-14 (hot-block gating, direct linking, cross-block allocation, lazy flags, shadow stack,
+remaining helper inlining, signals, threads, IR) are untouched.
 
 ---
 

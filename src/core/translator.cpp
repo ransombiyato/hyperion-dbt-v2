@@ -1059,6 +1059,7 @@ BlockTranslation translate_block(const std::uint8_t* code, std::size_t size,
     std::size_t next_offset = first.length;
     BlockExit exit = BlockExit::kFallThrough;
     std::uint64_t target = 0;
+    std::uint64_t alternate = 0; // kJcc branch destination, for successor prefetch
 
     while (true) {
         const Opcode op = insn.opcode;
@@ -1089,6 +1090,7 @@ BlockTranslation translate_block(const std::uint8_t* code, std::size_t size,
             steps.push_back({insn});
             exit = BlockExit::kJcc;
             target = insn.address + insn.length; // hint only; rip is authoritative
+            alternate = insn.dst.imm;
             break;
         }
 
@@ -1387,6 +1389,8 @@ BlockTranslation translate_block(const std::uint8_t* code, std::size_t size,
 
         out.exit = exit;
         out.target = target;
+        out.alternate = alternate;
+        out.has_alternate = (exit == BlockExit::kJcc);
         out.guest_instruction_count = steps.size();
         out.code = e.bytes();
         out.instruction_count = e.count();
@@ -1449,6 +1453,8 @@ BlockTranslation translate_block(const std::uint8_t* code, std::size_t size,
 
     out.exit = exit;
     out.target = target;
+    out.alternate = alternate;
+    out.has_alternate = (exit == BlockExit::kJcc);
     out.guest_instruction_count = steps.size();
     out.code = e.bytes();
     out.instruction_count = e.count();
@@ -2115,6 +2121,7 @@ BlockTranslation translate_cached_block(const std::uint8_t* code, std::size_t si
     std::size_t next_offset = first.length;
     BlockExit exit = BlockExit::kFallThrough;
     std::uint64_t target = 0;
+    std::uint64_t alternate = 0; // kJcc branch destination, for successor prefetch
 
     while (true) {
         const Opcode op = insn.opcode;
@@ -2140,6 +2147,7 @@ BlockTranslation translate_cached_block(const std::uint8_t* code, std::size_t si
             steps.push_back({insn, 0});
             exit = BlockExit::kJcc;
             target = insn.address + insn.length;
+            alternate = insn.dst.imm;
             break;
         }
 
@@ -3427,6 +3435,8 @@ BlockTranslation translate_cached_block(const std::uint8_t* code, std::size_t si
 
     out.exit = exit;
     out.target = target;
+    out.alternate = alternate;
+    out.has_alternate = (exit == BlockExit::kJcc);
     out.guest_instruction_count = steps.size();
     out.code = e.bytes();
     out.instruction_count = e.count();

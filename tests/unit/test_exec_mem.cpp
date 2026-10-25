@@ -144,6 +144,67 @@ HYPERION_TEST("exec_mem", "runs_generated_loop") {
 #endif
 }
 
+HYPERION_TEST("exec_mem", "arena_write_window_defers_one_mprotect_per_window") {
+    // The write window exists so a batch of blocks costs one protection change
+    // instead of two per block (audit §29.6: those changes are 99.8% of the cost
+    // of publishing a block). This pins the contract the cache relies on: memory
+    // handed out inside a window is not executable until publish().
+    hyperion::ExecArena arena(4096);
+    const std::uint8_t dummy[8] = {0x1F, 0x20, 0x03, 0xD5, 0xC0, 0x03, 0x5F, 0xD6}; // nop; ret
+
+    HYPERION_CHECK_EQ(arena.protection_changes(), std::uint64_t{0});
+
+    arena.begin_write();
+    HYPERION_CHECK(arena.write_window_open());
+    void* a = arena.allocate(dummy, sizeof(dummy));
+    void* b = arena.allocate(dummy, sizeof(dummy));
+    HYPERION_CHECK(a != nullptr && b != nullptr);
+    HYPERION_CHECK(a != b);
+    HYPERION_CHECK_EQ(arena.protection_changes(), std::uint64_t{0}); // still writable
+    arena.publish();
+    HYPERION_CHECK(!arena.write_window_open());
+    HYPERION_CHECK_EQ(arena.protection_changes(), std::uint64_t{1}); // one page, one call
+
+    // A published page can never be written again, so the next window lands on a
+    // fresh page and costs exactly one more call - not one per block.
+    arena.begin_write();
+    void* c = arena.allocate(dummy, sizeof(dummy));
+    HYPERION_CHECK(c != nullptr && c != a && c != b);
+    arena.publish();
+    HYPERION_CHECK_EQ(arena.protection_changes(), std::uint64_t{2});
+
+    // An empty window must not cost a syscall.
+    arena.begin_write();
+    arena.publish();
+    HYPERION_CHECK_EQ(arena.protection_changes(), std::uint64_t{2});
+}
+
+#if defined(__aarch64__)
+
+HYPERION_TEST("exec_mem", "arena_published_blocks_are_executable_and_reset_rearms_the_slab") {
+    // W^X is only useful if the published pages actually run: a write window that
+    // forgot to publish would fault here rather than in a guest.
+    hyperion::ExecArena arena(4096);
+    const std::uint8_t write_rax[12] = {0x40, 0x05, 0x80, 0xD2,  // mov x0, #42
+                                        0xC0, 0x03, 0x5F, 0xD6}; // ret
+    using Fn = std::uint64_t (*)();
+    arena.begin_write();
+    auto* a = reinterpret_cast<Fn>(arena.allocate(write_rax, sizeof(write_rax)));
+    arena.publish();
+    HYPERION_CHECK_EQ(a(), std::uint64_t{42});
+
+    // reset() must make the surviving slab writable again, otherwise the reuse
+    // path would write into read-execute memory and take SIGSEGV.
+    const std::uint64_t calls_before = arena.protection_changes();
+    arena.reset();
+    void* b = arena.allocate(write_rax, sizeof(write_rax));
+    HYPERION_CHECK(b != nullptr);
+    HYPERION_CHECK_EQ(reinterpret_cast<Fn>(b)(), std::uint64_t{42});
+    HYPERION_CHECK(arena.protection_changes() > calls_before);
+}
+
+#endif
+
 HYPERION_TEST("exec_mem", "arena_allocates_multiple_wx_blocks_and_reuses_on_reset") {
     hyperion::ExecArena arena(4096);
     const std::uint8_t dummy[8] = {0x1F, 0x20, 0x03, 0xD5, 0xC0, 0x03, 0x5F, 0xD6}; // nop; ret

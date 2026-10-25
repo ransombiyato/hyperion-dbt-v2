@@ -165,6 +165,11 @@ void print_tier1_stats(const hyperion::TranslationCache& cache) {
                 static_cast<unsigned long long>(guest_instructions), cache.total_code_bytes());
     std::printf("tier 1: dispatch %llu hit(s) / %llu miss(es)\n",
                 static_cast<unsigned long long>(hits), static_cast<unsigned long long>(misses));
+    // One publish covers every block in a write window, so this is per window,
+    // not per block: it is the number that shows the W^X cost (audit §29.6).
+    std::printf("tier 1: %llu mprotect call(s) for %zu block(s), %zu translated ahead\n",
+                static_cast<unsigned long long>(cache.protection_changes()), blocks,
+                cache.prefetched_blocks());
     if (blocks != 0) {
         const std::uint64_t ns = cache.translation_ns();
         std::printf("tier 1: translation %.3f ms wall (%.1f ns per translated guest "

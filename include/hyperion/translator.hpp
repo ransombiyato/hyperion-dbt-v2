@@ -58,7 +58,15 @@ struct BlockTranslation {
     std::size_t guest_instruction_count = 0; // guest instructions covered
 
     BlockExit exit = BlockExit::kFallThrough;
+    // For kJcc/kSyscall/kFallThrough this is the *fall-through* PC (for kJcc a
+    // hint only: rip is authoritative at run time). For kJmp it is the jump
+    // destination.
     std::uint64_t target = 0;
+    // kJcc only: the branch destination, i.e. the other possible successor.
+    // Carried so the cache can translate both sides of a conditional into one
+    // write window instead of publishing one block at a time (audit §29.6).
+    std::uint64_t alternate = 0;
+    bool has_alternate = false;
 
     bool ok() const { return error == TranslateError::kNone; }
 };

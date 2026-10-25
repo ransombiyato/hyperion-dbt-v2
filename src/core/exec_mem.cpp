@@ -148,9 +148,40 @@ void ExecArena::reset() noexcept {
         }
     }
     if (slab_count_ > 0) {
-        slabs_[0].used = 0;
+        Slab& first = slabs_[0];
+        const bool was_executable = first.published != 0;
+        if (was_executable && ::mprotect(first.base, first.capacity, PROT_READ | PROT_WRITE) != 0) {
+            // Slab 0 survives reset(), but publishing left it read-execute and it
+            // has to be writable again before it can be reused. If that fails the
+            // slab is unusable: drop it rather than hand out memory that will
+            // fault on the next write. reset() is noexcept, so there is no throw
+            // here; the next allocate() simply maps a fresh slab.
+            ::munmap(first.base, first.capacity);
+            slabs_[0] = Slab{};
+            slab_count_ = 0;
+            dirty_ = false;
+            window_open_ = false;
+            return;
+        }
+        if (was_executable) {
+            ++protection_changes_;
+        }
+        first.used = 0;
+        first.published = 0;
         slab_count_ = 1;
     }
+    dirty_ = false;
+    window_open_ = false;
+}
+
+void ExecArena::resize_slabs(std::size_t next_cap) {
+    auto* grown = new Slab[next_cap];
+    for (std::size_t i = 0; i < slab_count_; ++i) {
+        grown[i] = slabs_[i];
+    }
+    delete[] slabs_;
+    slabs_ = grown;
+    slab_cap_ = next_cap;
 }
 
 void* ExecArena::allocate(const std::uint8_t* code, std::size_t size) {
@@ -160,9 +191,15 @@ void* ExecArena::allocate(const std::uint8_t* code, std::size_t size) {
     const std::size_t aligned_size = round_up(size, 16);
     const std::size_t ps = page_size();
 
+    // A published page is read-execute, so it can never be written again: move
+    // the cursor past it. Anything left in the tail is wasted, which is why the
+    // caller should have filled the window before publishing.
     Slab* target = nullptr;
     if (slab_count_ > 0) {
         Slab& cur = slabs_[slab_count_ - 1];
+        if (cur.used < cur.published) {
+            cur.used = cur.published;
+        }
         if (aligned_size <= cur.capacity - cur.used) {
             target = &cur;
         }
@@ -171,51 +208,57 @@ void* ExecArena::allocate(const std::uint8_t* code, std::size_t size) {
     if (target == nullptr) {
         const std::size_t cap =
             round_up(aligned_size > slab_bytes_ ? aligned_size : slab_bytes_, ps);
-        void* p = ::mmap(nullptr, cap, PROT_READ | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        // Created writable and non-executable. publish() adds PROT_EXEC; no page
+        // is ever writable and executable at the same time.
+        void* p = ::mmap(nullptr, cap, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (p == MAP_FAILED) {
-            // Systems with strict PaX/SELinux policies allow RW -> RX via mprotect.
-            p = ::mmap(nullptr, cap, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-            if (p == MAP_FAILED) {
-                throw std::runtime_error("ExecArena: mmap failed");
-            }
-            if (::mprotect(p, cap, PROT_READ | PROT_EXEC) != 0) {
-                ::munmap(p, cap);
-                throw std::runtime_error("ExecArena: mprotect(RX) failed");
-            }
+            throw std::runtime_error("ExecArena: mmap failed");
         }
         if (slab_count_ == slab_cap_) {
-            const std::size_t next_cap = slab_cap_ == 0 ? 4 : slab_cap_ * 2;
-            auto* grown = new Slab[next_cap];
-            for (std::size_t i = 0; i < slab_count_; ++i) {
-                grown[i] = slabs_[i];
-            }
-            delete[] slabs_;
-            slabs_ = grown;
-            slab_cap_ = next_cap;
+            resize_slabs(slab_cap_ == 0 ? 4 : slab_cap_ * 2);
         }
-        slabs_[slab_count_] = Slab{static_cast<std::uint8_t*>(p), cap, 0};
+        slabs_[slab_count_] = Slab{static_cast<std::uint8_t*>(p), cap, 0, 0};
         target = &slabs_[slab_count_++];
     }
 
-    const std::size_t start_off = target->used;
-    const std::size_t end_off = start_off + aligned_size;
-    const std::size_t page_lo = (start_off / ps) * ps;
-    const std::size_t page_hi = round_up(end_off, ps);
-    const std::size_t span = page_hi - page_lo;
-
-    // Enforce strict W^X: toggle touched page(s) RW while copying, then RX.
-    if (::mprotect(target->base + page_lo, span, PROT_READ | PROT_WRITE) != 0) {
-        throw std::runtime_error("ExecArena: mprotect(RW) failed");
-    }
-    std::uint8_t* dst = target->base + start_off;
+    std::uint8_t* dst = target->base + target->used;
     std::memcpy(dst, code, size);
-    if (::mprotect(target->base + page_lo, span, PROT_READ | PROT_EXEC) != 0) {
-        throw std::runtime_error("ExecArena: mprotect(RX) failed");
+    target->used += aligned_size;
+    dirty_ = true;
+
+    if (!window_open_) {
+        publish();
     }
-    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
-    __builtin___clear_cache(reinterpret_cast<char*>(dst), reinterpret_cast<char*>(dst + size));
-    target->used = end_off;
     return dst;
+}
+
+void ExecArena::publish() {
+    if (!dirty_) {
+        window_open_ = false;
+        return;
+    }
+    const std::size_t ps = page_size();
+    for (std::size_t i = 0; i < slab_count_; ++i) {
+        Slab& slab = slabs_[i];
+        if (slab.used <= slab.published) {
+            continue;
+        }
+        const std::size_t hi = round_up(slab.used, ps);
+        const std::size_t span = hi - slab.published;
+        std::uint8_t* page = slab.base + slab.published;
+        if (::mprotect(page, span, PROT_READ | PROT_EXEC) != 0) {
+            throw std::runtime_error("ExecArena: mprotect(RX) failed");
+        }
+        ++protection_changes_;
+        // Only the bytes actually written need I-cache maintenance, but the
+        // whole published span is cheap to cover and a missed range is a very
+        // confusing stale-code bug on AArch64.
+        __builtin___clear_cache(reinterpret_cast<char*>(page),
+                                reinterpret_cast<char*>(page + span));
+        slab.published = hi;
+    }
+    dirty_ = false;
+    window_open_ = false;
 }
 
 } // namespace hyperion
