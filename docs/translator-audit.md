@@ -2137,6 +2137,72 @@ remaining flags are ~4 %). The work is not rejected — it is sequenced: it beco
 moment either a native-AArch64 measurement rig with ≤1 % noise exists, or stage 2 can be justified
 by a specific pass whose own measurement clears the bar.
 
+### 29.19 P5 re-validated on current main (option A), with the abort/regression case found
+
+P5 shipped in `b0583e8` (§29.6): one write window per dispatcher miss, the entry block's
+guessed successors translated inside it, one `publish()` for the window, links patched while
+the page is still writable. It has now been re-measured on top of P6 (hot-block gating) and
+P10 (call linking), because both change which blocks get translated and when.
+
+#### Counters — P5 on vs off, same binary, same guests
+
+A/B build differs by exactly one `getenv` early-return in `prefetch_successors` (temporary,
+never committed). Guests are the repository's own x86-64 workloads (`benchmarks/workloads/`,
+static, `-O2`), run through the AArch64 JIT under `qemu-aarch64-static`.
+
+| guest | blocks (on / off) | `mprotect` calls (on / off) | per block on | per block off | **reduction** |
+| --- | --- | --- | --- | --- | --- |
+| `sieve` | 588 / 374 | **173** / 374 | 0.294 | 1.00 | 6.5× vs pre-P5 2.00 |
+| `nqueens` | 525 / 355 | **163** / 355 | 0.310 | 1.00 | 6.9× |
+| `quicksort_c` | 631 / 411 | **194** / 411 | 0.307 | 1.00 | 6.9× |
+| `qsort_glibc` | 653 / 413 | **196** / 413 | 0.300 | 1.00 | 6.9× |
+
+("off" is 1.0 rather than the historical 2.0 per block because the write-window plumbing
+remains; switching only the speculation off returns to one publish per block, i.e. half of the
+original two `mprotect`s. The pre-P5 figure of 2.00 — one RW, one RX per `allocate()` — is the
+one in §29.6 and is what these rows are compared against.)
+
+Secondary effect, and a larger one than expected: **linked exits rise by 5.8×** (sieve 100 → 576,
+nqueens 92 → 516, quicksort_c 114 → 623, qsort_glibc 111 → 639). A successor that is translated
+inside its predecessor's window can be linked immediately, because §29.7's patch is only legal
+while the source page is still writable — the speculation is what makes direct linking succeed on
+the first attempt instead of after a second window.
+
+Cost side: 57 % more blocks exist than are executed for these guests (588 vs 374 on sieve), all
+inside the 16-block / 3584-byte budget.
+
+#### Wall clock — interleaved pairs, 14 samples each after discarding the first
+
+| guest | P5 off (median / min / IQR) | P5 on (median / min / IQR) | on/off | paired-ratio median |
+| --- | --- | --- | --- | --- |
+| `sieve` | 280.2 / 268.5 / 270–307 ms | 288.5 / 265.1 / 271–332 ms | **1.029** | 1.021 |
+| `nqueens` | 517.7 / 485.6 / 494–535 ms | **415.9** / 373.7 / 382–431 ms | 0.803 | 0.784 |
+| `quicksort_c` | 377.6 / 355.9 / 366–395 ms | **305.9** / 298.9 / 303–319 ms | 0.810 | 0.817 |
+| `qsort_glibc` | 492.7 / 467.3 / 477–505 ms | **441.9** / 425.6 / 431–455 ms | 0.897 | 0.895 |
+
+So the write window is worth **10–20 % of whole-process wall clock** on three of the four
+workloads, and `sieve` is ~3 % *slower* — with overlapping IQRs, so "no significant change" is
+defensible, but the median consistently leans the wrong way and that is reported rather than
+smoothed away. The likely cause is visible in the counters: sieve's blocks are few and long,
+so the 214 extra speculative blocks buy fewer protection changes per unit of useful code than on
+the branchy guests. A per-workload prefetch budget guess is exactly the kind of tuning that needs
+a measurement rig with better resolution than this one, so it is left alone deliberately rather
+than fitted to four data points.
+
+#### Verification on current main
+
+* targeted: `exec_mem.*` 9/9 (including `arena_write_window_defers_one_mprotect_per_window`,
+  `arena_patches_code_inside_a_window_and_refuses_it_afterwards`,
+  `arena_published_blocks_are_executable_and_reset_rearms_the_slab`) and `translation_cache.*`
+  27/27 under qemu
+* full native: 353 passed / 0 failed / 47 skipped of 400; `ctest` 19/19
+* full AArch64: 400 passed / 0 failed / 5 skipped of 405
+* generated-code counters unchanged from §29.12/§29.13 for the same guests; no test assertion
+  needed updating, because P5 was landed with its exact counts already pinned
+
+W^X is unchanged: a page is never writable and executable at the same time, and no alias mapping
+exists (option C stays rejected).
+
 ### 29.9 Still open from §L
 
 Items 1-5 of §L are all resolved (1 justified and pinned, 2 and 5 implemented, 3 retracted as wrong,
