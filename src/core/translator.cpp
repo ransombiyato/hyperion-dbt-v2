@@ -1686,6 +1686,20 @@ constexpr a64::Reg kSavedState = 27;       // GuestState* (callee-saved mirror o
 constexpr a64::Reg kCtxReg = 28;           // ExecContext* (callee-saved)
 constexpr std::size_t kCachedMaxAlloc = 5; // x19..x23
 
+// Canonical guest-register allocation for cached blocks: every block uses
+// this fixed guest->host mapping (x19..x23, in order), so values in these
+// registers are already in place when control passes between blocks inside
+// the JIT - linked and dispatched exits neither spill nor reload them.
+// GuestState remains authoritative at every point C++ can observe: the
+// entry trampoline loads the set once per JIT entry, and every path back
+// to C++ (halt/syscall/fault spills, helper boundaries, the dispatcher-miss
+// path and the budget-exhaustion stub) stores it first. The set is the one
+// measured worth carrying in docs/translator-audit.md §29.27; it must
+// include RSP, without which stack-heavy hot code regresses.
+constexpr Gpr kCanonicalGprs[] = {Gpr::kRax, Gpr::kRcx, Gpr::kRdx, Gpr::kRsp, Gpr::kRsi};
+constexpr std::size_t kCanonicalCount = sizeof(kCanonicalGprs) / sizeof(kCanonicalGprs[0]);
+static_assert(kCanonicalCount <= kCachedMaxAlloc);
+
 constexpr unsigned kFsBaseOffset = offsetof(GuestState, fs_base);
 static_assert(kFsBaseOffset % 8 == 0 && kFsBaseOffset < 4096);
 
@@ -2347,8 +2361,15 @@ JitTrampolines build_jit_trampolines() {
         e.stp_off(23, 24, a64::kSp, 48);
         e.stp_off(25, 26, a64::kSp, 64);
         e.stp_off(27, 28, a64::kSp, 80);
-        e.mov_reg(a64::Width::k64, kState, 0);       // x8 = GuestState*
-        e.mov_reg(a64::Width::k64, kSavedState, 0);  // x27 = GuestState*
+        e.mov_reg(a64::Width::k64, kState, 0);      // x8 = GuestState*
+        e.mov_reg(a64::Width::k64, kSavedState, 0); // x27 = GuestState*
+        // Load the canonical guest registers (see kCanonicalGprs): from
+        // here until the exit epilogue they live in x19..x23, and
+        // GuestState is only a backing store C++ funnels synchronise.
+        for (std::size_t i = 0; i < kCanonicalCount; ++i) {
+            e.ldr(a64::Width::k64, static_cast<a64::Reg>(kAllocBase + i), kState,
+                  gpr_offset(kCanonicalGprs[i]));
+        }
         e.mov_reg(a64::Width::k64, kInitBudget, 1);  // x25 = initial budget
         e.mov_reg(a64::Width::k64, kRemBudget, 1);   // x26 = remaining budget
         e.mov_reg(a64::Width::k64, kCtxReg, 2);      // x28 = ExecContext*
@@ -2374,6 +2395,13 @@ JitTrampolines build_jit_trampolines() {
         e.br(kT3);
 
         e.bind(miss);
+        // A miss returns to C++ through the exit epilogue, so the canonical
+        // registers must reach GuestState here; on a hit they stay live in
+        // x19..x23 across the transition (see kCanonicalGprs).
+        for (std::size_t i = 0; i < kCanonicalCount; ++i) {
+            e.str(a64::Width::k64, static_cast<a64::Reg>(kAllocBase + i), kState,
+                  gpr_offset(kCanonicalGprs[i]));
+        }
         e.movz(a64::Width::k64, 0, 0); // x0 = BlockResult::kOk
         e.ldr(a64::Width::k64, kA, kCtxReg, offsetof(ExecContext, jit_exit_epilogue));
         e.br(kA);
@@ -2482,33 +2510,15 @@ BlockTranslation translate_cached_block(const std::uint8_t* code, std::size_t si
         next_offset += insn.length;
     }
 
-    // Pass 1.5: per-block register allocation into callee-saved `x19..x23`.
-    // Because `enter_jit` already saved `x19..x23` once on stack frame entry,
-    // allocating a guest register inside a cached block costs ONLY `2` words
-    // (`1 ldr` at block entry + `1 str` at block exit), never `stp`/`ldp`!
-    std::size_t refs[kGprCount] = {};
-    for (const IrInsn& step : steps) {
-        for (unsigned i = 0; i < kGprCount; ++i) {
-            const auto bit = static_cast<std::uint16_t>(1u << i);
-            refs[i] += static_cast<std::size_t>(((step.facts.gpr_reads & bit) != 0 ? 1u : 0u) +
-                                                ((step.facts.gpr_writes & bit) != 0 ? 1u : 0u));
-        }
-    }
-
+    // Pass 1.5: canonical register allocation (see kCanonicalGprs above).
+    // Because `enter_jit` already saved `x19..x23` once on stack frame
+    // entry, and the mapping is the same in every block, a canonical
+    // register costs no load at block entry and no store at a JIT-internal
+    // block exit - only the C++-funnel synchronisations described above.
     RegAlloc ra;
-    std::vector<unsigned> order;
-    for (unsigned i = 0; i < kGprCount; ++i) {
-        if (refs[i] > 2) { // strictly saves >= 1 word over 1 load + 1 store!
-            order.push_back(i);
-        }
-    }
-    std::sort(order.begin(), order.end(), [&](unsigned a, unsigned b) {
-        return refs[a] != refs[b] ? refs[a] > refs[b] : a < b;
-    });
-    const std::size_t nalloc = std::min(order.size(), kCachedMaxAlloc);
-    for (std::size_t i = 0; i < nalloc; ++i) {
+    for (std::size_t i = 0; i < kCanonicalCount; ++i) {
         const auto h = static_cast<a64::Reg>(kAllocBase + i);
-        ra.host_of_guest[order[i]] = static_cast<std::int8_t>(h);
+        ra.host_of_guest[static_cast<unsigned>(kCanonicalGprs[i])] = static_cast<std::int8_t>(h);
         ra.allocated.push_back(h);
     }
 
@@ -3425,7 +3435,7 @@ BlockTranslation translate_cached_block(const std::uint8_t* code, std::size_t si
         // Entry budget check before first iteration + reload allocated GPRs once!
         e.subs_imm(a64::Width::k64, kRemBudget, kRemBudget, block_insns);
         e.b_cond(a64::Cond::kCc, entry_budget_undo);
-        reload_ra();
+        // No register reload: the canonical set is already live.
 
         constexpr a64::Reg kLoopA = 2;
         constexpr a64::Reg kLoopB = 3;
@@ -3592,13 +3602,14 @@ BlockTranslation translate_cached_block(const std::uint8_t* code, std::size_t si
             }
             emit_pf_af_store(e, exit_mask, R, kT2);
         }
-        spill_ra();
+        // No spill: this exit stays inside the JIT (see kCanonicalGprs).
         e.br(kDispatchReg); // chain directly into post-loop block!
     } else {
-        // Standard multi-block chained execution:
+        // Standard multi-block chained execution. No register reload on
+        // entry: the canonical set is live from the previous block (or from
+        // the entry trampoline on the first block).
         e.subs_imm(a64::Width::k64, kRemBudget, kRemBudget, block_insns);
         e.b_cond(a64::Cond::kCc, entry_budget_undo);
-        reload_ra();
 
         for (std::size_t idx = 0; idx < steps.size(); ++idx) {
             const IrInsn& step = steps[idx];
@@ -3626,17 +3637,16 @@ BlockTranslation translate_cached_block(const std::uint8_t* code, std::size_t si
                 break;
             }
             if (op == Opcode::kJmp) {
+                // No spill on any of these paths: the exit stays inside
+                // the JIT and the canonical set carries over.
                 if (step.insn.dst.kind == OperandKind::kImmediate) {
-                    spill_ra();
                     e.mov_imm64(kA, step.insn.dst.imm);
                 } else if (step.insn.dst.kind == OperandKind::kRegister) {
                     load_gpr_rb(e, &ra, step.insn.dst.reg, kA);
-                    spill_ra();
                 } else {
                     const a64::Label flbl = make_fault_label(idx);
                     emit_effective_address_jit(e, ra, step.insn.dst.mem, next_rip, kB, kT0);
                     emit_inline_tlb_read(e, kB, kA, 8, flbl, read_stubs);
-                    spill_ra();
                 }
                 if (step.insn.dst.kind == OperandKind::kImmediate) {
                     // Record the site before the branch word: the cache may
@@ -3674,7 +3684,7 @@ BlockTranslation translate_cached_block(const std::uint8_t* code, std::size_t si
                 load_gpr_rb(e, &ra, Gpr::kRsp, kB);
                 e.sub_imm(a64::Width::k64, kB, kB, 8);
                 store_gpr_rb(e, &ra, kB, Gpr::kRsp);
-                spill_ra();
+                // No spill: the call stays inside the JIT.
                 e.ldr(a64::Width::k64, kA, a64::kSp, kScratchSlot1);
                 // P10: a `call`'s destination, when it is an immediate, is a
                 // statically known block start, so the exit is linkable exactly
@@ -3710,7 +3720,7 @@ BlockTranslation translate_cached_block(const std::uint8_t* code, std::size_t si
                     e.add(a64::Width::k64, kB, kB, kT0);
                 }
                 store_gpr_rb(e, &ra, kB, Gpr::kRsp);
-                spill_ra();
+                // No spill: the return stays inside the JIT.
                 e.br(kDispatchReg); // `kA` holds `ret_addr` -> jump straight to caller!
 
                 e.bind(top_halt);
@@ -3723,11 +3733,11 @@ BlockTranslation translate_cached_block(const std::uint8_t* code, std::size_t si
                 break;
             }
             if (op == Opcode::kJcc) {
-                // `spill_ra()` only emits `STR`, which preserves hardware `NZCV`!
                 // Using `CSEL` instead of an internal `B.cond` keeps every guest block a
                 // single straight-line AArch64 basic block (zero internal host branches!)
                 // while saving 2–3 words per conditional exit.
-                spill_ra();
+                // No spill on this exit either: both successors are inside
+                // the JIT and inherit the canonical set as-is.
                 const std::uint64_t taken_pc = step.insn.dst.imm;
                 a64::Cond fused = a64::Cond::kAl;
                 bool prev_fusible = false;
@@ -3781,7 +3791,7 @@ BlockTranslation translate_cached_block(const std::uint8_t* code, std::size_t si
         }
 
         if (exit == BlockExit::kFallThrough) {
-            spill_ra();
+            // No spill: JIT-internal exit, canonical set carries over.
             e.mov_imm64(kA, target);
             e.str(a64::Width::k64, kA, kState, kRipOffset);
             if (out.exit_links.size() < kMaxExitLinks) {
@@ -3796,6 +3806,10 @@ BlockTranslation translate_cached_block(const std::uint8_t* code, std::size_t si
     // 1. Entry budget exhaustion (`x26` underflowed before touching any guest state)
     e.bind(entry_budget_undo);
     e.add_imm(a64::Width::k64, kRemBudget, kRemBudget, block_insns);
+    // This path reaches the C++ exit epilogue (via x29) without passing a
+    // block exit, so the canonical values - live from the previous block -
+    // must be stored here or C++ would observe a stale GuestState.
+    spill_ra();
     e.br(29);
 
     // 2. Out-of-line SoftTlb read misses

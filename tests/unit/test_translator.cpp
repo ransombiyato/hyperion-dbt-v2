@@ -524,6 +524,75 @@ HYPERION_TEST("translator", "dispatcher_step_limit") {
     HYPERION_CHECK_EQ(r.steps, std::uint64_t{1000});
 }
 
+HYPERION_TEST("translator", "canonical_values_cross_block_boundaries") {
+    // Canonical-allocation regression (audit §29.27): values held in the
+    // canonical registers (rax/rcx/rdx/rsp/rsi in x19..x23) must flow across
+    // block boundaries - here a `jmp` to a second block, a call/ret pair,
+    // and push/pop through the canonical RSP - without a GuestState
+    // round-trip, and the final architectural state must match tier 0.
+    const std::vector<std::uint8_t> program = {
+        0x48, 0xC7, 0xC0, 0x05, 0x00, 0x00, 0x00, // [0..6]   mov rax, 5
+        0x48, 0xC7, 0xC6, 0x07, 0x00, 0x00, 0x00, // [7..13]  mov rsi, 7
+        0xEB, 0x07,                               // [14..15] jmp +7 -> [23]
+        0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, // [16..22] never executed
+        0x48, 0x01, 0xF0,                         // [23..25] add rax, rsi
+        0x50,                                     // [26]     push rax
+        0x59,                                     // [27]     pop rcx
+        0xE8, 0x03, 0x00, 0x00, 0x00,             // [28..32] call +3 -> [36]
+        0xF4,                                     // [33]     hlt
+        0x90, 0x90,                               // [34..35] never executed
+        0x48, 0x83, 0xC2, 0x2A,                   // [36..39] add rdx, 42
+        0xC3,                                     // [40]     ret
+    };
+    GuestState initial;
+    initial.rip = kBase;
+    initial.reg(Gpr::kRsp) = kBase + 2048;
+    check_program_matches(program, initial);
+}
+
+HYPERION_TEST("translator", "canonical_state_synced_on_budget_exit") {
+    // When the step budget runs out at a block boundary, the JIT returns
+    // through the budget-exhaustion stub; the canonical registers (dirty
+    // from the block that just ran) must already be in GuestState, so the
+    // state C++ observes equals the interpreter's after the same steps.
+    const std::vector<std::uint8_t> program = {
+        0x48, 0xB8, 0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, // mov rax, imm64
+        0x48, 0xC7, 0xC6, 0x03, 0x00, 0x00, 0x00,                   // mov rsi, 3
+        0xEB, 0x07,                                                 // jmp +7 -> [26]
+        0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,                   // never executed
+        0x48, 0x01, 0xF0,                                           // add rax, rsi
+        0x50,                                                       // push rax
+        0x59,                                                       // pop rcx
+        0xF4,                                                       // hlt
+    };
+    GuestState initial;
+    initial.rip = kBase;
+    initial.reg(Gpr::kRsp) = kBase + 2048;
+
+    // The first block is exactly 3 instructions (mov/mov/jmp): after it,
+    // the budget is exhausted and tier 1 must stop with synced state.
+    FlatMemory interp_mem(kBase, 4096);
+    std::memcpy(interp_mem.data(), program.data(), program.size());
+    const hyperion::RunResult expected = hyperion::run_program(interp_mem, initial, 3);
+
+    FlatMemory tier1_mem(kBase, 4096);
+    std::memcpy(tier1_mem.data(), program.data(), program.size());
+    hyperion::TranslationCache cache;
+    cache.set_hot_threshold(0); // compile on first reach; determinism, not gating, is on test
+    const hyperion::RunResult actual = cache.run(tier1_mem, initial, 3);
+
+    HYPERION_CHECK_EQ(static_cast<int>(actual.status),
+                      static_cast<int>(hyperion::RunStatus::kStepLimit));
+    HYPERION_CHECK_EQ(actual.steps, std::uint64_t{3});
+    for (std::size_t i = 0; i < hyperion::kGprCount; ++i) {
+        HYPERION_CHECK_EQ(actual.state.gpr[i], expected.state.gpr[i]);
+    }
+    HYPERION_CHECK_EQ(actual.state.rip, expected.state.rip);
+    HYPERION_CHECK(actual.state.flags == expected.state.flags);
+    HYPERION_CHECK_EQ(actual.state.reg(Gpr::kRax), std::uint64_t{0x1122334455667788ULL});
+    HYPERION_CHECK_EQ(actual.state.reg(Gpr::kRsi), std::uint64_t{3});
+}
+
 HYPERION_TEST("translator", "translated_code_size_is_bounded") {
     // A deterministic translation-quality guard. Timing under qemu-user is
     // noisy (IQR several percent), so a regression in the emitted code size
@@ -557,18 +626,20 @@ HYPERION_TEST("translator", "translated_code_size_is_bounded") {
     // lies inside the entry block's byte range.
     HYPERION_CHECK_EQ(cache.block_count(), std::size_t{3});
     const std::size_t words = cache.total_code_bytes() / 4;
-    // Exact count at the time of writing is 88 words (352 bytes). Guest-register
-    // allocation (4.2.6) takes the halt block's prologue+epilogue but removes
-    // enough load/store traffic to net −3 words; the correctness fix that writes
-    // rip on a halt (4.2.7) adds 3 words back, landing on the same 88 recorded
-    // in 4.2.5 by coincidence. The profitability guard in pass 1.5 is what keeps
-    // allocation from regressing small blocks (see BENCHMARKS.md 4.2.6).
+    // Exact count at the time of writing is 89 words (356 bytes). History:
+    // 4.2.5 recorded 88; guest-register allocation (4.2.6) netted −3 and the
+    // halt rip-write fix (4.2.7) added 3 back. Canonical cross-block
+    // allocation (audit §29.27) lands at 89: it removes every per-block
+    // entry load and JIT-internal exit store, paying the entry-trampoline
+    // loads, the dispatcher-miss stores, and a 5-word canonical spill in
+    // each block's budget-exhaustion stub instead. Whole programs grow
+    // ~8–9 % in static size (see BENCHMARKS.md); the win is dynamic.
     // The guard is an upper bound so a *reduction* is allowed but any growth
     // fails CI; a code-size regression is otherwise easy to miss under qemu-user
     // timing noise. Update the bound deliberately when the count legitimately
     // changes, and record the exact figure in BENCHMARKS.md.
     HYPERION_CHECK_EQ(cache.total_code_bytes() % 4, std::size_t{0});
-    HYPERION_CHECK(words > 0 && words <= 88);
+    HYPERION_CHECK(words > 0 && words <= 89);
 }
 
 HYPERION_TEST("translator", "alu_immediate_is_folded") {
@@ -1004,6 +1075,14 @@ HYPERION_TEST("translator", "dispatcher_stops_at_unsupported") {
 }
 
 HYPERION_TEST("translator", "dispatcher_step_limit") {
+    HYPERION_SKIP("generated code is AArch64; requires an AArch64 host to run");
+}
+
+HYPERION_TEST("translator", "canonical_values_cross_block_boundaries") {
+    HYPERION_SKIP("generated code is AArch64; requires an AArch64 host to run");
+}
+
+HYPERION_TEST("translator", "canonical_state_synced_on_budget_exit") {
     HYPERION_SKIP("generated code is AArch64; requires an AArch64 host to run");
 }
 
