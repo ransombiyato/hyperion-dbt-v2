@@ -2658,6 +2658,7 @@ guests, `hyperion_translate_bench`), or a real AArch64 measurement host.
 | clang 19 strict (`HYPERION_WARNINGS_AS_ERRORS=ON`) | builds clean, 370 passed / 0 failed |
 | guest stdout vs native x86 execution | identical for all four guests |
 | `--timing` step counts | identical to baseline for all four guests |
+| GitHub Actions, all three pushes (`24f6477`, `9ee9cff`, `e393f0a`) | 7/7 checks green: build & test (gcc), build & test (clang), ASan/UBSan, AArch64 cross tests under qemu-user, clang-format, Android syscall policy paths, syscall inventory & shellcheck |
 
 Known platform limitation, unchanged and unrelated to this work: the three
 `*.rejects_single_sample` bench tests in `benchmarks/CMakeLists.txt` exec the benchmark binaries
