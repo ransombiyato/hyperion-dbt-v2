@@ -51,6 +51,87 @@ enum class BlockExit : std::uint8_t {
 
 const char* to_string(BlockExit exit);
 
+// --- P14 stage 1: per-instruction facts --------------------------------------
+//
+// Translate-time analysis of one decoded guest instruction, computed **once** per
+// instruction and consumed by every later pass (register allocation, flag
+// liveness, and any future optimisation pass) instead of each pass re-deriving
+// the same switches. `compute_ir_facts()` is a pure function of the decoded
+// `Instruction`: it reads no machine state, allocates nothing, and cannot fault.
+//
+// Validity and invalidation
+// -------------------------
+// The facts describe what the *guest* instruction does, not what the emitter
+// chooses to emit, so they stay valid for the whole lifetime of the decoded
+// `Instruction` they came from and need no invalidation inside a block:
+//
+//  * they are recomputed whenever the block is re-decoded, which is the only
+//    way the instruction can change (the translator decodes a fresh window on
+//    every miss, and code invalidation drops the whole block);
+//  * they never outlive the block: nothing caches them across blocks, so a
+//    self-modifying-code epoch bump cannot leave a stale fact behind;
+//  * `flags_written` is a *superset* view and `flags_killed` the subset that is
+//    definitely overwritten (`flags_written == flags_killed` for every opcode
+//    today, but the two are kept apart because INC/DEC already differ from the
+//    rest and a future pass must not assume equality);
+//  * `live_flags` (which of the written flags are actually observed) is *not* a
+//    fact: it depends on the whole block and is filled in by the liveness pass
+//    from these per-instruction facts.
+//
+// What is deliberately NOT here: memory ordering, fault points, TLB checks and
+// value ranges. Those stay in emission, because an IR pass must never be able to
+// reorder or elide a guest load/store across a fault point (audit §29.18).
+// Flag bits used by `IrFacts`, numbered the same way as the pending PF/AF
+// descriptor in `GuestState` (bit 0 CF, 1 PF, 2 AF, 3 ZF, 4 SF, 5 OF) so one
+// value can be used for both.
+namespace ir_flags {
+inline constexpr std::uint8_t kCf = 1u << 0;
+inline constexpr std::uint8_t kPf = 1u << 1;
+inline constexpr std::uint8_t kAf = 1u << 2;
+inline constexpr std::uint8_t kZf = 1u << 3;
+inline constexpr std::uint8_t kSf = 1u << 4;
+inline constexpr std::uint8_t kOf = 1u << 5;
+inline constexpr std::uint8_t kAll = 0x3F;
+} // namespace ir_flags
+
+struct IrFacts {
+    // Flags this instruction reads (Jcc/Setcc/Cmovcc conditions, ADC/SBB carry-in,
+    // variable shifts that pass flags through on a zero count).
+    std::uint8_t flags_read = 0;
+    // Flags this instruction overwrites, whether or not anything later reads them.
+    std::uint8_t flags_written = 0;
+    // Flags this instruction unconditionally overwrites (INC/DEC leave CF alone,
+    // MUL/IMUL only write CF and OF, ...). `flags_written` is derived from it.
+    std::uint8_t flags_killed = 0;
+    // Bit i set = Gpr(i) is read / written by this instruction. A write means the
+    // architectural value changes; for partial-register writes the whole 64-bit
+    // register is marked because the emitter writes it as a whole.
+    std::uint16_t gpr_reads = 0;
+    std::uint16_t gpr_writes = 0;
+    // Guest memory touched (including the implicit push/pop/call/ret accesses and
+    // string operations). A pass may not reorder or elide across these.
+    bool reads_memory = false;
+    bool writes_memory = false;
+    // Control flow ends the block here (Jmp/Jcc/Call/Ret/Hlt/Syscall).
+    bool is_terminator = false;
+    // Guest instructions retired by executing this instruction (always 1 today;
+    // named so the budget accounting reads as "sum of step weights" rather than
+    // "number of vector elements").
+    std::uint8_t step_weight = 1;
+};
+
+// One instruction of a decoded block plus its facts. `live_flags` is filled in by
+// the block's backward flag-liveness pass.
+struct IrInsn {
+    Instruction insn{};
+    IrFacts facts{};
+    std::uint8_t live_flags = 0;
+};
+
+// Compute the facts above for one decoded instruction. Pure and total: every
+// opcode, including ones the emitter later rejects, produces a consistent set.
+IrFacts compute_ir_facts(const Instruction& insn);
+
 // An exit site that always jumps to one statically known successor: the byte
 // offset of a word emitted as `br x24` (the shared dispatcher) plus the guest PC
 // it jumps to. The cache repoints such a word at the successor's entry once that

@@ -2336,6 +2336,119 @@ Consequences, recorded rather than acted on:
   pass that sees a block as a whole and rewrites the moves away — block-level copy propagation,
   which is a P14 stage-2 pass (§29.18), not a tuning constant.
 
+### 29.23 P14 stage 1 implemented — a facts pass that provably changes no output
+
+§29.18 defined stage 1 as "the decoded instruction plus, computed *once*, the facts every later
+pass needs", with the acceptance criterion *generated code byte-for-byte identical*. Both are now
+in place on `main`.
+
+#### What exists
+
+`include/hyperion/translator.hpp` carries the whole public surface:
+
+```cpp
+struct IrFacts {
+    std::uint8_t  flags_read, flags_written, flags_killed;   // ir_flags::{kCf,kPf,kAf,kZf,kSf,kOf}
+    std::uint16_t gpr_reads, gpr_writes;                     // bit i == Gpr(i)
+    bool          reads_memory, writes_memory;
+    bool          is_terminator;
+    std::uint8_t  step_weight;                               // retired instructions, always 1
+};
+struct IrInsn { Instruction insn; IrFacts facts; std::uint8_t live_flags; };
+IrFacts compute_ir_facts(const Instruction&);
+```
+
+`compute_ir_facts` is a pure function of the decoded `Instruction` alone. Inside
+`src/core/translator.cpp` the same computation lives in `compute_facts` in the file's anonymous
+namespace, because it must call the existing flag/register helpers
+(`flags_read_full`, `flags_written_full`, `flags_killed_full`, `regs_read_write_full`) directly;
+the exported wrapper simply forwards. `translate_cached_block`'s `std::vector<Step>` became
+`std::vector<IrInsn>` and pass 1 now fills `facts` as it decodes, so pass 1.5 (register
+allocation) and pass 2 (flag liveness) read fields instead of calling the helpers again. No helper
+was rewritten, no predicate was changed, no emission site was touched — which is why the output
+cannot move.
+
+#### Validity and invalidation, stated as rules
+
+The facts describe **one decoded instruction**, not a program point:
+
+* **Validity.** `facts` is valid from the moment pass 1 constructs the `IrInsn` until the
+  instruction is re-decoded. It is a fact about the encoding, so re-decoding the same bytes always
+  yields the same facts (a test pins this).
+* **Invalidation.** Nothing invalidates a fact except replacing the instruction itself. A pass may
+  not "update" `facts` incrementally; if it rewrites `insn` (a later stage that folds an immediate
+  into a displacement, say) it must call `compute_ir_facts` again on the new instruction. The
+  struct carries no state that a *previous* instruction could have contributed, and no pass may
+  add any: an `IrInsn` that depends on its neighbours is no longer block-local.
+* **`flags_killed` vs `flags_written`.** `written` is "the instruction produces a value for this
+  flag"; `killed` is the strictly weaker "any previous value for this flag is dead". They differ
+  for the deferred-PF/AF path (§29.11), where the descriptor stays pending across the instruction;
+  the invariant `killed ⊆ written` is asserted by the unit tests, and a consumer that needs
+  "definitely dead" must use `killed`, never `written`.
+* **`live_flags` is *not* a fact.** It is the pass-2 liveness solution for that index, filled in
+  after pass 1. It is the one field whose value depends on position in the block, so any future
+  stage that inserts, deletes or moves an `IrInsn` must re-run pass 2. Keeping it inside the same
+  struct is a data-layout convenience, not a claim of block-local validity.
+* **Memory facts are conservative by construction.** `reads_memory` is set for any memory operand
+  (an addressing form can always fault), `writes_memory` only for opcodes that really store, and
+  both are forced on where the truth is dynamic — string operations (direction from DF) and the
+  implicit stack traffic of `push`/`pop`/`call`/`ret`/`leave`. A consumer may use `reads_memory`
+  to *prevent* movement; it may never use its absence to justify movement of anything else.
+
+#### The deliberate gap, pinned by a test
+
+`regs_read_write_full` describes *explicit* operands (plus `rsp`/`rbp` where the allocator needs
+them). `mul`, `div`, `idiv`, `cqo`, and the implicit string operands fall through its `default:
+break` and report **no** registers at all. That is pre-existing behaviour, it is safe today
+because those opcodes execute through a helper that reloads `GuestState`, and stage 1 must not
+"fix" it: adding the implicit RAX:RDX pair would change pass-1.5 refcounts and therefore the
+generated code, breaking byte identity. `ir_facts.mul_reports_its_flags_but_not_its_implicit_registers`
+asserts `gpr_reads == gpr_writes == 0` for `mul rbx` so the boundary cannot be forgotten, and any
+future pass that reads the masks must treat those opcodes as opaque.
+
+#### Tests
+
+`tests/unit/test_ir_facts.cpp`, 17 cases: `mov` reg/reg and immediate; byte and word partial
+writes; high-byte aliases (`84 FC`); `cmp`; `inc`/`dec` preserving CF; `mul` (flags and the gap
+above); `adc` consuming CF; the condition-code reads of `je`/`jb`/`jbe`/`seto`; a store versus a
+`cmp`/`test` load; SIB index registers counted as reads; the implicit stack traffic of
+`push`/`pop`/`call`/`ret`/`leave`; terminator classification; conservative `rep movsb` bits;
+purity/reproducibility; `killed ⊆ written`.
+
+#### Byte-identity evidence
+
+Two trees, both built with the *same* temporary instrumented `translation_cache.cpp` that hashes
+every translated block's emitted bytes (an ad-hoc FNV-style digest printed from a destructor when
+`HYPERION_CODE_DIGEST` is set — never committed): `070168d` from `git archive`, and the working
+tree. Guests are static `gcc -O2` binaries, run under `qemu-aarch64-static`. The environment is
+pinned with `env -i PATH=/usr/bin:/bin` because the guest inherits the host environment and static
+glibc's startup takes different paths depending on it — which changes *which* blocks execute at
+all (sieve translates 494 blocks with the ambient environment, 509 under `env -i`).
+
+| guest | blocks | bytes | digest (baseline **and** stage 1, 2 runs each) |
+| --- | --- | --- | --- |
+| sieve | 509 | 179 696 | `ef9e708d80ef5c8a` |
+| nqueens | 425 | 143 232 | `0076e919dff74537` |
+| quicksort_c | 557 | 192 824 | `3f8274d269707116` |
+| qsort_glibc | 581 | 218 908 | `b7957322d9fa1ed3` |
+
+Identical for all four guests, so stage 1 is a pure refactor in the strong sense: the machine code
+is bit-for-bit the same, not merely equivalent.
+
+#### Verification
+
+| configuration | result |
+| --- | --- |
+| native (clang 19, RelWithDebInfo) | 370 passed, 0 failed, 47 skipped (was 353/0/47) |
+| `ctest` native | 19/19 |
+| AArch64 cross, unit tests under `qemu-aarch64-static` | 417 passed, 0 failed, 5 skipped (was 400/0/5) |
+| `cli_smoke` | green on both trees |
+
+Known platform limitation, unchanged: the three `*.rejects_single_sample` bench tests invoke the
+benchmark binaries directly, so in the cross tree they try to execute AArch64 ELF natively and fail
+with a shell syntax error. They are unrelated to this change and fail identically without it; the
+AArch64 gate is the unit-test binary under qemu.
+
 ### 29.9 Still open from §L
 
 Items 1-5 of §L are all resolved (1 justified and pinned, 2 and 5 implemented, 3 retracted as wrong,

@@ -19,6 +19,7 @@ add_executable(hyperion_unit_tests
     unit/test_aarch64_encoder.cpp
     unit/test_exec_mem.cpp
     unit/test_translator.cpp
+    unit/test_ir_facts.cpp
     unit/test_translation_cache.cpp
     unit/test_interpreter.cpp
     unit/test_syscall.cpp

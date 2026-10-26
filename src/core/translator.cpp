@@ -1982,6 +1982,87 @@ void regs_read_write_full(const Instruction& insn, bool reads[kGprCount], bool w
     }
 }
 
+namespace {
+
+// Does this operand form touch guest memory?
+bool operand_is_memory(const Operand& op) {
+    return op.kind == OperandKind::kMemory;
+}
+
+} // namespace
+
+// The facts themselves. In this anonymous namespace so they see the flag and
+// register helpers above directly; the exported `hyperion::compute_ir_facts`
+// wrapper at the end of the file is what other translation units call.
+IrFacts compute_facts(const Instruction& insn) {
+    IrFacts f;
+
+    bool r[kGprCount] = {};
+    bool w[kGprCount] = {};
+    regs_read_write_full(insn, r, w);
+    for (unsigned i = 0; i < kGprCount; ++i) {
+        const auto bit = static_cast<std::uint16_t>(1u << i);
+        if (r[i]) {
+            f.gpr_reads = static_cast<std::uint16_t>(f.gpr_reads | bit);
+        }
+        if (w[i]) {
+            f.gpr_writes = static_cast<std::uint16_t>(f.gpr_writes | bit);
+        }
+    }
+
+    f.flags_read = flags_read_full(insn);
+    f.flags_killed = flags_killed_full(insn);
+    f.flags_written = flags_written_full(insn);
+
+    // Memory effects. Deliberately conservative: any memory operand counts as a
+    // read (an addressing form can always fault on load), and the destination
+    // counts as a write only for opcodes that really store. Where the truth is
+    // subtle (string operations move in the direction of DF, and the implicit
+    // stack accesses of push/pop/call/ret/leave) both bits are set, so a future
+    // pass that consults these can never elide or reorder across them.
+    f.reads_memory = operand_is_memory(insn.dst) || (insn.has_src && operand_is_memory(insn.src));
+    const bool dst_is_written = insn.opcode != Opcode::kCmp && insn.opcode != Opcode::kTest &&
+                                insn.opcode != Opcode::kPush && insn.opcode != Opcode::kJmp &&
+                                insn.opcode != Opcode::kJcc && insn.opcode != Opcode::kCall;
+    f.writes_memory = dst_is_written && operand_is_memory(insn.dst);
+    switch (insn.opcode) {
+    case Opcode::kPush:
+    case Opcode::kCall:
+        f.writes_memory = true; // return address / operand onto the guest stack
+        break;
+    case Opcode::kPop:
+    case Opcode::kRet:
+        f.reads_memory = true; // pop the guest stack
+        break;
+    case Opcode::kLeave:
+        f.reads_memory = true;
+        f.writes_memory = true;
+        break;
+    case Opcode::kStringOp:
+        f.reads_memory = true;
+        f.writes_memory = true; // MOVS/STOS store; CMPS/SCAS only read
+        break;
+    default:
+        break;
+    }
+
+    switch (insn.opcode) {
+    case Opcode::kJmp:
+    case Opcode::kJcc:
+    case Opcode::kCall:
+    case Opcode::kRet:
+    case Opcode::kHlt:
+    case Opcode::kSyscall:
+        f.is_terminator = true;
+        break;
+    default:
+        break;
+    }
+
+    f.step_weight = 1;
+    return f;
+}
+
 void read_gpr_sized_jit(a64::Encoder& e, const RegAlloc& ra, Gpr r, OperandSize sz, bool high_byte,
                         a64::Reg dst) {
     load_gpr_rb(e, &ra, r, dst);
@@ -2246,6 +2327,12 @@ bool is_classic_fast_alu(const Instruction& insn) {
 
 } // namespace
 
+// Exported wrapper: tests and other translation units ask for the facts without
+// seeing the flag/register helper predicates they are derived from.
+IrFacts compute_ir_facts(const Instruction& insn) {
+    return compute_facts(insn);
+}
+
 JitTrampolines build_jit_trampolines() {
     JitTrampolines out;
 
@@ -2338,11 +2425,10 @@ BlockTranslation translate_cached_block(const std::uint8_t* code, std::size_t si
     const PfAfDeferScope pf_af_scope(out);
     constexpr std::size_t kMaxCachedBlockInsns = 256;
 
-    struct Step {
-        Instruction insn;
-        std::uint8_t live_flags = 0;
-    };
-    std::vector<Step> steps;
+    // P14 stage 1: the block is a vector of IrInsn (instruction + facts), so the
+    // allocation and liveness passes below read facts instead of re-deriving
+    // them, and later passes have somewhere to look them up.
+    std::vector<IrInsn> steps;
     steps.reserve(16);
 
     Instruction insn = first;
@@ -2354,32 +2440,32 @@ BlockTranslation translate_cached_block(const std::uint8_t* code, std::size_t si
     while (true) {
         const Opcode op = insn.opcode;
         if (op == Opcode::kHlt) {
-            steps.push_back({insn, 0});
+            steps.push_back(IrInsn{insn, compute_ir_facts(insn), 0});
             exit = BlockExit::kHalted;
             break;
         }
         if (op == Opcode::kSyscall) {
-            steps.push_back({insn, 0});
+            steps.push_back(IrInsn{insn, compute_ir_facts(insn), 0});
             exit = BlockExit::kSyscall;
             target = insn.address + insn.length;
             break;
         }
         if (op == Opcode::kJmp || op == Opcode::kCall || op == Opcode::kRet) {
-            steps.push_back({insn, 0});
+            steps.push_back(IrInsn{insn, compute_ir_facts(insn), 0});
             exit = BlockExit::kJmp;
             target = (insn.dst.kind == OperandKind::kImmediate && op != Opcode::kRet) ? insn.dst.imm
                                                                                       : 0ULL;
             break;
         }
         if (op == Opcode::kJcc) {
-            steps.push_back({insn, 0});
+            steps.push_back(IrInsn{insn, compute_ir_facts(insn), 0});
             exit = BlockExit::kJcc;
             target = insn.address + insn.length;
             alternate = insn.dst.imm;
             break;
         }
 
-        steps.push_back({insn, 0});
+        steps.push_back(IrInsn{insn, compute_ir_facts(insn), 0});
         if (steps.size() >= kMaxCachedBlockInsns || next_offset >= size) {
             exit = BlockExit::kFallThrough;
             target = first.address + next_offset;
@@ -2401,12 +2487,11 @@ BlockTranslation translate_cached_block(const std::uint8_t* code, std::size_t si
     // allocating a guest register inside a cached block costs ONLY `2` words
     // (`1 ldr` at block entry + `1 str` at block exit), never `stp`/`ldp`!
     std::size_t refs[kGprCount] = {};
-    for (const Step& step : steps) {
-        bool r[kGprCount] = {};
-        bool w[kGprCount] = {};
-        regs_read_write_full(step.insn, r, w);
+    for (const IrInsn& step : steps) {
         for (unsigned i = 0; i < kGprCount; ++i) {
-            refs[i] += static_cast<std::size_t>((r[i] ? 1 : 0) + (w[i] ? 1 : 0));
+            const auto bit = static_cast<std::uint16_t>(1u << i);
+            refs[i] += static_cast<std::size_t>(((step.facts.gpr_reads & bit) != 0 ? 1u : 0u) +
+                                                ((step.facts.gpr_writes & bit) != 0 ? 1u : 0u));
         }
     }
 
@@ -2430,12 +2515,9 @@ BlockTranslation translate_cached_block(const std::uint8_t* code, std::size_t si
     // Pass 2: exact backward flag liveness across the full ISA.
     std::uint8_t live_out = kFbAll;
     for (std::size_t i = steps.size(); i-- > 0;) {
-        const Instruction& in = steps[i].insn;
-        const std::uint8_t reads = flags_read_full(in);
-        const std::uint8_t killed = flags_killed_full(in);
-        const std::uint8_t written = flags_written_full(in);
-        steps[i].live_flags = static_cast<std::uint8_t>(written & live_out);
-        live_out = static_cast<std::uint8_t>(reads | (live_out & ~killed));
+        const IrFacts& facts = steps[i].facts;
+        steps[i].live_flags = static_cast<std::uint8_t>(facts.flags_written & live_out);
+        live_out = static_cast<std::uint8_t>(facts.flags_read | (live_out & ~facts.flags_killed));
     }
 
     a64::Encoder e;
@@ -3519,7 +3601,7 @@ BlockTranslation translate_cached_block(const std::uint8_t* code, std::size_t si
         reload_ra();
 
         for (std::size_t idx = 0; idx < steps.size(); ++idx) {
-            const Step& step = steps[idx];
+            const IrInsn& step = steps[idx];
             const Opcode op = step.insn.opcode;
             const std::uint64_t next_rip = step.insn.address + step.insn.length;
 
