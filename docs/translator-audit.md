@@ -2449,6 +2449,128 @@ benchmark binaries directly, so in the cross tree they try to execute AArch64 EL
 with a shell syntax error. They are unrelated to this change and fail identically without it; the
 AArch64 gate is the unit-test binary under qemu.
 
+### 29.24 P14 stage 2 (block-level copy propagation) — measured, and rejected: the mov mass is not where a copy pass can reach it
+
+Stage 1 (§29.23) delivered the facts pass. Stage 2 was to be copy propagation, the first consumer.
+It is **not implemented**, because the measurement that was supposed to justify it says the
+removable fraction is ~0.05 % of translated instructions — two orders of magnitude under this
+rig's noise floor (§29.20), and below the 1–2 % at which a `--timing` A/B can even be read.
+
+The instruction that matters here was explicit: *do not treat the 25–31 % `mov` share as a 25–31 %
+opportunity; measure the removable fraction first*. That measurement is below.
+
+#### How it was measured
+
+A temporary hook in `translate_cached_block` (never committed) dumped, for every block the four
+benchmark guests actually translate, the decoded instruction stream plus the facts stage 1
+computes: operand kinds and widths, high-byte flag, memory base/index/displacement, the four flag
+masks, the GPR read/write masks, and the per-instruction live-flags solution, together with the
+guest registers pass 1.5 allocated for that block. An offline analyser then applied the actual
+codegen cost model of this translator to each block:
+
+* an **unallocated** guest register costs one `ldr` per read and one `str` per write; an allocated
+  one costs nothing (its prologue/epilogue is 2 words per block, already paid);
+* a `mov r, r` with neither operand allocated is therefore 2 words, with one allocated 1 word, and
+  both allocated a single `mov`;
+* a **copy is removable outright** only if its destination is fully overwritten (`mov`/`movzx`/
+  `movsx`/32-bit write) *before any later read of it in the block*, and its source is not memory
+  (a dead load can still fault, so dead loads are never removed);
+* a copy can **also** be removed by renaming its destination to its source for the rest of the
+  block — but only if the destination is dead at block exit, which is almost never true here:
+  `GuestState` is authoritative at every boundary again, so every guest register is live-out and
+  the destination's store must happen somewhere. Renaming therefore saves only *reloads of an
+  unallocated destination that alias an allocated source*.
+
+Guests: `sieve`, `nqueens`, `quicksort_c`, `qsort_glibc` (static `gcc -O2`), translated under
+`qemu-aarch64-static` with the environment pinned (`env -i PATH=/usr/bin:/bin`).
+
+#### The static corpus
+
+| guest | blocks | insns | insns/block | `mov` | share | store r→[m] | load [m]→r | `mov r,imm` | copy r←r 64 | copy r←r 32 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| sieve | 501 | 2 309 | 4.6 | 631 | 27.3 % | 178 | 194 | 44 | 160 | 53 |
+| nqueens | 425 | 1 927 | 4.5 | 490 | 25.4 % | 129 | 148 | 35 | 129 | 47 |
+| quicksort_c | 549 | 2 535 | 4.6 | 696 | 27.5 % | 190 | 210 | 44 | 181 | 69 |
+| qsort_glibc | 572 | 2 710 | 4.7 | 727 | 26.8 % | 192 | 237 | 51 | 198 | 47 |
+
+The `mov` share reproduces the earlier dynamic figure (25–31 %), which is the point: the share is
+real, and it is **60 % memory-operand moves** (372–429 of 490–727), not register copies. A copy
+propagation pass cannot touch a `mov [rbp-0x18], rdi` — that is a guest store, not an alias.
+
+#### What block-local copy propagation could actually reach
+
+| guest | copies with dst read again (used) | dst never read again (block-final) | dst fully overwritten first (**removable**) | reads that renaming could reach | words renaming saves | removable % of insns | words saved |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| sieve | 32 | 127 | **1** | 55 | 0 | 0.043 % | 1 |
+| nqueens | 27 | 101 | **1** | 52 | 0 | 0.052 % | 1 |
+| quicksort_c | 37 | 142 | **2** | 72 | 0 | 0.079 % | 2 |
+| qsort_glibc | 41 | 155 | **2** | 62 | 0 | 0.074 % | 2 |
+
+Two numbers carry the decision:
+
+1. **At most 2 instructions per guest** are removable outright (0.04–0.08 % of all translated
+   instructions), worth **1–2 emitted words out of ~4 800–6 800** — 0.03 %. Not a fraction that
+   can be measured, let alone claimed.
+2. **Renaming saves exactly zero words**, in every guest. There is not a single case where an
+   unallocated copy destination is re-read while its source sits in an allocated host register:
+   when a register is referenced more than twice it is already pinned by pass 1.5, so the alias
+   target is allocated too, and the reload it would have saved was already free.
+
+#### Why the structure makes this the expected answer
+
+Blocks average **4.5–4.7 guest instructions**. Of the 64-bit copies, **79–83 % have a destination
+that is never read again inside its own block** — they are call-argument setup (`mov rdi, rax`
+immediately before a `call`) and return-value moves (`mov rax, …` immediately before a `ret`),
+which is exactly where a block ends. Copy propagation needs a *use* after the copy, inside the
+same block, to have anything to propagate into; with a mean of 4.6 instructions per block and a
+`jcc` roughly every seven, those uses are in the next block almost every time.
+
+This is the same wall §29.15 (P8) hit from the other side, where the measurement was "there is
+almost nothing worth keeping across a block boundary", and §29.22, where loosening the
+register-allocation threshold was flat because the allocator already takes every register with
+more than two references. Three independent measurements now agree, from three directions, that
+the block is the wrong granularity for value-level optimisation *and* that the current
+per-block allocation already captures what is there.
+
+Two further checks were run so the rejection is not an artefact of one definition:
+
+* **32-bit copies** (`mov eax, ebx`, which zero-extends and so is not a plain alias) were counted
+  separately — 47–69 per guest, all block-final or used-with-zero-saving, same conclusion.
+* **Store→load forwarding** for the memory-form moves — the one other block-local redundancy
+  elimination the corpus suggests — was measured too: of 77–104 plain `[base+disp]` 64-bit stores
+  per guest, **zero** are followed in the same block by a load of the same slot before any
+  intervening store, call or base-register write.
+
+#### Decision
+
+Stage 2 as specified — block-level copy propagation over the stage-1 facts — is **rejected**, and
+the reason is a measurement rather than an effort estimate: it can remove at most 0.05 % of
+translated instructions and zero emitted words on the corpus this project measures, i.e. its
+effect is unobservable with the rig that would have to certify it. Implementing it would add an
+alias table, width and partial-write tracking, invalidation rules and a new class of bugs to the
+translator, in exchange for code-size noise. That fails the criterion the item set for itself
+("measurable value", §29.18), so nothing is implemented and no fallback switch is added.
+
+What would change the verdict, stated so the decision can be revisited rather than re-argued:
+
+* **A block granularity that puts a copy and its use in the same block** — a trace/superblock
+  builder, or block extension across unconditional jumps and through `jcc` fall-through. With
+  mean block length 4.6, doubling or tripling reachable block length is the precondition for
+  every value-level pass, this one included, and it is a *control-flow* change (§29.18 stage 3),
+  not a dataflow change.
+* **Cross-block liveness proven on the successor set** (§29.15 concluded it is worth ~nothing,
+  but that measurement predates the facts pass and assumes the same short blocks).
+* Or the cheaper, orthogonal direction the corpus does point at: 60 % of the `mov` mass and the
+  bulk of the per-instruction cost are *guest-state memory accesses* (0.68–0.71 per instruction
+  survive allocation). Reducing those means either more pinned host registers — blocked by the
+  `x19..x23` window that `enter_jit` saves, with `x24..x28` still in use for dispatch, budget and
+  state — or folding the load/store of a value that an adjacent instruction has just produced,
+  which is a *scheduling* pass over ≥2 instructions and again needs the longer block.
+
+Stage 1 stays: the facts are the correct substrate for whichever of those comes first, and stage 1
+cost nothing (§29.23's byte-identity result). This section closes item 14 with stages 1 shipped and
+stage 2 rejected on evidence.
+
 ### 29.9 Still open from §L
 
 Items 1-5 of §L are all resolved (1 justified and pinned, 2 and 5 implemented, 3 retracted as wrong,
@@ -2478,10 +2600,11 @@ delivery documented as absent. Item 13 (guest threads) is audited in §29.17: th
 "many processes, no threads", every shared-state clone flag is refused (and the refusal is now
 pinned at unit level as well as end to end), and the six things a thread implementation would need
 - per-thread state and JIT context, a write-race-free dispatcher, a translation-cache shootdown,
-futex wait queues and asynchronous signals - are written down instead of approximated. Item 14 (an IR) is proposed and staged in §29.18 —
-inspection, a four-stage plan with an acceptance criterion per stage, the invariants every pass
-must preserve, and the explicit reason it is sequenced rather than implemented now. Nothing in
-§L items 6–14 is left unaddressed; §30 is the summary.
+futex wait queues and asynchronous signals - are written down instead of approximated. Item 14 (an IR) is proposed and staged in §29.18, and then executed: stage 1
+(the facts pass) shipped in §29.23 with byte-identical output, and stage 2 (block-level copy
+propagation) was measured and **rejected** in §29.24 — the corpus contains at most 2 removable
+copies per guest, 0.04–0.08 % of translated instructions, and renaming saves zero words. Nothing
+in §L items 6–14 is left unaddressed; §30 is the summary.
 
 ---
 
@@ -2497,11 +2620,11 @@ must preserve, and the explicit reason it is sequenced rather than implemented n
 | 10 shadow stack | **half implemented** — direct `call` exits are linked (9 % on a call-heavy guest); the shadow stack itself is rejected, a verified ret-target cache deferred to P14 | §29.13 |
 | 12 signals | **audited and partly implemented** — `kill`/`tgkill` honour disposition and mask; handler invocation, `rt_sigreturn` and asynchronous delivery documented as absent | §29.16 |
 | 13 threads | **audited and pinned** — "many processes, no threads"; every shared-state clone flag refused, the six pieces a thread implementation needs written down | §29.17 |
-| 14 IR | **proposed and staged** — four stages with acceptance criteria and invariants; sequenced behind a measurement rig | §29.18 |
+| 14 IR | **stage 1 shipped, stage 2 rejected on measurement** — facts pass with byte-identical output (2 047 blocks, 4 guests); block-local copy propagation can remove 0.04–0.08 % of instructions and saves 0 emitted words | §29.23, §29.24 |
 
-Verification for the batch, at `2303e54`: native (x86-64, clang-19) 353 passed / 0 failed / 47
-skipped of 400, `ctest` 19/19; AArch64 under `qemu-aarch64-static` 400 passed / 0 failed / 5
-skipped of 405; GCC and clang strict builds (`HYPERION_WARNINGS_AS_ERRORS=ON`) clean; full guest
+Verification for the batch, at `24f6477` (P14 stage 1): native (x86-64, clang-19) 370 passed / 0
+failed / 47 skipped of 417, `ctest` 19/19; AArch64 under `qemu-aarch64-static` 417 passed / 0
+failed / 5 skipped of 422; at `2303e54` the same batch was 353/0/47 of 400 and 400/0/5 of 405; GCC and clang strict builds (`HYPERION_WARNINGS_AS_ERRORS=ON`) clean; full guest
 runs on both tiers byte-identical (`acc=9000001 counter=0`, `acc=20475694797959 g=50991808`).
 
 Two measurements in this batch are negative results that matter for planning: the PF/AF deferral
