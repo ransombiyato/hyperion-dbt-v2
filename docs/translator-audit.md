@@ -2666,6 +2666,197 @@ directly, so in the cross tree they try to run AArch64 ELF on the x86 host and f
 syntax error. They fail identically at `070168d`; the AArch64 gate for this project is the unit
 test binary under `qemu-aarch64-static`.
 
+### 29.26 P15 — trace/superblock formation: investigated, designed, and not implemented — the hot paths are already linked, and what is left is shorter than the noise floor
+
+P14's rejection (§29.24) ended by naming the one change that could give value-level passes
+something to work on: longer translation units. This section is that investigation. It was run as
+a separate item (P15) with the phases in order — restore and baseline first, measurements second,
+design third, success criteria fourth, implementation only if the evidence supported it. It does
+not. No production code changed; the only code written was a temporary probe in the tier-0
+interpreter (described below), removed before this was committed, with the tree verified clean
+and both builds re-run green afterwards.
+
+#### Phase 0: restore, and a baseline that is actually `de5df0e`
+
+The sandbox's persisted file snapshot was stale again: 55 paths differed from `origin/main`
+(44 modified, 11 missing). Before touching anything, every differing file was inspected. All but
+one of the modified blobs exist verbatim in committed history — the snapshot had reverted files
+to older committed states; the missing paths are the ones snapshots drop (`.github/`,
+`tools/vendor/host-debs/*.deb`, `tests/unit/test_ir_facts.cpp`). The one blob not in history
+(`src/core/sigsys_diagnostics.cpp`, an older formatting/semantics variant) was preserved anyway:
+the full pre-resync diff and file copies are in `/home/user/pre-p15-resync-backup/` (kept outside
+the repo). Only then was the tree resynchronised: `git status` clean, `HEAD == origin/main ==
+de5df0ea65f3c8166cc7827ecc9d84a350d4431a`. P14 stage 1 was confirmed in the actual checkout
+(`IrFacts` at `include/hyperion/translator.hpp:84`, `compute_ir_facts` at
+`src/core/translator.cpp:2332`, wired into pass 1 at `:2443`, 17 cases in
+`tests/unit/test_ir_facts.cpp`). Baseline before any change: native (clang 19, RelWithDebInfo)
+**370 passed / 0 failed / 47 skipped of 417**, `ctest` **19/19**.
+
+#### Phase 1: what the dynamic block stream actually looks like
+
+**Method.** Tier 1 chains blocks inside generated code, so the C++ dispatch loop never sees most
+transitions; counting there would measure the chaining, not the guest. The probe therefore sat in
+tier 0's `run_program` (temporary, env-gated `HYPERION_TRACE_PROBE=<path>`, never committed): it
+reconstructs exactly the block stream the translator's own rules produce — a block closes at
+`hlt`/`syscall`/`jmp`/`call`/`ret`/`jcc` or at the 256-instruction cap — and records per-block
+executions, guest-instruction and byte lengths, exit kind, and every block-to-block edge.
+Caveats, stated: the probe measures the run it instruments (the extra environment variable costs
+glibc ~4 600 extra startup instructions, identical across guests; guest stdout md5 was verified
+unchanged and equal to native execution for all four guests), and tier-0 frequencies are the
+guest's, independent of which tier executes them.
+
+| guest | retired steps | block execs | distinct blocks | dyn. mean len | transitions /1000 insns |
+| --- | --- | --- | --- | --- | --- |
+| sieve | 16 995 559 | 4 159 894 | 1 282 | 4.09 | 244.8 |
+| nqueens | 39 368 251 | 4 302 096 | 1 199 | 9.15 | 109.3 |
+| quicksort_c | 21 677 694 | 3 911 314 | 1 293 | 5.54 | 180.4 |
+| qsort_glibc | 21 611 597 | 3 969 203 | 1 289 | 5.44 | 183.7 |
+
+Dynamic exit kinds (share of block executions):
+
+| guest | jcc | call | ret | jmp | syscall/hlt |
+| --- | --- | --- | --- | --- | --- |
+| sieve | 99.7 % | 0.1 % | 0.1 % | 0.1 % | ~0 % |
+| nqueens | 59.9 % | **20.0 %** | **20.0 %** | 0.1 % | ~0 % |
+| quicksort_c | 94.9 % | 0.3 % | 0.3 % | 4.4 % | ~0 % |
+| qsort_glibc | 55.0 % | **20.0 %** | **20.0 %** | 5.1 % | ~0 % |
+
+Branch direction at `jcc` (taken vs fall-through): sieve **97.6 % taken** (a loop back-edge),
+nqueens 24.6 % taken / 75.4 % fall-through, quicksort_c 59.5 % / 40.5 %, qsort_glibc
+49.6 % / 50.4 %. Only ~29–38 % of two-successor `jcc` blocks have a ≥90 % dominant direction
+(median dominant share 78–83 %). `ret` targets are polymorphic (up to 35–36 distinct successors
+per `ret` block; in nqueens essentially all 858 k `ret` executions are in multi-successor blocks);
+indirect `jmp` is negligible (≤3 executions in multi-successor blocks). Concentration is extreme:
+the top 5 blocks cover 99.1 % (sieve), 99.2 % (nqueens), 46.9 % (quicksort_c) and 72.4 %
+(qsort_glibc) of all block executions.
+
+**Realistic traces.** A NET-style greedy formation over the aggregate edge counts (follow the
+dominant successor; stop at `call`/`ret`/`syscall`/`hlt`, at an already-claimed block, or at caps
+of 16 blocks / 64 guest instructions; heads ≥0.1 % of executions) produces:
+
+| guest | traces | mean length | mean guest insns | interior transitions removed | side-exit events |
+| --- | --- | --- | --- | --- | --- |
+| sieve | 1 | 2.0 blocks | 6 | 22.1 % of transitions | 1.9 % |
+| nqueens | 1 | 3.0 blocks | 34 | 32.2 % | 7.3 % |
+| quicksort_c | 10 | 2.3 blocks | 10.5 | 26.7 % | 7.9 % |
+| qsort_glibc | 9 | 2.7 blocks | 13.4 | 27.0 % | 11.8 % |
+
+Greedy hottest-path walks from the hottest starts confirm why traces stay short: they hit a
+`call` or `ret` within 1–3 blocks (nqueens' hot cycle `…→ call →…→ ret →…` repeats every
+iteration), or close a loop. Full-path probability collapses with length — quicksort_c's 5–7-block
+candidate paths traverse end-to-end only 14–15 % of entries. And the single hottest edge in the
+whole corpus, sieve's `0x401610 → 0x401610` (51.0 % of all its block executions), is a self-loop
+the translator **already** compiles as a self-loop superblock (`translator.cpp:3412`).
+
+**What a removed transition is worth today.** Transitions are not dispatches to C++: both `jcc`
+successors and direct `call` exits are patched to direct branches inside the write window
+(§29.7, §29.13; measured this session under tier 1: 496/496, 422/421, 542/543, 560/569 exits
+linked for the four guests, dispatch misses only 7.4–8.5 k per run against millions of hits);
+unlinked exits take the in-JIT jump-table probe, not a C++ return. What an interior trace edge
+would actually save is the boundary state traffic: §29.15 measured *all* block-boundary traffic
+(prologue loads, exit/helper spills, reloads) at **6.1–6.6 % of generated words**. Removing
+22–32 % of transitions therefore has a static ceiling of ≈ **1.3–2.1 % of generated code** —
+before subtracting side-exit synchronisation (1.9–11.8 % of transitions would pay a full
+block-exit-style sync mid-trace), side-exit stub code, trace-entry duplication, and the fact that
+a well-predicted direct branch is cheaper than the average generated word. The guest-state
+operand traffic that dominates emission (~0.7 accesses per instruction, §29.24) is *inside*
+blocks and is untouched by trace formation unless it is combined with the canonical cross-block
+register assignment §29.15 already designed and deferred. Expected runtime effect: **≤1–2 %**,
+at or below this rig's resolution (interleaved A/B CI half-widths 1–4 %, §29.20/§29.25), measured
+through qemu rather than on AArch64.
+
+**Interactions, checked against the implementation** (measured facts above; the rest is code
+reading, labelled as such):
+
+* *Direct linking (P7/P10):* complementary but overlapping — linking already removed the
+  dispatcher from exactly the edges a trace would internalise; the trace's marginal saving is
+  the register spill/reload pair, not the transition.
+* *Cold-block gating (P6):* trace heads need a much higher bar than the compile threshold
+  (`hot_` saturates at 3 reaches); the existing 1 024-entry direct-mapped hot table has no edge
+  information at all, so any profile-driven variant needs new profile state.
+* *Signals, faults, exceptions:* no new hazard in principle — a trace is one translation unit,
+  so per-instruction fault stubs and the exit epilogue's state sync generalise — but every
+  interior `jcc` needs a side exit that performs the *full* sync (pinned registers stored,
+  `rip` = the exact next guest pc, PF/AF descriptor valid: §29.11's invariant), and any cycle
+  inside a trace needs a budget check or a long trace loop could overrun `max_steps`, which
+  `run()` currently guarantees per block.
+* *Self-modifying code:* invalidation is already total — a code-epoch bump drops the entire
+  cache (`TranslationCache::run`) — so traces need no new invalidation machinery, but duplicated
+  hot blocks multiply the retranslation a bump costs.
+* *W^X:* compatible only under the existing discipline — emit the whole trace and patch its
+  internal links inside one write window, publish once (`translate_at`); no published page is
+  ever re-opened. Feasible, but trace/link patching must not outlive the window.
+* *Cache growth / i-cache:* selective traces duplicate few blocks (≤24 blocks/guest above,
+  ≈ ≤8 KB), so growth is not the blocker; it becomes one only if formation is made aggressive,
+  which the side-exit rates argue against.
+
+#### Phase 2: designs compared, and the smallest one that would be built
+
+1. **Hot-edge trace formation (NET-style, profile-recorded traces).** Needs edge profiling in
+   generated code (new hot-path counters), a trace recorder, trace cache keyed by head, and
+   anchor patching. Most machinery, targets exactly the measured-hot paths — but the measured
+   traces are 2–3 blocks, so the machinery buys the least where it costs the most. Rejected
+   as first step.
+2. **Superblocks with side exits (no profiling).** At translation time, continue the unit past
+   a `jcc` along one successor and give the other a side exit to the existing dispatcher.
+   Which successor is "the path" must be guessed statically (fall-through is right 75 % in
+   nqueens, wrong 98 % in sieve), and the unit needs mid-unit conditional exits with full state
+   sync — a new emission shape, and a new way to break the §29.3 write-back invariant.
+3. **Selective formation on proven-hot paths only (recommended, if this is ever built).**
+   Reuse the block machinery: a *trace* is a `CachedBlock` whose translation unit is the head
+   block extended through dominant successors, formed only for heads that P6's gating has
+   already promoted and that additionally exceed a high execution bar. Design, specified so a
+   future implementation does not have to re-derive it:
+   * *Selection:* head executed ≥1 000 times (profile counted at the C++ funnel is too coarse —
+     chained executions bypass it — so this requires either interpreter-collected profiles or
+     in-JIT counters; that dependency is itself a cost); extend via the successor taken
+     ≥80 % of the time; stop at `call`/`ret`/`syscall`/`hlt`, indirect branches, a block
+     already in the trace, 16 blocks, or 64 guest instructions.
+   * *Exits:* every non-dominant successor and every trace-ending transfer is a side exit to
+     the *original* block's entry or the dispatcher, after full state sync (all pinned
+     registers stored, guest `rip` set, PF/AF descriptor materialised); the original blocks
+     remain translated and reachable, so a side exit is never a correctness event.
+   * *Budget:* a budget check on every back-edge inside the trace; retired-instruction
+     accounting stays one `Instruction` = one step (§29.18's invariants).
+   * *Invalidation:* unchanged — code-epoch bump invalidates everything; traces are dropped
+     with it and re-formed only when the head re-earns its threshold.
+   * *W^X:* whole trace emitted, internally linked and published in one write window; no
+     patching after publish; trace entries live in the same arena.
+   * *Fallback:* any doubt (decode failure mid-trace, successor not yet translated, delta out
+     of branch range) → emit the plain head block; the un-traced path is always available and
+     is the default until a head qualifies.
+
+#### Phase 3: success criteria, fixed before any implementation
+
+*Correctness:* full native + AArch64-under-qemu suites green with no test weakened; guest
+stdout and `--timing` step counts identical to the un-traced build on all four guests; a
+differential run (tier 0 vs tier 1) over the ISA corpus guests; SMC, fault-pc and step-limit
+behaviour exercised by the existing tests that pin them. *Performance:* interleaved A/B on the
+§29.20 rig (`--timing`, ≥12 pairs × 2 sessions per guest, bootstrap 95 % CI on the paired
+median ratio), accepted only if the median ratio is **≤0.98 with the CI entirely below 1.0 on
+at least two guests and no guest regressing beyond 1.01**; translation time, `total_code_bytes`
+(growth ≤10 %), and block/trace counts reported alongside. *Rejection conditions:* CI straddles
+1.0, any correctness delta, code growth >10 %, or side-exit rates above the Phase-1 model —
+any one of these retires the prototype, as with §29.21 and §29.24.
+
+#### Phase 4: decision
+
+Not implemented. The measured ceiling (≈1.3–2.1 % of generated code, ≤1–2 % runtime, through an
+emulator-mediated rig whose CI half-widths are 1–4 %) does not clear the bar Phase 3 sets, the
+hottest paths are already captured by the self-loop superblock and direct linking, the
+call/ret-dominated guests break traces every iteration, and the only version worth building
+depends on edge profiling the translator does not have. This is the fourth measurement in a row
+(§29.15, §29.22, §29.24, here) whose conclusion is that block granularity is not where the
+remaining cost lives; the state-traffic problem (~0.7 guest-state accesses per instruction) is
+an allocator problem, and traces without the canonical assignment of §29.15 do not touch it.
+
+**Reversal conditions.** Revisit when any of these holds: (a) a native-AArch64 measurement rig
+with ≤1 % noise exists, making a 1–2 % effect decidable; (b) the canonical cross-block register
+assignment (§29.15) is undertaken for its own sake — a trace is its natural unit, and the two
+together address both the 6 % boundary share and the in-block state traffic; (c) a workload
+with long, hot, acyclic paths (the four benchmark guests have none: their hot cycles are
+≤3 blocks or cross a call) becomes a stated target.
+
 ### 29.9 Still open from §L
 
 Items 1-5 of §L are all resolved (1 justified and pinned, 2 and 5 implemented, 3 retracted as wrong,
@@ -2716,6 +2907,7 @@ in §L items 6–14 is left unaddressed; §30 is the summary.
 | 12 signals | **audited and partly implemented** — `kill`/`tgkill` honour disposition and mask; handler invocation, `rt_sigreturn` and asynchronous delivery documented as absent | §29.16 |
 | 13 threads | **audited and pinned** — "many processes, no threads"; every shared-state clone flag refused, the six pieces a thread implementation needs written down | §29.17 |
 | 14 IR | **stage 1 shipped, stage 2 rejected on measurement** — facts pass with byte-identical output (2 047 blocks, 4 guests); block-local copy propagation can remove 0.04–0.08 % of instructions and saves 0 emitted words | §29.23, §29.24 |
+| 15 trace/superblock formation | **investigated, designed, not implemented** — dynamic traces are 2–3 blocks; removing 22–32 % of transitions has a ≈1.3–2.1 % generated-code ceiling (≤1–2 % runtime), under the rig's noise floor; hottest edge already a self-loop superblock, call/ret break traces in two guests | §29.26 |
 
 Verification for the batch, at `24f6477` (P14 stage 1): native (x86-64, clang-19) 370 passed / 0
 failed / 47 skipped of 417, `ctest` 19/19; AArch64 under `qemu-aarch64-static` 417 passed / 0
