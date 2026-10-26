@@ -580,6 +580,36 @@ Target-device measurements require real hardware and will be recorded in
 `docs/target-environment.md` and here when available. Do not assume target
 performance from x86-64 host numbers.
 
+### 4.4 Canonical cross-block register allocation (shipped)
+
+Every cached block now uses one fixed guest→host mapping — `rax, rcx, rdx,
+rsp, rsi` in `x19..x23` (audit §29.27, §29.29) — loaded once by the entry
+trampoline per JIT entry and stored only where control returns to C++
+(halt/syscall/fault/helper funnels, dispatcher miss, budget exhaustion).
+JIT-internal exits (linked branches, chained dispatch, call/ret) no longer
+spill or reload guest registers at block boundaries.
+
+Measured on this host under qemu-user (candidate/baseline execution time,
+`--timing` wall minus translation; 36 interleaved pairs per guest across
+three sessions with binary order rotated; A/A identical-binary controls
+spanned 0.984–1.014):
+
+| guest | median ratio | bootstrap 95 % CI |
+| --- | --- | --- |
+| `sieve` | 0.970 | [0.953, 0.982] |
+| `nqueens` | 0.989 | [0.976, 1.008] |
+| `quicksort_c` | 0.951 | [0.920, 0.976] |
+| `qsort_glibc` | 1.002 | [0.992, 1.014] |
+
+Two clear gains, one small gain, one flat; no regression beyond rig noise.
+Translation time is unchanged. The cost is static: generated code grows
+8–9 % (e.g. sieve 171,712 → 187,036 bytes), and the pinned code-size test
+moves 88 → 89 words for its 3-block program. Guest-visible output is
+byte-identical on all four workloads; the full test suite passes natively
+and under qemu (419 passed / 0 failed / 5 skipped), including two new
+regression tests for canonical values crossing block boundaries and for
+state synchronisation on a budget-exhaustion exit.
+
 ---
 
 ## 5. Methodology for future phases

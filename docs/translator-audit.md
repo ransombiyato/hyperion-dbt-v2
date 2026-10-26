@@ -3101,6 +3101,26 @@ in §L items 6–14 is left unaddressed; §30 is the summary.
 
 ---
 
+### 29.29 P16 shipped — canonical cross-block register allocation in production
+
+§29.27 deferred this design only because the qemu rig could not certify a
+~2–4 % effect. Under the performance-first directive it has been shipped in
+production form: the fixed mapping lives in one `kCanonicalGprs` constant
+(`{rax,rcx,rdx,rsp,rsi}` → `x19..x23`); the entry trampoline loads it once
+per JIT entry; dispatcher misses and each block's budget-exhaustion stub
+store it before reaching C++; JIT-internal exits carry it live. The pinned
+code-size bound moves deliberately from 88 to 89 words (whole-program
+static growth 8–9 %, as measured in §29.27). Two regression tests pin the
+semantics: canonical values crossing `jmp`/`call`/`ret`/`push`/`pop` block
+boundaries, and exact GuestState synchronisation when the step budget
+expires at a block boundary. Fresh ship-time A/B (36 interleaved pairs per
+guest, order rotated, A/A controls 0.984–1.014): sieve 0.970
+[0.953, 0.982], nqueens 0.989 [0.976, 1.008], quicksort_c 0.951
+[0.920, 0.976], qsort_glibc 1.002 [0.992, 1.014] — gains where the
+§29.27 model predicted them, flat elsewhere, no regression beyond noise.
+Suites: native 370/0/49, AArch64 under qemu 419/0/5, `cli_smoke` green on
+both. Numbers also in BENCHMARKS.md §4.4.
+
 ## 30. Status after items 6–14
 
 | item | outcome | where |
@@ -3113,7 +3133,7 @@ in §L items 6–14 is left unaddressed; §30 is the summary.
 | 13 threads | **audited and pinned** — "many processes, no threads"; every shared-state clone flag refused, the six pieces a thread implementation needs written down | §29.17 |
 | 14 IR | **stage 1 shipped, stage 2 rejected on measurement** — facts pass with byte-identical output (2 047 blocks, 4 guests); block-local copy propagation can remove 0.04–0.08 % of instructions and saves 0 emitted words | §29.23, §29.24 |
 | 15 trace/superblock formation | **investigated, designed, not implemented** — dynamic traces are 2–3 blocks; removing 22–32 % of transitions has a ≈1.3–2.1 % generated-code ceiling (≤1–2 % runtime), under the rig's noise floor; hottest edge already a self-loop superblock, call/ret break traces in two guests | §29.26 |
-| 16 cross-block register allocation | **prototyped, measured, deferred** — canonical `{rax,rdx,rsp,rsi,rcx}` in `x19..x23`: guest outputs identical, pooled A/B 0.963 (sieve) / 0.978 (nqueens) with CIs below 1, but A/A controls show ≤1.6 % rig bias, quicksorts flat, code size +8.2–9.2 %; needs a native-AArch64 rig to certify | §29.27 |
+| 16 cross-block register allocation | **implemented** — canonical `{rax,rcx,rdx,rsp,rsi}` in `x19..x23` shipped in production form (shared `kCanonicalGprs` mapping; spills only at C++ funnels, dispatcher miss and the budget-exhaustion stub; pinned code-size bound deliberately 88 → 89 words; two new regression tests). Re-measured at ship time: 36 pooled pairs/guest 0.970 (sieve) / 0.989 (nqueens) / 0.951 (quicksort_c) / 1.002 (qsort_glibc), guest output byte-identical, suites green | §29.27, §29.29 |
 | 17 flag-state optimisation | **micro-hypotheses rejected, stage-2 class deferred** — redundant PF/AF pending-store measures at exactly 0 (upper bound 9–11 stores/run; ≈1 live producer per block execution), consumer guards 0 in hot blocks, descriptor packing saves nothing; remaining cost is P9 stage 2's representation change (≈4 % ceiling, §29.14), still unmeasurable on this rig | §29.28 |
 
 Verification for the batch, at `24f6477` (P14 stage 1): native (x86-64, clang-19) 370 passed / 0
