@@ -131,6 +131,34 @@ struct GuestState {
     double fpu_st[8] = {};
     XmmReg xmm[kXmmCount] = {};
 
+    // --- Pending cc descriptor (P9 stage 2; not architectural state) -------
+    //
+    // Generalisation of the PF/AF descriptor above to all six flags: a
+    // 32/64-bit add/sub/logical producer in generated code stores the result
+    // and (for add/sub) the first operand here instead of materialising the
+    // flag bytes, and sets `cc_op` to a packed descriptor:
+    //
+    //   bits 0-1: kind (1 = add, 2 = sub, 3 = logical)
+    //   bit  2:   operand width is 32-bit (clear = 64-bit)
+    //   bits 3-8: mask of flags this descriptor defines, in the translator's
+    //             flag-bit numbering (bit 0 = CF, 1 = PF, 2 = AF, 3 = ZF,
+    //             4 = SF, 5 = OF)
+    //
+    // Every flag is derivable from (result, operand a): the second operand is
+    // b = result - a (add) or b = a - result (sub), AF is bit 4 of (a ^ b ^
+    // result), PF is the parity of the low result byte, and CF/OF come from
+    // the standard full-adder identities at the operand width. INC/DEC are
+    // recorded as add/sub of 1 with CF clear in the mask, so the preserved CF
+    // byte is never overwritten. `cc_op == 0` means no descriptor is pending
+    // and `flags` is definitive; materialisation (generated-code epilogue,
+    // `flush_pending_flags`) also clears any PF/AF descriptor, which a cc
+    // descriptor supersedes. Appended after `xmm` so no existing field offset
+    // moves.
+    std::uint64_t cc_result = 0;
+    std::uint64_t cc_src = 0; // operand `a` (add/sub only)
+    std::uint32_t cc_op = 0;
+    std::uint32_t cc_pad = 0;
+
     std::uint64_t& reg(Gpr r) { return gpr[static_cast<std::size_t>(r)]; }
     std::uint64_t reg(Gpr r) const { return gpr[static_cast<std::size_t>(r)]; }
 };
@@ -148,6 +176,14 @@ inline constexpr std::uint8_t kPfAfPendingPf = 1u << 1;
 inline constexpr std::uint8_t kPfAfPendingAf = 1u << 2;
 inline constexpr std::uint8_t kPfAfPendingBoth =
     static_cast<std::uint8_t>(kPfAfPendingPf | kPfAfPendingAf);
+
+// `GuestState::cc_op` packing (see the descriptor comment on the fields).
+inline constexpr std::uint32_t kCcKindAdd = 1;
+inline constexpr std::uint32_t kCcKindSub = 2;
+inline constexpr std::uint32_t kCcKindLogic = 3;
+inline constexpr std::uint32_t cc_op_pack(std::uint32_t kind, bool is32, std::uint8_t mask) {
+    return kind | (is32 ? 4u : 0u) | (static_cast<std::uint32_t>(mask) << 3);
+}
 
 // Materialise any pending PF/AF into `state.flags` and clear the pending bits.
 // Cheap and idempotent when nothing is pending; returns true if it did work.

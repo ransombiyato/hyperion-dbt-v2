@@ -93,6 +93,8 @@ void TranslationCache::ensure_trampolines() {
     ctx_->jit_budget_epilogue = arena_.allocate(tr.budget_code.data(), tr.budget_code.size());
     ctx_->jit_exit_epilogue = arena_.allocate(tr.exit_code.data(), tr.exit_code.size());
     ctx_->jit_preserve_call = arena_.allocate(tr.preserve_code.data(), tr.preserve_code.size());
+    ctx_->jit_cc_materialise =
+        static_cast<std::uint8_t*>(ctx_->jit_exit_epilogue) + tr.cc_materialise_offset;
 }
 
 bool TranslationCache::should_gate(std::uint64_t pc) {
@@ -244,6 +246,7 @@ const CachedBlock* TranslationCache::translate_one(Memory& memory, std::uint64_t
     block->guest_instruction_count = translated.guest_instruction_count;
     block->code_bytes = translated.code.size();
     block->pf_af_deferred = translated.pf_af_deferred;
+    block->cc_deferred = translated.cc_deferred;
 
     const CachedBlock* raw = block.get();
     window_blocks_.push_back(const_cast<CachedBlock*>(raw));
@@ -265,6 +268,14 @@ std::uint64_t TranslationCache::pf_af_deferred() const {
     std::uint64_t total = 0;
     for (const auto& entry : blocks_) {
         total += entry.second->pf_af_deferred;
+    }
+    return total;
+}
+
+std::uint64_t TranslationCache::cc_deferred() const {
+    std::uint64_t total = 0;
+    for (const auto& entry : blocks_) {
+        total += entry.second->cc_deferred;
     }
     return total;
 }

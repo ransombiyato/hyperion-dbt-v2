@@ -708,12 +708,13 @@ HYPERION_TEST("translator", "dead_flags_are_not_computed") {
     const std::size_t one = words_of({0x48, 0x01, 0xD8, 0xF4});
     const std::size_t two = words_of({0x48, 0x01, 0xD8, 0x48, 0x01, 0xD8, 0xF4});
 
-    const std::size_t live_add = one - h;   // `add` with all six flags computed
+    const std::size_t live_add = one - h;   // `add` with all six flags live
     const std::size_t dead_add = two - one; // `add` whose flags a later add kills
 
-    // A live add computes the full flag prologue; a dead add is just the
+    // A live add records the cc descriptor (P9 stage 2): the operation plus
+    // the result/operand/descriptor stores. A dead add is just the
     // arithmetic plus the destination store. The gap is the whole point.
-    HYPERION_CHECK(live_add >= 15);
+    HYPERION_CHECK(live_add >= 8);
     HYPERION_CHECK(dead_add <= 4);
     HYPERION_CHECK(dead_add < live_add);
 }

@@ -36,6 +36,8 @@ struct CachedBlock {
     // PF/AF results recorded as a pending descriptor instead of materialised in
     // generated code (P9 stage 1).
     std::uint32_t pf_af_deferred = 0;
+    // Flag producers recorded as a pending cc descriptor (P9 stage 2).
+    std::uint32_t cc_deferred = 0;
 };
 
 class TranslationCache {
@@ -83,6 +85,7 @@ public:
     // PF/AF results recorded as pending descriptors rather than materialised
     // (P9 stage 1), summed over every translated block.
     std::uint64_t pf_af_deferred() const;
+    std::uint64_t cc_deferred() const;
     // Times a live pending descriptor had to be materialised because a helper was
     // about to read the flags (P9 stage 1). Materialisations done by generated
     // code (exit epilogue, PF/AF consumers) are not counted here.

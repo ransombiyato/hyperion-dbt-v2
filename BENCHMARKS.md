@@ -648,6 +648,40 @@ byte-identical on all five workloads. Two regression tests pin
 resident values across block boundaries and their synchronisation on
 a budget-exhaustion exit.
 
+### 4.6 Deferred flag materialisation (cc descriptor, shipped)
+
+Flag production for 32/64-bit add/sub/logical no longer emits eager
+`cset`+store per live flag. The producer stores one packed descriptor
+(`cc_result`, `cc_src`, `cc_op` kind=add/sub/logic, fused
+`cmp result, 0` for the NZCV Jcc path); a single shared materialise
+routine appended to the exit trampoline recomputes CF/ZF/SF/OF/PF/AF
+into GuestState wherever flags must be observed (guest-state exits,
+Setcc/Cmovcc consumers, flag-reading helpers, faults). Descriptors
+ride chained block entries instead of being flushed at exits. Two
+producer shapes stay eager because deferral measured slower there:
+a producer immediately before a Setcc/Cmovcc consumer (qsort_glibc
++21 % when deferred), and 8/16-bit ops, which simply clear a pending
+descriptor since they redefine all six flags (flushing there cost
+sieve +32 %). INC/DEC preserve a pending CF exactly.
+
+Measured on this host under qemu-user (candidate/baseline execution
+time, 72 interleaved pairs per guest across two runs, pair medians):
+
+| guest | pair-median ratio |
+| --- | --- |
+| `sieve` | ~0.99 |
+| `nqueens` | ~0.975 |
+| `quicksort_c` | ~0.97 |
+| `qsort_glibc` | ~1.00 |
+| `sha256` | ~1.00 |
+
+Small consistent gains on the integer guests, neutral elsewhere; no
+regressions. Generated code shrinks ~2 % on all five guests; the
+pinned code-size bound stays at 105 words. Guest-visible output is
+byte-identical on all five workloads; native 370/0/61, AArch64
+431/0/5, differential 11/11, ctest 19/19. Ten `cc_*` regression tests
+pin cross-block, chained-entry and helper-boundary behaviour.
+
 ---
 
 ## 5. Methodology for future phases

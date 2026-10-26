@@ -3146,13 +3146,44 @@ attributed to qemu TCG layout sensitivity; see BENCHMARKS.md §4.5).
 Generated code +~2%; pinned test bound 89 -> 105 words deliberately.
 Suites: native 370/0/51, AArch64 421/0/5, `cli_smoke` green both.
 
+### 29.31 Deferred flag materialisation (cc descriptor) shipped
+
+P9 stage 2 (§29.14), deferred since it sat under the rig's noise
+floor, is implemented in its smallest form. A tier-0 flag census
+confirmed the pool: 82–99 % of eager flag stores across the five
+guests are overwritten before any read (block exits seed liveness
+with all six flags). The 32/64-bit add/sub/logical producers now
+store one packed lazy descriptor (`cc_result`, `cc_src`,
+`cc_op` = add/sub/logic in `GuestState`) plus a fused
+`cmp result, 0` preserving the NZCV Jcc path, instead of ~10–12
+words of `cset`+store per producer. One shared materialise routine
+appended after the exit epilogue (not per block: a per-block stub
+measured +185 test-bound words) recomputes all six flags;
+`flush_pending_flags` guards every guest-state observation point
+(exits, helper/syscall/fault/halt/budget boundaries), and a pending
+descriptor legitimately crosses chained block entries — consumers
+flush, writers supersede-or-flush per `flags_written`, never an
+entry assumption. Two measured exceptions stay eager: a producer
+immediately before Setcc/Cmovcc (deferral cost qsort_glibc
++21–23 %: its hot comparator materialised twice per call), and
+8/16-bit flag writers clear rather than flush a pending descriptor
+(flushing cost sieve +32 %: byte-compare loop pair). INC/DEC flush
+only the pending CF (their semantics preserve it). Benchmark (72
+interleaved pairs/guest, pair medians): sieve ~0.99, nqueens
+~0.975, quicksort_c ~0.97, qsort_glibc/sha256 ~1.00; generated code
+−2 % on all five; guest output byte-identical; native 370/0/61,
+AArch64 431/0/5 (10 new `cc_*` tests), differential 11/11, ctest
+19/19. Side finding, pre-existing on `2bc34a4`, not fixed here:
+8-bit high-byte ALU operands (`add bh,bh`) read a zeroed operand
+and leave CF stale in tier 1.
+
 ## 30. Status after items 6–14
 
 | item | outcome | where |
 | --- | --- | --- |
 | 6 hot-block gating | **implemented** — cold block starts execute in the interpreter; 14–35 % faster from 10 k guest instructions up, 69 % less generated code | §29.12 |
 | 8 cross-block register allocation | **measured, deferred** — 0.65–0.75 registers pinned per block, so all boundary traffic is 6.1–6.6 % of code and only part of it is removable | §29.15 |
-| 9 stage 2 (CF/ZF/SF/OF) | **measured, deferred** — flag materialisation is 10.2–10.8 % of code, the deferrable part ≈ 4 %, under this environment's noise floor | §29.14 |
+| 9 stage 2 (CF/ZF/SF/OF) | **implemented** — cc descriptor defers 32/64-bit add/sub/logical flags to one shared materialise routine; pair-median A/B sieve ~0.99, nqueens ~0.975, quicksort_c ~0.97, others neutral; code −2 % | §29.31 |
 | 10 shadow stack | **half implemented** — direct `call` exits are linked (9 % on a call-heavy guest); the shadow stack itself is rejected, a verified ret-target cache deferred to P14 | §29.13 |
 | 12 signals | **audited and partly implemented** — `kill`/`tgkill` honour disposition and mask; handler invocation, `rt_sigreturn` and asynchronous delivery documented as absent | §29.16 |
 | 13 threads | **audited and pinned** — "many processes, no threads"; every shared-state clone flag refused, the six pieces a thread implementation needs written down | §29.17 |

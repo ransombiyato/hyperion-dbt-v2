@@ -67,6 +67,65 @@ Flags unpack_flags(std::uint64_t rflags) {
 }
 
 bool flush_pending_flags(GuestState& state) {
+    // A pending cc descriptor (P9 stage 2) defines every flag in its mask,
+    // PF/AF included, and supersedes the PF/AF descriptor. This is the C++
+    // mirror of emit_cc_materialise() in src/core/translator.cpp.
+    if (state.cc_op != 0) {
+        const std::uint32_t op = state.cc_op;
+        const std::uint32_t kind = op & 3u;
+        const bool is32 = (op & 4u) != 0;
+        const std::uint8_t mask = static_cast<std::uint8_t>((op >> 3) & 0x3Fu);
+        const std::uint64_t wmask = is32 ? 0xFFFFFFFFull : ~0ull;
+        const unsigned sign = is32 ? 31 : 63;
+        const std::uint64_t r = state.cc_result & wmask;
+        const std::uint64_t a = state.cc_src & wmask;
+        auto set_flag = [&state, mask](unsigned bit, bool value) {
+            if ((mask & (1u << bit)) == 0) {
+                return;
+            }
+            switch (bit) {
+            case 0:
+                state.flags.cf = value;
+                break;
+            case 1:
+                state.flags.pf = value;
+                break;
+            case 2:
+                state.flags.af = value;
+                break;
+            case 3:
+                state.flags.zf = value;
+                break;
+            case 4:
+                state.flags.sf = value;
+                break;
+            default:
+                state.flags.of = value;
+                break;
+            }
+        };
+        set_flag(1, __builtin_parity(static_cast<unsigned>(r & 0xFFu)) == 0);
+        set_flag(3, r == 0);
+        set_flag(4, ((r >> sign) & 1u) != 0);
+        if (kind == kCcKindLogic) {
+            set_flag(0, false);
+            set_flag(2, false);
+            set_flag(5, false);
+        } else {
+            const std::uint64_t b = (kind == kCcKindSub) ? ((a - r) & wmask) : ((r - a) & wmask);
+            set_flag(2, ((a ^ b ^ r) >> 4 & 1u) != 0);
+            if (kind == kCcKindSub) {
+                set_flag(0, (((~a & b) | (~(a ^ b) & r)) >> sign & 1u) != 0);
+                set_flag(5, (((a ^ b) & (a ^ r)) >> sign & 1u) != 0);
+            } else {
+                set_flag(0, (((a & b) | ((a | b) & ~r)) >> sign & 1u) != 0);
+                set_flag(5, (((a ^ r) & (b ^ r)) >> sign & 1u) != 0);
+            }
+        }
+        state.cc_op = 0;
+        state.pf_af_pending = 0;
+        return true;
+    }
     const std::uint8_t pending = state.pf_af_pending;
     if (pending == 0) {
         return false;

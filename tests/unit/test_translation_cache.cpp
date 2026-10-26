@@ -401,6 +401,7 @@ namespace p9 {
 struct Outcome {
     hyperion::RunResult result;
     std::uint64_t deferred = 0;
+    std::uint64_t cc_deferred = 0;
     std::uint64_t flushes = 0;
 };
 
@@ -417,6 +418,7 @@ Outcome run_cached(const std::vector<std::uint8_t>& program, const GuestState& i
     Outcome out;
     out.result = cache.run(mem, initial);
     out.deferred = cache.pf_af_deferred();
+    out.cc_deferred = cache.cc_deferred();
     out.flushes = cache.pf_af_flushes();
     return out;
 }
@@ -467,7 +469,9 @@ void check_matches(const char* what, const std::vector<std::uint8_t>& program,
     // interpreter, a syscall, this test) would see a stale PF/AF.
     HYPERION_CHECK_EQ(static_cast<unsigned>(got.pf_af_pending), 0u);
     if (want_deferred) {
-        HYPERION_CHECK(actual.deferred >= 1);
+        // Stage 2 defers 32/64-bit producers behind the cc descriptor, so the
+        // deferral this pins may be recorded by either mechanism.
+        HYPERION_CHECK(actual.deferred + actual.cc_deferred >= 1);
     }
 }
 
@@ -639,6 +643,203 @@ HYPERION_TEST("translation_cache", "pf_consumer_in_the_successor_block_forces_ma
     initial.flags.pf = false;
     initial.reg(Gpr::kRdx) = 0;
     p9::check_matches("successor consumer", program, initial);
+}
+
+// --- P9 stage 2: pending cc descriptor ---------------------------------------
+//
+// The six flag bytes are deferred behind a (result, operand) descriptor and
+// materialised only at exits, helper boundaries and in-block consumers.
+// These tests are differential (cached tier vs interpreter, whole resulting
+// state) with flags preset to the opposite of the computed values, so a
+// missing materialisation cannot pass by accident; each also pins that the
+// block really did defer (cc_deferred >= 1) and that no descriptor leaks
+// into C++ (cc_op == 0 afterwards).
+namespace cc2 {
+
+struct Outcome {
+    hyperion::RunResult result;
+    std::uint64_t deferred = 0;
+};
+
+Outcome run_cached_cc(const std::vector<std::uint8_t>& program, const GuestState& initial) {
+    FlatMemory mem(kBase, kMemSize);
+    std::memcpy(mem.data(), program.data(), program.size());
+    TranslationCache cache;
+    cache.set_hot_threshold(0); // see p9::run_cached for why
+    Outcome out;
+    out.result = cache.run(mem, initial);
+    out.deferred = cache.cc_deferred();
+    return out;
+}
+
+void check_cc(const char* what, const std::vector<std::uint8_t>& program,
+              const GuestState& initial) {
+    const hyperion::RunResult expected = p9::run_interp(program, initial);
+    const Outcome actual = run_cached_cc(program, initial);
+    const GuestState& got = actual.result.state;
+    const GuestState& want = expected.state;
+    bool same = actual.result.status == expected.status && got.rip == want.rip &&
+                actual.result.steps == expected.steps && got.flags == want.flags;
+    for (std::size_t i = 0; i < hyperion::kGprCount; ++i) {
+        same = same && got.gpr[i] == want.gpr[i];
+    }
+    if (!same) {
+        std::fprintf(
+            stderr,
+            "  CC mismatch in %s: steps %llu/%llu rip 0x%llx/0xllx\n"
+            "    tier1 cf/pf/af/zf/sf/of = %d%d%d%d%d%d  rax=0x%llx rcx=0x%llx rdx=0x%llx\n"
+            "    tier0 cf/pf/af/zf/sf/of = %d%d%d%d%d%d  rax=0x%llx rcx=0x%llx rdx=0x%llx\n",
+            what, static_cast<unsigned long long>(actual.result.steps),
+            static_cast<unsigned long long>(expected.steps),
+            static_cast<unsigned long long>(got.rip), static_cast<unsigned long long>(want.rip),
+            got.flags.cf, got.flags.pf, got.flags.af, got.flags.zf, got.flags.sf, got.flags.of,
+            static_cast<unsigned long long>(got.reg(Gpr::kRax)),
+            static_cast<unsigned long long>(got.reg(Gpr::kRcx)),
+            static_cast<unsigned long long>(got.reg(Gpr::kRdx)), want.flags.cf, want.flags.pf,
+            want.flags.af, want.flags.zf, want.flags.sf, want.flags.of,
+            static_cast<unsigned long long>(want.reg(Gpr::kRax)),
+            static_cast<unsigned long long>(want.reg(Gpr::kRcx)),
+            static_cast<unsigned long long>(want.reg(Gpr::kRdx)));
+        HYPERION_CHECK(false);
+        return;
+    }
+    HYPERION_CHECK_EQ(static_cast<unsigned>(got.cc_op), 0u);
+    HYPERION_CHECK(actual.deferred >= 1);
+}
+
+// Flags preset to values the programs below do not compute, per flag.
+GuestState opposite_flags() {
+    GuestState s;
+    s.rip = kBase;
+    s.flags.cf = true;
+    s.flags.pf = true;
+    s.flags.af = true;
+    s.flags.zf = true;
+    s.flags.sf = true;
+    s.flags.of = true;
+    return s;
+}
+
+} // namespace cc2
+
+HYPERION_TEST("translation_cache", "cc_descriptor_materialised_at_exit_epilogue") {
+    // sub eax, ebx ; hlt with 0x80000000 - 1: OF=1, SF=1, CF=0, ZF=0 -- the
+    // incoming state has CF/ZF set and OF/SF clear, so only a real
+    // materialisation at the exit epilogue can match the interpreter.
+    const std::vector<std::uint8_t> program = {0x29, 0xD8, 0xF4}; // sub eax, ebx ; hlt
+    GuestState initial = cc2::opposite_flags();
+    initial.flags.sf = false;
+    initial.flags.of = false;
+    initial.reg(Gpr::kRax) = 0x80000000u;
+    initial.reg(Gpr::kRbx) = 1;
+    cc2::check_cc("sub epilogue", program, initial);
+}
+
+HYPERION_TEST("translation_cache", "cc_descriptor_64bit_overflow_at_exit") {
+    // add rax, rbx ; hlt with INT64_MAX + 1: OF=1, SF=1, CF=0, ZF=0.
+    const std::vector<std::uint8_t> program = {0x48, 0x01, 0xD8, 0xF4};
+    GuestState initial = cc2::opposite_flags();
+    initial.flags.sf = false;
+    initial.flags.of = false;
+    initial.reg(Gpr::kRax) = 0x7FFFFFFFFFFFFFFFull;
+    initial.reg(Gpr::kRbx) = 1;
+    cc2::check_cc("add64 epilogue", program, initial);
+}
+
+HYPERION_TEST("translation_cache", "cc_descriptor_logical_clears_cf_of_af") {
+    // and rax, rbx ; hlt: CF=OF=AF=0 by definition, whatever was pending.
+    const std::vector<std::uint8_t> program = {0x48, 0x21, 0xD8, 0xF4};
+    GuestState initial = cc2::opposite_flags(); // all set; AND must clear CF/OF/AF
+    initial.reg(Gpr::kRax) = 0xF0F0F0F0F0F0F0F0ull;
+    initial.reg(Gpr::kRbx) = 0x0F0F0F0F0F0F0F0Full;
+    cc2::check_cc("and64 epilogue", program, initial);
+}
+
+HYPERION_TEST("translation_cache", "cc_descriptor_neg_records_sub_from_zero") {
+    // neg rax ; hlt with rax = 5: result -5, CF=1 (operand nonzero), OF=0.
+    const std::vector<std::uint8_t> program = {0x48, 0xF7, 0xD8, 0xF4};
+    GuestState initial = cc2::opposite_flags();
+    initial.flags.cf = false;
+    initial.reg(Gpr::kRax) = 5;
+    cc2::check_cc("neg epilogue", program, initial);
+}
+
+HYPERION_TEST("translation_cache", "cc_inc_preserves_pending_cf") {
+    // add eax, ebx (0xFFFFFFFF + 1 -> CF=1, ZF=1) ; inc ecx ; setb dl ; hlt
+    // The INC must not disturb the pending CF: setb dl reads it after the INC
+    // recorded its own descriptor.
+    const std::vector<std::uint8_t> program = {0x01, 0xD8, 0xFF, 0xC1, 0x0F, 0x92, 0xC2, 0xF4};
+    GuestState initial = cc2::opposite_flags();
+    initial.flags.cf = false;
+    initial.reg(Gpr::kRax) = 0xFFFFFFFFu;
+    initial.reg(Gpr::kRbx) = 1;
+    initial.reg(Gpr::kRcx) = 41;
+    cc2::check_cc("inc keeps cf", program, initial);
+}
+
+HYPERION_TEST("translation_cache", "cc_setcc_and_cmov_consumers_flush_in_block") {
+    // cmp eax, ebx ; mov esi, 0x1234 ; cmovz ecx, edx ; setz bl ; hlt -- the
+    // MOV keeps the CMP from being the instruction immediately before the
+    // consumer (that case emits eager flags by design), so both the Cmovcc
+    // and the Setcc consumer read a *deferred* descriptor via the guard.
+    const std::vector<std::uint8_t> program = {0x39, 0xD8, 0xBE, 0x34, 0x12, 0x00, 0x00,
+                                               0x0F, 0x44, 0xCA, 0x0F, 0x94, 0xC3, 0xF4};
+    GuestState initial = cc2::opposite_flags();
+    initial.reg(Gpr::kRax) = 7;
+    initial.reg(Gpr::kRbx) = 7; // equal: ZF=1
+    initial.reg(Gpr::kRcx) = 0x1111;
+    initial.reg(Gpr::kRdx) = 0x2222;
+    cc2::check_cc("cmov+setcc consumers", program, initial);
+}
+
+HYPERION_TEST("translation_cache", "cc_descriptor_crosses_link_to_setcc_successor") {
+    // add eax, ebx ; jmp next ; next: setb cl ; hlt -- the descriptor is
+    // recorded in the first block and consumed by Setcc in the successor.
+    const std::vector<std::uint8_t> program = {0x01, 0xD8, 0xEB, 0x00, 0x0F, 0x92, 0xC1, 0xF4};
+    GuestState initial = cc2::opposite_flags();
+    initial.flags.cf = false;
+    initial.reg(Gpr::kRax) = 0xFFFFFFFFu;
+    initial.reg(Gpr::kRbx) = 1; // CF=1
+    cc2::check_cc("linked setcc successor", program, initial);
+}
+
+HYPERION_TEST("translation_cache", "cc_wide_op_flushes_pending_descriptor") {
+    // add eax, ebx (CF=1) ; mov esi, 7 ; setb cl ; cmp cl, dl ; setz bl ; hlt
+    // -- the SETB consumes the deferred descriptor in-block, then the 8-bit
+    // CMP on the non-deferred wide path writes its own flags, which the
+    // final SETZ reads.
+    const std::vector<std::uint8_t> program = {0x01, 0xD8, 0xBE, 0x07, 0x00, 0x00, 0x00, 0x0F,
+                                               0x92, 0xC1, 0x38, 0xD1, 0x0F, 0x94, 0xC3, 0xF4};
+    GuestState initial = cc2::opposite_flags();
+    initial.flags.cf = false;
+    initial.reg(Gpr::kRax) = 0xFFFFFFFFu;
+    initial.reg(Gpr::kRbx) = 1; // add: CF=1 -> cl=1; cmp 1,1: ZF=1 -> bl=1
+    initial.reg(Gpr::kRdx) = 1;
+    cc2::check_cc("setcc then wide", program, initial);
+}
+
+HYPERION_TEST("translation_cache", "cc_adc_helper_boundary_flushes") {
+    // add eax, ebx (CF=1) ; adc edx, ecx ; hlt -- ADC runs through the C++
+    // helper, which must observe the materialised CF.
+    const std::vector<std::uint8_t> program = {0x01, 0xD8, 0x11, 0xCA, 0xF4};
+    GuestState initial = cc2::opposite_flags();
+    initial.flags.cf = false;
+    initial.reg(Gpr::kRax) = 0xFFFFFFFFu;
+    initial.reg(Gpr::kRbx) = 1;
+    initial.reg(Gpr::kRcx) = 10;
+    initial.reg(Gpr::kRdx) = 20; // adc: 20 + 10 + 1 = 31
+    cc2::check_cc("adc helper", program, initial);
+}
+
+HYPERION_TEST("translation_cache", "cc_dec_loop_flags_match_interpreter") {
+    // mov ecx, 3 ; L: dec ecx ; jnz L ; setz al ; hlt -- the loop producer is
+    // a fused NZCV consumer on the back edge and a descriptor producer for
+    // the final Setcc.
+    const std::vector<std::uint8_t> program = {0xB9, 0x03, 0x00, 0x00, 0x00, 0xFF, 0xC9,
+                                               0x75, 0xFC, 0x0F, 0x94, 0xC0, 0xF4};
+    GuestState initial = cc2::opposite_flags();
+    initial.flags.zf = false;
+    cc2::check_cc("dec loop", program, initial);
 }
 
 // --- P6: hot-block gating ---------------------------------------------------
@@ -1042,6 +1243,46 @@ HYPERION_TEST("translation_cache", "pending_pf_af_crosses_a_directly_linked_exit
 }
 
 HYPERION_TEST("translation_cache", "pf_consumer_in_the_successor_block_forces_materialisation") {
+    HYPERION_SKIP("generated code is AArch64; requires an AArch64 host to run");
+}
+
+HYPERION_TEST("translation_cache", "cc_descriptor_materialised_at_exit_epilogue") {
+    HYPERION_SKIP("generated code is AArch64; requires an AArch64 host to run");
+}
+
+HYPERION_TEST("translation_cache", "cc_descriptor_64bit_overflow_at_exit") {
+    HYPERION_SKIP("generated code is AArch64; requires an AArch64 host to run");
+}
+
+HYPERION_TEST("translation_cache", "cc_descriptor_logical_clears_cf_of_af") {
+    HYPERION_SKIP("generated code is AArch64; requires an AArch64 host to run");
+}
+
+HYPERION_TEST("translation_cache", "cc_descriptor_neg_records_sub_from_zero") {
+    HYPERION_SKIP("generated code is AArch64; requires an AArch64 host to run");
+}
+
+HYPERION_TEST("translation_cache", "cc_inc_preserves_pending_cf") {
+    HYPERION_SKIP("generated code is AArch64; requires an AArch64 host to run");
+}
+
+HYPERION_TEST("translation_cache", "cc_setcc_and_cmov_consumers_flush_in_block") {
+    HYPERION_SKIP("generated code is AArch64; requires an AArch64 host to run");
+}
+
+HYPERION_TEST("translation_cache", "cc_descriptor_crosses_link_to_setcc_successor") {
+    HYPERION_SKIP("generated code is AArch64; requires an AArch64 host to run");
+}
+
+HYPERION_TEST("translation_cache", "cc_wide_op_flushes_pending_descriptor") {
+    HYPERION_SKIP("generated code is AArch64; requires an AArch64 host to run");
+}
+
+HYPERION_TEST("translation_cache", "cc_adc_helper_boundary_flushes") {
+    HYPERION_SKIP("generated code is AArch64; requires an AArch64 host to run");
+}
+
+HYPERION_TEST("translation_cache", "cc_dec_loop_flags_match_interpreter") {
     HYPERION_SKIP("generated code is AArch64; requires an AArch64 host to run");
 }
 

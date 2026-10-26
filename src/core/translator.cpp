@@ -38,6 +38,13 @@ constexpr a64::Reg kT0 = 12;   // scratch
 constexpr a64::Reg kT1 = 13;   // scratch
 constexpr a64::Reg kT2 = 14;   // scratch
 constexpr a64::Reg kT3 = 15;   // scratch
+// Callee-saved registers held across every cached block (the cached-block
+// compiler section at the bottom of this file relies on the same values).
+constexpr a64::Reg kDispatchReg = 24; // void* jit_dispatch
+constexpr a64::Reg kInitBudget = 25;  // initial step budget
+constexpr a64::Reg kRemBudget = 26;   // remaining step budget
+constexpr a64::Reg kSavedState = 27;  // GuestState* (mirror of x8)
+constexpr a64::Reg kCtxReg = 28;      // ExecContext*
 
 // Guest-register allocation (Phase 5, BENCHMARKS.md §4.2.6).
 //
@@ -84,6 +91,10 @@ constexpr unsigned kOfOffset = offsetof(GuestState, flags) + offsetof(Flags, of)
 constexpr unsigned kPfAfPendingOffset = offsetof(GuestState, pf_af_pending);
 constexpr unsigned kPfAfResLowOffset = offsetof(GuestState, pf_af_res_low);
 constexpr unsigned kPfAfXorLowOffset = offsetof(GuestState, pf_af_xor_low);
+// P9 stage 2 pending cc descriptor (see the flag section below).
+constexpr unsigned kCcResultOffset = offsetof(GuestState, cc_result);
+constexpr unsigned kCcSrcOffset = offsetof(GuestState, cc_src);
+constexpr unsigned kCcOpOffset = offsetof(GuestState, cc_op);
 
 static_assert(std::is_trivially_copyable_v<GuestState>,
               "generated code relies on GuestState being a plain memory image");
@@ -514,6 +525,329 @@ void emit_pf_af_store(a64::Encoder& e, std::uint8_t mask, a64::Reg result, a64::
     }
 }
 
+// --- Pending cc descriptor (P9 stage 2) -------------------------------------
+//
+// Stage 1 deferred only PF/AF, the two flags whose materialisation is
+// expensive relative to how rarely they are read. The tier-0 census behind
+// this change (docs/translator-audit.md, flag-materialisation follow-up)
+// showed the same shape for the eager flags: ~94-99.9% of the CF/ZF/SF/OF
+// byte stores a producer emits are overwritten before any consumer reads
+// them, because the consumer that matters -- the block-final Jcc -- already
+// fuses to the producer's NZCV and never touches the bytes. The bytes are
+// written almost purely for the benefit of a hypothetical reader in a later
+// block.
+//
+// So a 32/64-bit add/sub/logical producer now records a descriptor instead
+// of materialising anything: the result and (for add/sub) the first operand
+// go to `GuestState::cc_result`/`cc_src`, and `cc_op` packs the kind, the
+// operand width and the mask of flags defined. Every flag is re-derivable
+// from those two words (b = result - a for add, a - result for sub; CF/OF
+// are the full-adder carry/overflow identities at the operand width; AF is
+// bit 4 of (a ^ b ^ result); PF is the result byte's parity), so the
+// descriptor is materialised only at the points that can observe flag
+// bytes, mirroring stage 1's synchronisation points:
+//
+//   1. the shared JIT-to-C++ exit epilogue (and emit_return), so C++ never
+//      sees a stale flag;
+//   2. `flush_pending_flags` (C++), which jit_exec_complex already calls
+//      before any helper re-enters the interpreter;
+//   3. a guard in front of every generated-code flag consumer
+//      (Setcc/Cmovcc/non-fused Jcc) and in front of writers that define only
+//      a subset of flags (the 8/16-bit path, INC/DEC's preserved CF).
+//
+// Producers whose mask is empty emit nothing at all, exactly as today. A
+// superseding producer simply overwrites the descriptor; liveness
+// (live_flags, seeded with kFbAll at every block exit) guarantees that any
+// flag the new descriptor does not define is either written by it or dead
+// until a later writer that itself defers or flushes. INC/DEC record
+// themselves as add/sub of 1 with CF clear in the mask, so materialisation
+// can never overwrite the CF they preserve; before recording, they flush a
+// pending descriptor that does define CF.
+//
+// The materialisation body lives in one shared stub at the head of the
+// exit-epilogue code (plus an inline copy in emit_return, whose standalone
+// path has no ExecContext): it preserves NZCV, so it is safe in front of
+// the fused-Jcc exit path, and clobbers only kT0-kT3, kB and kR, which are
+// dead at every guard site. Guards reach it with adr x30 + br through
+// ctx->jit_cc_materialise (the encoder has no bl); x30 is scratch inside a
+// block body.
+
+// Diagnostics mirror for tl_pf_af_deferred.
+thread_local std::uint32_t tl_cc_deferred = 0;
+
+struct CcDeferScope {
+    BlockTranslation& out;
+    std::uint32_t outer;
+    explicit CcDeferScope(BlockTranslation& target) : out(target), outer(tl_cc_deferred) {
+        tl_cc_deferred = 0;
+    }
+    ~CcDeferScope() {
+        out.cc_deferred = tl_cc_deferred;
+        tl_cc_deferred = outer;
+    }
+    CcDeferScope(const CcDeferScope&) = delete;
+    CcDeferScope& operator=(const CcDeferScope&) = delete;
+};
+
+// Record the cc descriptor for a producer instead of materialising flags.
+// `result` is the operation result (zero-extended for 32-bit ops) and `src`
+// the first operand `a`; both must still hold their values at the point of
+// the call, except that a caller whose result register overwrites `a` may
+// pre-store it with emit_cc_store_src() and pass store_src = false. Also
+// clears any pending PF/AF descriptor, which this descriptor supersedes.
+// Clobbers kT3.
+void emit_cc_store(a64::Encoder& e, std::uint32_t kind, bool is32, std::uint8_t mask,
+                   a64::Reg result, a64::Reg src, bool store_src) {
+    ++tl_cc_deferred;
+    e.str(a64::Width::k64, result, kState, kCcResultOffset);
+    if (store_src) {
+        e.str(a64::Width::k64, src, kState, kCcSrcOffset);
+    }
+    e.movz(a64::Width::k32, kT3, static_cast<std::uint16_t>(cc_op_pack(kind, is32, mask)));
+    e.str(a64::Width::k32, kT3, kState, kCcOpOffset);
+    e.strb(a64::kXzr, kState, kPfAfPendingOffset);
+}
+
+// Pre-store the descriptor's `a` operand before an operation whose result
+// register is the same register (see emit_cc_store).
+void emit_cc_store_src(a64::Encoder& e, a64::Reg src) {
+    e.str(a64::Width::k64, src, kState, kCcSrcOffset);
+}
+
+// Supersede a pending cc descriptor without materialising it: the caller is
+// writing the flag bytes itself, so the descriptor must not survive to be
+// materialised over them later.
+void emit_cc_clear(a64::Encoder& e) {
+    e.str(a64::Width::k32, a64::kXzr, kState, kCcOpOffset);
+}
+
+// Materialise the pending cc descriptor into the flag bytes and clear it
+// (and any PF/AF descriptor, which it supersedes). The caller guarantees a
+// descriptor is pending. Preserves NZCV; clobbers kT0-kT3, kB and kR. With
+// with_ret the sequence ends in `ret` and serves as the per-block stub.
+// Formulas verified exhaustively against the interpreter's flag semantics
+// (docs/translator-audit.md, flag-materialisation follow-up): AF/PF are
+// derived at natural width, then 32-bit operands are shifted up by 32 so
+// every sign test reads bit 63.
+void emit_cc_materialise(a64::Encoder& e, a64::Reg base, bool with_ret) {
+    const a64::Label add_kind = e.new_label();
+    const a64::Label sub_kind = e.new_label();
+    const a64::Label logic = e.new_label();
+    const a64::Label have_b = e.new_label();
+    const a64::Label no_af = e.new_label();
+    const a64::Label no_pf = e.new_label();
+    const a64::Label no_shift = e.new_label();
+    const a64::Label add_again = e.new_label();
+    const a64::Label have_b2 = e.new_label();
+    const a64::Label cf_add = e.new_label();
+    const a64::Label cf_done = e.new_label();
+    const a64::Label no_cf = e.new_label();
+    const a64::Label of_add = e.new_label();
+    const a64::Label of_done = e.new_label();
+    const a64::Label no_of = e.new_label();
+    const a64::Label no_sf = e.new_label();
+    const a64::Label no_zf = e.new_label();
+    const a64::Label lg_no_cf = e.new_label();
+    const a64::Label lg_no_of = e.new_label();
+    const a64::Label lg_no_af = e.new_label();
+    const a64::Label lg_no_pf = e.new_label();
+    const a64::Label lg_no_shift = e.new_label();
+    const a64::Label lg_no_sf = e.new_label();
+    const a64::Label lg_no_zf = e.new_label();
+    const a64::Label clear = e.new_label();
+
+    // kT0 = result, kT1 = a, kT2 = b, kT3 = packed cc_op, kR = defined mask,
+    // kB = kind.
+    e.ldr(a64::Width::k32, kT3, base, kCcOpOffset);
+    e.ldr(a64::Width::k64, kT0, base, kCcResultOffset);
+    e.ldr(a64::Width::k64, kT1, base, kCcSrcOffset);
+    e.ubfx(a64::Width::k32, kR, kT3, 3, 6);
+    e.ubfx(a64::Width::k32, kB, kT3, 0, 2);
+    e.tbz(kB, 1, add_kind); // kind add (1)
+    e.tbz(kB, 0, sub_kind); // kind sub (2)
+    e.b(logic);             // kind logic (3)
+    e.bind(add_kind);
+    e.sub(a64::Width::k64, kT2, kT0, kT1); // add: b = result - a
+    e.b(have_b);
+    e.bind(sub_kind);
+    e.sub(a64::Width::k64, kT2, kT1, kT0); // b = a - result
+    e.bind(have_b);
+    // AF = bit 4 of (a ^ b ^ result); consumes b (re-derived below).
+    e.eor(a64::Width::k64, kT2, kT1, kT2);
+    e.eor(a64::Width::k64, kT2, kT2, kT0);
+    e.ubfx(a64::Width::k64, kT2, kT2, 4, 1);
+    e.tbz(kR, 2, no_af);
+    e.strb(kT2, base, kAfOffset);
+    e.bind(no_af);
+    // PF = parity of the result's low byte.
+    emit_parity(e, kT2, kT0);
+    e.tbz(kR, 1, no_pf);
+    e.strb(kT2, base, kPfOffset);
+    e.bind(no_pf);
+    // Normalise 32-bit operands so the sign bit is bit 63.
+    e.tbz(kT3, 2, no_shift);
+    e.lsl_imm(a64::Width::k64, kT0, kT0, 32);
+    e.lsl_imm(a64::Width::k64, kT1, kT1, 32);
+    e.bind(no_shift);
+    // Re-derive b at the normalised width.
+    e.tbz(kB, 1, add_again);
+    e.sub(a64::Width::k64, kT2, kT1, kT0); // sub: b = a - result
+    e.b(have_b2);
+    e.bind(add_again);
+    e.sub(a64::Width::k64, kT2, kT0, kT1); // add: b = result - a
+    e.bind(have_b2);
+    // CF: add carry = ((a & b) | ((a | b) & ~result)); sub borrow =
+    // ((~a & b) | (~(a ^ b) & result)); the top bit is the flag.
+    e.tbz(kB, 1, cf_add);
+    e.mvn(a64::Width::k64, kT3, kT1);
+    e.and_(a64::Width::k64, kT3, kT3, kT2);
+    e.eor(a64::Width::k64, kB, kT1, kT2);
+    e.mvn(a64::Width::k64, kB, kB);
+    e.and_(a64::Width::k64, kB, kB, kT0);
+    e.orr(a64::Width::k64, kT3, kT3, kB);
+    e.b(cf_done);
+    e.bind(cf_add);
+    e.and_(a64::Width::k64, kT3, kT1, kT2);
+    e.orr(a64::Width::k64, kB, kT1, kT2);
+    e.mvn(a64::Width::k64, kT2, kT0);
+    e.and_(a64::Width::k64, kB, kB, kT2);
+    e.orr(a64::Width::k64, kT3, kT3, kB);
+    e.bind(cf_done);
+    e.ubfx(a64::Width::k64, kT3, kT3, 63, 1);
+    e.tbz(kR, 0, no_cf);
+    e.strb(kT3, base, kCfOffset);
+    e.bind(no_cf);
+    // OF: add = ((a ^ result) & (b ^ result)); sub = ((a ^ b) & (a ^ result)).
+    // The kind was consumed above, so reload the descriptor and re-derive b.
+    e.ldr(a64::Width::k32, kB, base, kCcOpOffset);
+    e.tbz(kB, 1, of_add);
+    e.sub(a64::Width::k64, kT2, kT1, kT0);
+    e.eor(a64::Width::k64, kT3, kT1, kT2);
+    e.eor(a64::Width::k64, kB, kT1, kT0);
+    e.and_(a64::Width::k64, kT3, kT3, kB);
+    e.b(of_done);
+    e.bind(of_add);
+    e.sub(a64::Width::k64, kT2, kT0, kT1);
+    e.eor(a64::Width::k64, kT3, kT1, kT0);
+    e.eor(a64::Width::k64, kB, kT2, kT0);
+    e.and_(a64::Width::k64, kT3, kT3, kB);
+    e.bind(of_done);
+    e.ubfx(a64::Width::k64, kT3, kT3, 63, 1);
+    e.tbz(kR, 5, no_of);
+    e.strb(kT3, base, kOfOffset);
+    e.bind(no_of);
+    // SF = top bit of the (normalised) result.
+    e.ubfx(a64::Width::k64, kT3, kT0, 63, 1);
+    e.tbz(kR, 4, no_sf);
+    e.strb(kT3, base, kSfOffset);
+    e.bind(no_sf);
+    // ZF = (result == 0), tested as the top bit of (result | -result).
+    e.mvn(a64::Width::k64, kT3, kT0);
+    e.add_imm(a64::Width::k64, kT3, kT3, 1);
+    e.orr(a64::Width::k64, kT3, kT3, kT0);
+    e.ubfx(a64::Width::k64, kT3, kT3, 63, 1);
+    e.movz(a64::Width::k32, kB, 1);
+    e.eor(a64::Width::k64, kT3, kT3, kB);
+    e.tbz(kR, 3, no_zf);
+    e.strb(kT3, base, kZfOffset);
+    e.bind(no_zf);
+    e.b(clear);
+
+    // Logical ops: CF/OF/AF are defined as zero; SF/ZF/PF come from result.
+    e.bind(logic);
+    e.tbz(kR, 0, lg_no_cf);
+    e.strb(a64::kXzr, base, kCfOffset);
+    e.bind(lg_no_cf);
+    e.tbz(kR, 5, lg_no_of);
+    e.strb(a64::kXzr, base, kOfOffset);
+    e.bind(lg_no_of);
+    e.tbz(kR, 2, lg_no_af);
+    e.strb(a64::kXzr, base, kAfOffset);
+    e.bind(lg_no_af);
+    emit_parity(e, kT2, kT0);
+    e.tbz(kR, 1, lg_no_pf);
+    e.strb(kT2, base, kPfOffset);
+    e.bind(lg_no_pf);
+    e.tbz(kT3, 2, lg_no_shift);
+    e.lsl_imm(a64::Width::k64, kT0, kT0, 32);
+    e.bind(lg_no_shift);
+    e.ubfx(a64::Width::k64, kT3, kT0, 63, 1);
+    e.tbz(kR, 4, lg_no_sf);
+    e.strb(kT3, base, kSfOffset);
+    e.bind(lg_no_sf);
+    e.mvn(a64::Width::k64, kT3, kT0);
+    e.add_imm(a64::Width::k64, kT3, kT3, 1);
+    e.orr(a64::Width::k64, kT3, kT3, kT0);
+    e.ubfx(a64::Width::k64, kT3, kT3, 63, 1);
+    e.movz(a64::Width::k32, kB, 1);
+    e.eor(a64::Width::k64, kT3, kT3, kB);
+    e.tbz(kR, 3, lg_no_zf);
+    e.strb(kT3, base, kZfOffset);
+    e.bind(lg_no_zf);
+
+    e.bind(clear);
+    // Full-word clear: the packed descriptor uses up to 9 bits, so clearing
+    // only the low byte would leave a nonzero residue C++ could misread.
+    e.str(a64::Width::k32, a64::kXzr, base, kCcOpOffset);
+    e.strb(a64::kXzr, base, kPfAfPendingOffset);
+    if (with_ret) {
+        e.ret();
+    }
+}
+
+// Guard emitted before generated code observes flag bytes: materialise the
+// pending cc descriptor when one exists. The materialisation body is shared
+// (one copy in the exit-epilogue code, addressed by ctx->jit_cc_materialise,
+// on the kSavedState base that mirrors kState inside every block); the guard
+// reaches it with adr x30 + br, which costs five words and nothing when no
+// descriptor is pending beyond the ldrb/cbz pair. x30 is scratch inside a
+// block body.
+void emit_cc_guard(a64::Encoder& e) {
+    const a64::Label done = e.new_label();
+    e.ldrb(kT3, kState, kCcOpOffset);
+    e.cbz(a64::Width::k32, kT3, done);
+    e.adr(a64::kLr, done);
+    e.ldr(a64::Width::k64, kT3, kCtxReg, offsetof(ExecContext, jit_cc_materialise));
+    e.br(kT3);
+    e.bind(done);
+}
+
+// Like emit_cc_guard, but materialises only when the pending descriptor
+// defines CF. INC/DEC use this: they overwrite every other flag, so only a
+// pending CF needs flushing before they record their own descriptor.
+void emit_cc_guard_cf(a64::Encoder& e) {
+    const a64::Label done = e.new_label();
+    e.ldr(a64::Width::k32, kT3, kState, kCcOpOffset);
+    e.cbz(a64::Width::k32, kT3, done);
+    e.tbz(kT3, 3, done); // mask bit 0 (CF) sits at cc_op bit 3
+    e.adr(a64::kLr, done);
+    e.ldr(a64::Width::k64, kT3, kCtxReg, offsetof(ExecContext, jit_cc_materialise));
+    e.br(kT3);
+    e.bind(done);
+}
+
+// Label variant for the exit epilogue, which sits in the same buffer as the
+// shared stub and can branch to it directly.
+void emit_cc_guard_label(a64::Encoder& e, a64::Reg base, const a64::Label& stub) {
+    const a64::Label done = e.new_label();
+    e.ldrb(kT3, base, kCcOpOffset);
+    e.cbz(a64::Width::k32, kT3, done);
+    e.adr(a64::kLr, done);
+    e.b(stub);
+    e.bind(done);
+}
+
+// Inline variant for emit_return (the standalone path has no ExecContext,
+// so it carries its own copy; the descriptor is never pending there in
+// practice, but the check keeps the invariant unconditional).
+void emit_cc_guard_inline(a64::Encoder& e, a64::Reg base) {
+    const a64::Label done = e.new_label();
+    e.ldrb(kT3, base, kCcOpOffset);
+    e.cbz(a64::Width::k32, kT3, done);
+    emit_cc_materialise(e, base, false);
+    e.bind(done);
+}
+
 // Emitted immediately before generated code reads PF/AF. Skips the
 // materialisation entirely when nothing is pending, which is the common case
 // once the flags have been flushed at an exit. Preserves NZCV.
@@ -603,6 +937,7 @@ void emit_return(a64::Encoder& e, BlockResult result, const RegAlloc* ra = nullp
     // has to be materialised before C++ (or the test harness) can read
     // `GuestState::flags`. Same forcing rule as the shared exit epilogue, which
     // this is the direct-`ret` equivalent of.
+    emit_cc_guard_inline(e, kState);
     emit_pf_af_guard(e, kFbPfAf, kState);
     if (set_single_run) {
         e.movz(a64::Width::k64, 1, 1);
@@ -817,7 +1152,8 @@ const char* to_string(BlockExit exit) {
 namespace {
 
 TranslateError emit_one(a64::Encoder& e, const Instruction& insn, bool write_rip,
-                        std::uint8_t live_flags, const RegAlloc* ra = nullptr) {
+                        std::uint8_t live_flags, const RegAlloc* ra = nullptr,
+                        bool cc_defer = false, bool cc_clear = false) {
     const bool is32 = insn.dst.size == OperandSize::k32;
     const a64::Width w = is32 ? a64::Width::k32 : a64::Width::k64;
     const int bits = is32 ? 32 : 64;
@@ -1021,13 +1357,28 @@ TranslateError emit_one(a64::Encoder& e, const Instruction& insn, bool write_rip
                 break;
             }
             if (mask != 0) {
-                emit_flags_logical(e, w, mask, R);
-                // Logical ops define AF as 0, so a zero xor byte is exact.
-                emit_pf_af_store(e, mask, R, a64::kXzr);
+                if (cc_defer) {
+                    // Record a cc descriptor instead of materialising flags.
+                    emit_cc_store(e, kCcKindLogic, is32, mask, R, a64::kXzr, false);
+                    // A block-final Jcc may still fuse to this producer's
+                    // NZCV, which emit_flags_logical used to set with a
+                    // compare against zero; keep that compare (the descriptor
+                    // does not carry NZCV). Unconditional: a CF/OF-only
+                    // consumer (JB/JO) reads C/V without needing ZF/SF live.
+                    e.cmp_imm(w, R, 0);
+                } else {
+                    emit_flags_logical(e, w, mask, R);
+                    // Logical ops define AF as 0, so a zero xor byte is exact.
+                    emit_pf_af_store(e, mask, R, a64::kXzr);
+                    if (cc_clear) {
+                        emit_cc_clear(e); // eager bytes supersede a pending descriptor
+                    }
+                }
             }
         } else if (imm_folded) {
+            const bool defer = cc_defer && mask != 0;
             const auto imm_nibble = static_cast<std::uint32_t>(imm_value & 0xFULL);
-            const bool pfaf_live = (mask & kFbPfAf) != 0;
+            const bool pfaf_live = !defer && (mask & kFbPfAf) != 0;
             // AF = bit 4 of (a ^ imm ^ r). When the immediate's low nibble is
             // zero, no carry can enter bit 4, so AF is identically 0 and the
             // descriptor's xor byte can be the zero register.
@@ -1037,44 +1388,65 @@ TranslateError emit_one(a64::Encoder& e, const Instruction& insn, bool write_rip
                 e.mov_reg(a64::Width::k64, kT2, A);
                 prev_a = kT2;
             }
+            if (defer && R == A) {
+                emit_cc_store_src(e, A); // capture `a` before the op overwrites it
+            }
             if (is_sub) {
                 e.subs_imm(w, R, A, imm12, shift12);
             } else {
                 e.adds_imm(w, R, A, imm12, shift12);
             }
-            if (af_from_xor) {
-                // xor byte = a ^ r, with bit 4 toggled when bit 4 of the
-                // immediate is set. Complementing the whole word is the cheap
-                // way to do that: only bit 4 of the xor byte is read back.
-                e.eor(a64::Width::k64, kT2, prev_a, R);
-                if ((imm_value & 0x10ULL) != 0) {
-                    e.mvn(a64::Width::k32, kT2, kT2);
+            if (defer) {
+                emit_cc_store(e, is_sub ? kCcKindSub : kCcKindAdd, is32, mask, R, A, R != A);
+            } else {
+                if (af_from_xor) {
+                    // xor byte = a ^ r, with bit 4 toggled when bit 4 of the
+                    // immediate is set. Complementing the whole word is the cheap
+                    // way to do that: only bit 4 of the xor byte is read back.
+                    e.eor(a64::Width::k64, kT2, prev_a, R);
+                    if ((imm_value & 0x10ULL) != 0) {
+                        e.mvn(a64::Width::k32, kT2, kT2);
+                    }
+                }
+                const auto eager_mask = static_cast<std::uint8_t>(mask & ~kFbPfAf);
+                if (eager_mask != 0) {
+                    emit_flags_from_nzcv(e, is_sub, eager_mask, kT2, R);
+                }
+                emit_pf_af_store(e, mask, R, af_from_xor ? kT2 : a64::kXzr);
+                if (cc_clear) {
+                    emit_cc_clear(e);
                 }
             }
-            const auto eager_mask = static_cast<std::uint8_t>(mask & ~kFbPfAf);
-            if (eager_mask != 0) {
-                emit_flags_from_nzcv(e, is_sub, eager_mask, kT2, R);
-            }
-            emit_pf_af_store(e, mask, R, af_from_xor ? kT2 : a64::kXzr);
         } else {
-            const bool pfaf_live = (mask & kFbPfAf) != 0;
+            const bool defer = cc_defer && mask != 0;
+            const bool pfaf_live = !defer && (mask & kFbPfAf) != 0;
             if (pfaf_live) {
                 // t2 = a ^ b, completed to (a ^ b ^ r) after the op: bit 4 is AF.
                 e.eor(a64::Width::k64, kT2, A, B);
+            }
+            if (defer && R == A) {
+                emit_cc_store_src(e, A); // capture `a` before the op overwrites it
             }
             if (is_sub) {
                 e.subs(w, R, A, B);
             } else {
                 e.adds(w, R, A, B);
             }
-            if (pfaf_live) {
-                e.eor(a64::Width::k64, kT2, kT2, R);
+            if (defer) {
+                emit_cc_store(e, is_sub ? kCcKindSub : kCcKindAdd, is32, mask, R, A, R != A);
+            } else {
+                if (pfaf_live) {
+                    e.eor(a64::Width::k64, kT2, kT2, R);
+                }
+                const auto eager_mask = static_cast<std::uint8_t>(mask & ~kFbPfAf);
+                if (eager_mask != 0) {
+                    emit_flags_from_nzcv(e, is_sub, eager_mask, kT2, R);
+                }
+                emit_pf_af_store(e, mask, R, kT2);
+                if (cc_clear) {
+                    emit_cc_clear(e);
+                }
             }
-            const auto eager_mask = static_cast<std::uint8_t>(mask & ~kFbPfAf);
-            if (eager_mask != 0) {
-                emit_flags_from_nzcv(e, is_sub, eager_mask, kT2, R);
-            }
-            emit_pf_af_store(e, mask, R, kT2);
         }
 
         if (writes_dst && R == kR) {
@@ -1104,7 +1476,20 @@ TranslateError emit_one(a64::Encoder& e, const Instruction& insn, bool write_rip
             static_cast<std::uint8_t>(flags_written(insn.opcode) & live_flags);
         const a64::Reg R =
             (ra != nullptr && ra->mapped(insn.dst.reg)) ? ra->host(insn.dst.reg) : kR;
-        const bool pfaf_live = (mask & kFbPfAf) != 0;
+        const bool defer = cc_defer && mask != 0;
+        if (defer) {
+            // INC/DEC preserve CF: flush a pending descriptor that defines
+            // it, then record this op as add/sub of 1 whose mask (from
+            // flags_written) already excludes CF.
+            emit_cc_guard_cf(e);
+            emit_cc_store_src(e, A); // capture `a` before the op overwrites it
+        } else if (cc_clear && mask != 0) {
+            // Eager path in a cached block: a pending descriptor's CF must
+            // still be flushed (INC/DEC preserve it), and the descriptor
+            // cleared once the eager bytes are written below.
+            emit_cc_guard_cf(e);
+        }
+        const bool pfaf_live = !defer && (mask & kFbPfAf) != 0;
         a64::Reg prev_a = A;
         if (pfaf_live && R == A) {
             e.mov_reg(a64::Width::k64, kT2, A);
@@ -1115,14 +1500,21 @@ TranslateError emit_one(a64::Encoder& e, const Instruction& insn, bool write_rip
         } else {
             e.adds_imm(w, R, A, 1);
         }
-        if (pfaf_live) {
-            e.eor(a64::Width::k64, kT2, prev_a, R); // bit 4 = AF
+        if (defer) {
+            emit_cc_store(e, is_sub ? kCcKindSub : kCcKindAdd, is32, mask, R, A, false);
+        } else {
+            if (pfaf_live) {
+                e.eor(a64::Width::k64, kT2, prev_a, R); // bit 4 = AF
+            }
+            const auto eager_mask = static_cast<std::uint8_t>(mask & ~kFbPfAf);
+            if (eager_mask != 0) {
+                emit_flags_from_nzcv(e, is_sub, eager_mask, kT2, R);
+            }
+            emit_pf_af_store(e, mask, R, kT2);
+            if (cc_clear && mask != 0) {
+                emit_cc_clear(e);
+            }
         }
-        const auto eager_mask = static_cast<std::uint8_t>(mask & ~kFbPfAf);
-        if (eager_mask != 0) {
-            emit_flags_from_nzcv(e, is_sub, eager_mask, kT2, R);
-        }
-        emit_pf_af_store(e, mask, R, kT2);
         if (R == kR) {
             store_gpr_rb(e, ra, kR, insn.dst.reg);
         }
@@ -1679,11 +2071,6 @@ BlockTranslation translate_block(const std::uint8_t* code, std::size_t size,
 
 namespace {
 
-constexpr a64::Reg kDispatchReg = 24;      // void* jit_dispatch (callee-saved)
-constexpr a64::Reg kInitBudget = 25;       // initial step budget (callee-saved)
-constexpr a64::Reg kRemBudget = 26;        // remaining step budget (callee-saved)
-constexpr a64::Reg kSavedState = 27;       // GuestState* (callee-saved mirror of x8)
-constexpr a64::Reg kCtxReg = 28;           // ExecContext* (callee-saved)
 constexpr std::size_t kCachedMaxAlloc = 5; // x19..x23
 
 // Canonical guest-register allocation for cached blocks: every block uses
@@ -2442,13 +2829,22 @@ JitTrampolines build_jit_trampolines() {
     // 3. Shared exit epilogue (`ctx->jit_exit_epilogue`): expects `x0` = `BlockResult`.
     {
         a64::Encoder e;
-        // Materialise any pending PF/AF *before* control reaches C++: this is the
-        // one funnel every block exit, budget exhaustion, dispatcher miss and
-        // fault path goes through, so the interpreter, syscall layer and tests can
-        // never observe a stale `GuestState::flags`. Costs two instructions when
-        // nothing is pending. Deliberately not emitted on the dispatcher's
-        // jump-table hit path, which stays inside generated code: a linked block
-        // that does not read PF/AF keeps the descriptor alive.
+        // The shared pending-cc materialisation stub (P9 stage 2) is appended
+        // after the epilogue in this buffer (ctx->jit_cc_materialise points
+        // at it, and the epilogue guard below branches forward to it) so the
+        // epilogue entry stays at offset 0 for ctx->jit_exit_epilogue. It
+        // runs on the kSavedState base, which mirrors kState inside every
+        // block, and returns on x30.
+        const a64::Label cc_materialise_sub = e.new_label();
+        // Materialise any pending flags *before* control reaches C++: this is
+        // the one funnel every block exit, budget exhaustion, dispatcher miss
+        // and fault path goes through, so the interpreter, syscall layer and
+        // tests can never observe a stale `GuestState::flags`. Costs two
+        // instructions when nothing is pending. Deliberately not emitted on
+        // the dispatcher's jump-table hit path, which stays inside generated
+        // code: a linked block that does not read PF/AF keeps the descriptor
+        // alive.
+        emit_cc_guard_label(e, kSavedState, cc_materialise_sub);
         emit_pf_af_guard(e, kFbPfAf, kSavedState);
         // Every C++-bound path funnels through here (block exits, budget
         // exhaustion via x29, dispatcher misses, faults), so this is where
@@ -2469,7 +2865,19 @@ JitTrampolines build_jit_trampolines() {
         e.ldp_off(27, 28, a64::kSp, 80);
         e.ldp_post(29, 30, a64::kSp, 128);
         e.ret();
+        // Shared pending-cc materialisation stub (see the head of this
+        // section); reached only via ctx->jit_cc_materialise or the guard at
+        // the head of the epilogue, never by fall-through (the epilogue ends
+        // in `ret` above).
+        e.bind(cc_materialise_sub);
+        emit_cc_materialise(e, kSavedState, true);
         out.exit_code = e.bytes();
+        // The stub's offset is the epilogue size; measure the stub with a
+        // scratch encoder (bytes() cannot be called mid-stream: it requires
+        // every label bound).
+        a64::Encoder stub_probe;
+        emit_cc_materialise(stub_probe, kSavedState, true);
+        out.cc_materialise_offset = out.exit_code.size() - stub_probe.bytes().size();
     }
 
     // 4. Canonical-XMM-preserving C++ call (`ctx->jit_preserve_call`):
@@ -2514,6 +2922,7 @@ BlockTranslation translate_cached_block(const std::uint8_t* code, std::size_t si
                                         const Instruction& first) {
     BlockTranslation out;
     const PfAfDeferScope pf_af_scope(out);
+    const CcDeferScope cc_scope(out);
     constexpr std::size_t kMaxCachedBlockInsns = 256;
 
     // P14 stage 1: the block is a vector of IrInsn (instruction + facts), so the
@@ -2632,15 +3041,33 @@ BlockTranslation translate_cached_block(const std::uint8_t* code, std::size_t si
         return lbl;
     };
 
+    // Pending-cc guards (P9 stage 2): branch to the shared materialisation
+    // stub (ctx->jit_cc_materialise) when a producer deferred its flags and
+    // a consumer (or a subset-writing instruction) needs the bytes.
+    auto cc_guard = [&]() { emit_cc_guard(e); };
+    auto cc_guard_cf = [&]() { emit_cc_guard_cf(e); };
+
     // Emit one non-control-flow instruction `steps[idx]`.
     auto emit_cached_body_insn = [&](std::size_t idx) -> TranslateError {
         const Instruction& in = steps[idx].insn;
         const std::uint8_t lflags = steps[idx].live_flags;
         const std::uint64_t next_rip = in.address + in.length;
 
+        // A flag producer immediately followed by a Setcc/Cmovcc consumer
+        // gains nothing from deferring: the consumer would flush the
+        // descriptor (~40 instructions) on the next instruction anyway.
+        // Emit the eager flag bytes for such producers instead; the
+        // descriptor path serves producers whose flags are consumed by a
+        // fused Jcc, a later block, or nobody.
+        const bool next_is_flag_consumer =
+            idx + 1 < steps.size() && (steps[idx + 1].insn.opcode == Opcode::kSetcc ||
+                                       steps[idx + 1].insn.opcode == Opcode::kCmovcc);
+        const bool defer_flags = !next_is_flag_consumer;
+
         // Fast reuse of proven 32/64-bit register/imm ALU/LEA/MOV codegen!
         if (is_classic_fast_alu(in)) {
-            return emit_one(e, in, /*write_rip=*/false, lflags, &ra);
+            return emit_one(e, in, /*write_rip=*/false, lflags, &ra, defer_flags,
+                            /*cc_clear=*/true);
         }
 
         const int bits = op_bits(in.dst.size);
@@ -2759,11 +3186,21 @@ BlockTranslation translate_cached_block(const std::uint8_t* code, std::size_t si
                         break;
                     }
                     if (lflags != 0) {
-                        emit_flags_logical(e, w, lflags, kR);
-                        emit_pf_af_store(e, lflags, kR, a64::kXzr); // AF is 0
+                        if (defer_flags) {
+                            // Record a cc descriptor instead of materialising.
+                            emit_cc_store(e, kCcKindLogic, bits == 32, lflags, kR, a64::kXzr,
+                                          false);
+                            // Preserve the NZCV a fused block-final Jcc reads
+                            // (see the emit_one logical path).
+                            e.cmp_imm(w, kR, 0);
+                        } else {
+                            emit_flags_logical(e, w, lflags, kR);
+                            emit_pf_af_store(e, lflags, kR, a64::kXzr); // AF is 0
+                            emit_cc_clear(e);
+                        }
                     }
                 } else {
-                    const bool pfaf_live = (lflags & kFbPfAf) != 0;
+                    const bool pfaf_live = !defer_flags && (lflags & kFbPfAf) != 0;
                     if (pfaf_live) {
                         e.eor(a64::Width::k64, kT2, kA, kB);
                     }
@@ -2772,14 +3209,22 @@ BlockTranslation translate_cached_block(const std::uint8_t* code, std::size_t si
                     } else {
                         e.adds(w, kR, kA, kB);
                     }
-                    if (pfaf_live) {
-                        e.eor(a64::Width::k64, kT2, kT2, kR); // bit 4 = AF
+                    if (lflags != 0) {
+                        if (defer_flags) {
+                            emit_cc_store(e, is_sub ? kCcKindSub : kCcKindAdd, bits == 32, lflags,
+                                          kR, kA, true);
+                        } else {
+                            if (pfaf_live) {
+                                e.eor(a64::Width::k64, kT2, kT2, kR); // bit 4 = AF
+                            }
+                            const auto eager_mask = static_cast<std::uint8_t>(lflags & ~kFbPfAf);
+                            if (eager_mask != 0) {
+                                emit_flags_from_nzcv(e, is_sub, eager_mask, kT2, kR);
+                            }
+                            emit_pf_af_store(e, lflags, kR, kT2);
+                            emit_cc_clear(e);
+                        }
                     }
-                    const auto eager_mask = static_cast<std::uint8_t>(lflags & ~kFbPfAf);
-                    if (eager_mask != 0) {
-                        emit_flags_from_nzcv(e, is_sub, eager_mask, kT2, kR);
-                    }
-                    emit_pf_af_store(e, lflags, kR, kT2);
                 }
 
                 if (writes_dst) {
@@ -2819,6 +3264,17 @@ BlockTranslation translate_cached_block(const std::uint8_t* code, std::size_t si
                 (in.dst.kind == OperandKind::kMemory || in.src.kind == OperandKind::kMemory)
                     ? make_fault_label(idx)
                     : a64::Label{0};
+            // This path writes all six flags itself (bytes for CF/ZF/SF/OF,
+            // the PF/AF descriptor for PF/AF), so a pending cc descriptor is
+            // superseded, not materialised: liveness guarantees every flag
+            // the descriptor defines is either written here or dead until a
+            // later writer. Clearing the descriptor (one store) is enough --
+            // materialising it would compute six flags that are about to be
+            // overwritten, which the tier-0 census showed is the common case
+            // in byte-compare loops.
+            if (lflags != 0) {
+                emit_cc_clear(e);
+            }
             if (in.dst.kind == OperandKind::kMemory) {
                 emit_effective_address_jit(e, ra, in.dst.mem, next_rip, kB, kT0);
                 if (writes_dst) {
@@ -2913,32 +3369,56 @@ BlockTranslation translate_cached_block(const std::uint8_t* code, std::size_t si
                     read_gpr_sized_jit(e, ra, in.dst.reg, in.dst.size, false, kA);
                 }
                 if (in.opcode == Opcode::kNeg) {
-                    const bool pfaf_live = (lflags & kFbPfAf) != 0;
+                    // NEG is SUB from zero: record it as a sub descriptor
+                    // whose `a` operand is zero.
+                    const bool pfaf_live = !defer_flags && (lflags & kFbPfAf) != 0;
                     e.subs(w, kR, a64::kXzr, kA);
-                    if (pfaf_live) {
-                        e.eor(a64::Width::k64, kT2, kA, kR); // 0 ^ a ^ r; bit 4 = AF
+                    if (lflags != 0) {
+                        if (defer_flags) {
+                            emit_cc_store(e, kCcKindSub, bits == 32, lflags, kR, a64::kXzr, true);
+                        } else {
+                            if (pfaf_live) {
+                                e.eor(a64::Width::k64, kT2, kA, kR); // 0 ^ a ^ r; bit 4 = AF
+                            }
+                            const auto eager_mask = static_cast<std::uint8_t>(lflags & ~kFbPfAf);
+                            if (eager_mask != 0) {
+                                emit_flags_from_nzcv(e, /*is_sub=*/true, eager_mask, kT2, kR);
+                            }
+                            emit_pf_af_store(e, lflags, kR, kT2);
+                            emit_cc_clear(e);
+                        }
                     }
-                    const auto eager_mask = static_cast<std::uint8_t>(lflags & ~kFbPfAf);
-                    if (eager_mask != 0) {
-                        emit_flags_from_nzcv(e, /*is_sub=*/true, eager_mask, kT2, kR);
-                    }
-                    emit_pf_af_store(e, lflags, kR, kT2);
                 } else {
                     const bool is_sub = (in.opcode == Opcode::kDec);
-                    const bool pfaf_live = (lflags & kFbPfAf) != 0;
+                    if (lflags != 0) {
+                        // Preserve a pending CF before recording (INC/DEC
+                        // write every other flag themselves). Also required
+                        // on the eager path, which leaves the CF byte alone.
+                        cc_guard_cf();
+                    }
+                    const bool pfaf_live = !defer_flags && (lflags & kFbPfAf) != 0;
                     if (is_sub) {
                         e.subs_imm(w, kR, kA, 1);
                     } else {
                         e.adds_imm(w, kR, kA, 1);
                     }
-                    if (pfaf_live) {
-                        e.eor(a64::Width::k64, kT2, kA, kR); // a ^ 1 ^ r; bit 4 = AF
+                    if (lflags != 0) {
+                        if (defer_flags) {
+                            // mask (from flags_written) already excludes CF.
+                            emit_cc_store(e, is_sub ? kCcKindSub : kCcKindAdd, bits == 32, lflags,
+                                          kR, kA, true);
+                        } else {
+                            if (pfaf_live) {
+                                e.eor(a64::Width::k64, kT2, kA, kR); // a ^ 1 ^ r; bit 4 = AF
+                            }
+                            const auto eager_mask = static_cast<std::uint8_t>(lflags & ~kFbPfAf);
+                            if (eager_mask != 0) {
+                                emit_flags_from_nzcv(e, is_sub, eager_mask, kT2, kR);
+                            }
+                            emit_pf_af_store(e, lflags, kR, kT2);
+                            emit_cc_clear(e);
+                        }
                     }
-                    const auto eager_mask = static_cast<std::uint8_t>(lflags & ~kFbPfAf);
-                    if (eager_mask != 0) {
-                        emit_flags_from_nzcv(e, is_sub, eager_mask, kT2, kR);
-                    }
-                    emit_pf_af_store(e, lflags, kR, kT2);
                 }
                 if (in.dst.kind == OperandKind::kMemory) {
                     e.ldr(a64::Width::k64, kB, a64::kSp, kScratchSlot1);
@@ -3038,6 +3518,7 @@ BlockTranslation translate_cached_block(const std::uint8_t* code, std::size_t si
         }
 
         case Opcode::kSetcc: {
+            cc_guard(); // the condition reads flag bytes
             emit_eval_cond_to_reg(e, in.condition, kR);
             if (in.dst.kind == OperandKind::kRegister) {
                 write_gpr_sized_jit(e, ra, in.dst.reg, OperandSize::k8, in.dst.high_byte, kR, kT0);
@@ -3053,6 +3534,7 @@ BlockTranslation translate_cached_block(const std::uint8_t* code, std::size_t si
             if (bits == 32 || bits == 64) {
                 const a64::Label flbl =
                     (in.src.kind == OperandKind::kMemory) ? make_fault_label(idx) : a64::Label{0};
+                cc_guard(); // before the operand load: materialisation clobbers kB
                 load_any_op(in.src, kB, flbl); // x86 rule: memory read unconditionally!
                 read_gpr_sized_jit(e, ra, in.dst.reg, in.dst.size, false, kA);
                 emit_eval_cond_to_reg(e, in.condition, kT0);
@@ -3749,6 +4231,10 @@ BlockTranslation translate_cached_block(const std::uint8_t* code, std::size_t si
         e.mov_imm64(kA, target); // next PC is fallthrough past Jcc!
 
         e.bind(emit_flags_common);
+        // Flush any descriptor deferred by a loop-body producer before the
+        // loop producer's own flags are materialised eagerly below (the
+        // materialisation preserves the NZCV they are read from).
+        cc_guard();
         const auto loop_eager_mask = static_cast<std::uint8_t>(exit_mask & ~kFbPfAf);
         if (is_logical) {
             emit_flags_logical(e, w, loop_eager_mask, R);
@@ -3926,6 +4412,7 @@ BlockTranslation translate_cached_block(const std::uint8_t* code, std::size_t si
                         try_nzcv_cond(prev.opcode, step.insn.condition, fused);
                 }
                 if (!prev_fusible) {
+                    cc_guard(); // the condition reads flag bytes
                     emit_eval_cond_to_reg(e, step.insn.condition, kT0);
                     e.cmp_imm(a64::Width::k32, kT0, 0);
                     fused = a64::Cond::kNe;
