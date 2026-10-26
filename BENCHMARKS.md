@@ -610,6 +610,44 @@ and under qemu (419 passed / 0 failed / 5 skipped), including two new
 regression tests for canonical values crossing block boundaries and for
 state synchronisation on a budget-exhaustion exit.
 
+### 4.5 Canonical XMM residency (shipped)
+
+Guest `xmm0..7` now live in host `q16..q23` across JIT-internal block
+boundaries (audit issue #17), under the same contract as the canonical
+GPRs: loaded once by the entry trampoline, stored by the shared exit
+epilogue (the single C++ funnel), spilled/reloaded around Tier-B helper
+calls, and preserved around SoftTlb slow-path C++ calls by one shared
+generated trampoline (`ctx->jit_preserve_call`) so each slow stub costs
+one extra word instead of an 8-word spill/reload pair. A pre-change
+traffic census (tier-0 instrumented simulation of the tier-1 emission
+model) counted 8.17M GuestState XMM accesses in `sha256`
+(0.40/instruction); residency removes ~99 % of them. `xmm8..15` stay
+memory-resident.
+
+Measured on this host under qemu-user (candidate/baseline execution
+time, 36 interleaved pairs per guest, order rotated):
+
+| guest | median ratio | bootstrap 95 % CI |
+| --- | --- | --- |
+| `sha256` | 0.832 | [0.818, 0.841] |
+| `sieve` | 0.982 | [0.966, 1.005] |
+| `nqueens` | 0.995 | [0.969, 1.011] |
+| `qsort_glibc` | 0.996 | [0.981, 1.010] |
+| `quicksort_c` | 1.017 | [1.004, 1.023] |
+
+The SSE-dense workload is ~17 % faster; three guests are flat.
+`quicksort_c` shows a consistent ~1.7 % cost on this rig despite its
+hot generated code being byte-identical (its SSE traffic is ~800
+instructions; every added dynamic operation on its paths measured
+negligible at ~8K JIT re-entries/run) - attributed to generated-code
+layout sensitivity of the qemu TCG translator, and accepted against
+the SSE win. Static generated code grows ~2 %; the pinned code-size
+test moves 89 -> 105 words (the trampoline/dispatcher sync words).
+Translation time is unchanged and guest-visible output is
+byte-identical on all five workloads. Two regression tests pin
+resident values across block boundaries and their synchronisation on
+a budget-exhaustion exit.
+
 ---
 
 ## 5. Methodology for future phases

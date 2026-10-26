@@ -3121,6 +3121,31 @@ guest, order rotated, A/A controls 0.984–1.014): sieve 0.970
 Suites: native 370/0/49, AArch64 under qemu 419/0/5, `cli_smoke` green on
 both. Numbers also in BENCHMARKS.md §4.4.
 
+### 29.30 XMM residency shipped (issue #17)
+
+§29.29's GPR contract now extends to SSE state: guest `xmm0..7` are
+canonical in host `q16..q23`. The decision was driven by a tier-0 traffic
+census (temporary instrument, since removed): `sha256` executes 3.65M
+SSE instructions with 8.17M GuestState XMM accesses (0.40/insn) under the
+old per-op `ldr q`/`str q` model, `qsort_glibc` 0.83M, the integer
+guests ~1K. A simulated cross-block residency removed ~99% of the
+`sha256` traffic; hot registers are xmm0-7 (~95%). Implementation:
+entry trampoline loads the set; the shared exit epilogue stores it (all
+C++-bound paths funnel there, so fault/budget/miss sites needed no XMM
+words of their own); Tier-B helper boundaries spill/reload it; SoftTlb
+slow stubs call C++ through one shared preserving trampoline
+(`ctx->jit_preserve_call`, +1 word/stub) after a first version with
+per-stub spill/reload measured +11-14% on integer guests from code
+growth alone. Converted emissions: movups/movq/movd, the logic/padd/
+punpck/pack group, immediate shifts, and the FP group (raw NEON words
+re-fielded to the resident registers); everything else reaches state
+through the existing helper funnel. Ship-time A/B (36 pairs/guest):
+`sha256` 0.832 [0.818, 0.841], sieve/nqueens/qsort_glibc flat,
+`quicksort_c` 1.017 [1.004, 1.023] (hot code byte-identical;
+attributed to qemu TCG layout sensitivity; see BENCHMARKS.md §4.5).
+Generated code +~2%; pinned test bound 89 -> 105 words deliberately.
+Suites: native 370/0/51, AArch64 421/0/5, `cli_smoke` green both.
+
 ## 30. Status after items 6–14
 
 | item | outcome | where |
@@ -3135,6 +3160,7 @@ both. Numbers also in BENCHMARKS.md §4.4.
 | 15 trace/superblock formation | **investigated, designed, not implemented** — dynamic traces are 2–3 blocks; removing 22–32 % of transitions has a ≈1.3–2.1 % generated-code ceiling (≤1–2 % runtime), under the rig's noise floor; hottest edge already a self-loop superblock, call/ret break traces in two guests | §29.26 |
 | 16 cross-block register allocation | **implemented** — canonical `{rax,rcx,rdx,rsp,rsi}` in `x19..x23` shipped in production form (shared `kCanonicalGprs` mapping; spills only at C++ funnels, dispatcher miss and the budget-exhaustion stub; pinned code-size bound deliberately 88 → 89 words; two new regression tests). Re-measured at ship time: 36 pooled pairs/guest 0.970 (sieve) / 0.989 (nqueens) / 0.951 (quicksort_c) / 1.002 (qsort_glibc), guest output byte-identical, suites green | §29.27, §29.29 |
 | 17 flag-state optimisation | **micro-hypotheses rejected, stage-2 class deferred** — redundant PF/AF pending-store measures at exactly 0 (upper bound 9–11 stores/run; ≈1 live producer per block execution), consumer guards 0 in hot blocks, descriptor packing saves nothing; remaining cost is P9 stage 2's representation change (≈4 % ceiling, §29.14), still unmeasurable on this rig | §29.28 |
+| 18 XMM state residency (issue #17) | **implemented** — canonical `xmm0..7` in `q16..q23` under the GPR contract (entry load, exit-epilogue store, helper spill/reload, shared SoftTlb preserve trampoline); census showed 8.17M state accesses in `sha256`, ~99% removed; A/B `sha256` 0.832 [0.818, 0.841], integer guests flat except `quicksort_c` 1.017 (TCG layout, hot code identical); code +~2%, bound 89 -> 105 | §29.30 |
 
 Verification for the batch, at `24f6477` (P14 stage 1): native (x86-64, clang-19) 370 passed / 0
 failed / 47 skipped of 417, `ctest` 19/19; AArch64 under `qemu-aarch64-static` 417 passed / 0
