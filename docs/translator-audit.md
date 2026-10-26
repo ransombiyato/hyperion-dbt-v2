@@ -2571,6 +2571,100 @@ Stage 1 stays: the facts are the correct substrate for whichever of those comes 
 cost nothing (§29.23's byte-identity result). This section closes item 14 with stages 1 shipped and
 stage 2 rejected on evidence.
 
+### 29.25 P14 stage 1 verified end to end: A/B timing, code size, and the one cost it does add
+
+Stage 1 (§29.23) is a refactor, so the only honest claims are *no change* claims, and they are
+checked here against a clean `070168d` build (`git archive 070168d`, same toolchain, same
+`RelWithDebInfo` cross configuration, tests and benchmarks off, no instrumentation) on the four
+benchmark guests.
+
+#### Generated code: identical, measured two independent ways
+
+| guest | `070168d` | `24f6477` (stage 1) |
+| --- | --- | --- |
+| sieve | 171 712 B / 2 274 guest insns | 171 712 B / 2 274 |
+| nqueens | 141 692 B / 1 895 | 141 692 B / 1 895 |
+| quicksort_c | 184 460 B / 2 495 | 184 460 B / 2 495 |
+| qsort_glibc | 211 168 B / 2 683 | 211 168 B / 2 683 |
+
+`total_code_bytes()` and the translated-instruction counts are equal for all four guests — the
+same numbers the digest hook produced byte for byte in §29.23, now from an uninstrumented pair of
+binaries. Guest output is also unchanged: the md5 of each guest's stdout is identical under
+`070168d`, under stage 1, and natively on the host, and the `--timing` step counts match exactly
+(16 990 960 / 39 363 637 / 21 673 085 / 21 606 988).
+
+#### Run time: two interleaved A/B sessions, 12 pairs per guest each
+
+`--timing`'s in-process run wall (execution loop only), A and B alternating within each pair so
+machine drift hits both sides, environment pinned with `env -i PATH=/usr/bin:/bin`.
+
+| guest | session | baseline median (ms) | stage 1 median (ms) | paired-ratio median | 95 % CI |
+| --- | --- | --- | --- | --- | --- |
+| sieve | 1 | 199.51 | 199.61 | 1.016 | [0.980, 1.061] |
+| sieve | 2 | 202.50 | 195.58 | 0.994 | [0.890, 1.016] |
+| nqueens | 1 | 284.59 | 287.42 | 0.983 | [0.963, 1.010] |
+| nqueens | 2 | 281.00 | 280.57 | 1.003 | [0.958, 1.053] |
+| quicksort_c | 1 | 219.24 | 221.40 | 1.017 | [0.973, 1.039] |
+| quicksort_c | 2 | 217.18 | 217.46 | 0.985 | [0.967, 1.021] |
+| qsort_glibc | 1 | 327.92 | 325.88 | 1.006 | [0.961, 1.030] |
+| qsort_glibc | 2 | 336.97 | 339.36 | 1.020 | [0.981, 1.032] |
+
+Every CI straddles 1.0 in both sessions, which is the acceptance criterion: a refactor that cannot
+change the machine code cannot change the run, and the rig (§29.20) is sensitive enough to say so
+rather than merely failing to detect a change.
+
+#### The cost that is real: translation time
+
+`translation_ns()`, 15 interleaved pairs per guest:
+
+| guest | baseline (ms) | stage 1 (ms) | ratio | 95 % CI |
+| --- | --- | --- | --- | --- |
+| sieve | 40.90 | 43.52 | 1.037 | [0.990, 1.109] |
+| nqueens | 38.40 | 40.33 | 1.022 | [0.989, 1.103] |
+| quicksort_c | 43.18 | 44.61 | 1.023 | [0.987, 1.065] |
+| qsort_glibc | 46.27 | 47.15 | 1.018 | [1.000, 1.061] |
+
+Medians are 1.8–3.7 % above baseline in all four guests and three of the four CIs touch or exclude
+1.0 — the direction is consistent, so it is reported rather than dismissed. It is *not* acted on,
+for three reasons, and the reasoning is recorded so a future change can revisit it:
+
+* Translation is **15–20 % of run wall** on these guests (42–48 ms of 216–339 ms), so 2–4 % of it
+  is 0.3–0.7 % of the run — below the resolution of the run-time rig that Stage 1 is judged by,
+  and below the level at which any of the optimisations in this batch were accepted.
+* The mechanism is understood: the facts are computed eagerly for every decoded instruction,
+  inside the decode loop, instead of lazily by the two passes that need them, and `IrInsn` is
+  168 bytes against `Step`'s 160. Neither is free, neither is large, and reversing them means
+  either splitting the computation back out of pass 1 (re-reading the instruction stream twice,
+  which is what stage 1 was meant to avoid) or packing `IrFacts` and `live_flags` into the 8 bytes
+  of padding after `Instruction` — which does not fit: the three flag bytes, two register masks
+  and a live-flags byte are already 9.
+* These numbers are measured **through `qemu-aarch64-static`**, i.e. on emulated AArch64, where
+  extra memory traffic and extra C++ work are amplified relative to a real AArch64 host. Chasing
+  a 0.3–0.7 % run-time-sized effect with an emulator-mediated measurement would be guessing.
+
+What would make it worth doing: a translator-only workload where the miss path dominates (short
+guests, `hyperion_translate_bench`), or a real AArch64 measurement host.
+
+#### Test matrix at `24f6477`
+
+| configuration | result |
+| --- | --- |
+| native x86-64, clang 19, `RelWithDebInfo` | 370 passed / 0 failed / 47 skipped of 417 |
+| `ctest` (native) | 19/19 |
+| AArch64 cross, unit tests under `qemu-aarch64-static` | 417 passed / 0 failed / 5 skipped of 422 |
+| `cli_smoke.sh` native | pass (static and dynamic PT_INTERP ELF) |
+| `cli_smoke.sh` AArch64 under the emulator | pass (same digests as native) |
+| GCC 14 strict (`HYPERION_WARNINGS_AS_ERRORS=ON`) | builds clean, 370 passed / 0 failed |
+| clang 19 strict (`HYPERION_WARNINGS_AS_ERRORS=ON`) | builds clean, 370 passed / 0 failed |
+| guest stdout vs native x86 execution | identical for all four guests |
+| `--timing` step counts | identical to baseline for all four guests |
+
+Known platform limitation, unchanged and unrelated to this work: the three
+`*.rejects_single_sample` bench tests in `benchmarks/CMakeLists.txt` exec the benchmark binaries
+directly, so in the cross tree they try to run AArch64 ELF on the x86 host and fail with a shell
+syntax error. They fail identically at `070168d`; the AArch64 gate for this project is the unit
+test binary under `qemu-aarch64-static`.
+
 ### 29.9 Still open from §L
 
 Items 1-5 of §L are all resolved (1 justified and pinned, 2 and 5 implemented, 3 retracted as wrong,
