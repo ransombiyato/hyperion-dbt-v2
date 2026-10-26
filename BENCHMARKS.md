@@ -682,6 +682,40 @@ byte-identical on all five workloads; native 370/0/61, AArch64
 431/0/5, differential 11/11, ctest 19/19. Ten `cc_*` regression tests
 pin cross-block, chained-entry and helper-boundary behaviour.
 
+### 4.7 Extended canonical GPR residency: rbx, r14 (shipped)
+
+The canonical set (§4.4) grows from five to seven guest registers:
+`rbx` and `r14` join `rax/rcx/rdx/rsp/rsi`, in host `x25`/`x27`. A
+tier-0 census counted the remaining GuestState GPR traffic at ~6M
+accesses (sieve, almost all `rbx`/`rbp` reads), ~39M (nqueens),
+~10M (qsort_glibc) and ~16M (sha256); `rbx`+`r14` cover the largest
+cross-guest share. The two host registers were freed by moving the
+initial step budget and the saved GuestState pointer out of
+`x25`/`x27` into fixed slots in the 160-byte entry frame; every
+C++-call boundary now reloads the state pointer from its slot (the
+XMM-preserving trampoline does so on both sides of its call - a
+caller-saved base register does not survive a C++ callee, which is
+exactly why the pointer was pinned in a callee-saved register
+before; audit §29.32).
+
+Measured on this host under qemu-user (candidate/`5fd980c`,
+72 interleaved pairs per guest across two runs, medians):
+
+| guest | ratio | pair median |
+| --- | --- | --- |
+| `sieve` | 0.984–0.987 | ~0.99 |
+| `nqueens` | 0.971–0.972 | ~0.967 |
+| `quicksort_c` | 0.979–0.983 | ~0.987 |
+| `qsort_glibc` | 0.982–0.987 | ~0.987 |
+| `sha256` | 0.958–0.963 | ~0.965 |
+
+All five guests improve ~1.5–4 %; none regress. Generated code grows
+~6 % (two more spill/reload words at C++-bound exits and helper
+boundaries); the pinned code-size bound moves 105 -> 107 words.
+Guest-visible output is byte-identical on all five workloads; native
+370/0/62, AArch64 432/0/5 (one new boundary test), differential
+11/11, ctest 19/19.
+
 ---
 
 ## 5. Methodology for future phases

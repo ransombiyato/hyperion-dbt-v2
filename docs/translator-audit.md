@@ -3177,6 +3177,37 @@ AArch64 431/0/5 (10 new `cc_*` tests), differential 11/11, ctest
 8-bit high-byte ALU operands (`add bh,bh`) read a zeroed operand
 and leave CF stale in tier 1.
 
+### 29.32 Extended canonical GPR residency (rbx, r14) shipped
+
+The §29.27 canonical set {rax,rcx,rdx,rsp,rsi} grows by rbx and
+r14, the largest remaining GuestState GPR traffic in a tier-0
+census (non-canonical accesses: sieve ~6.3M, nqueens ~39M,
+qsort_glibc ~10M, sha256 ~16M per run). Their host homes x25/x27
+were pinned by JIT bookkeeping: the initial step budget (x25, read
+once by the exit epilogue) and the saved GuestState pointer (x27).
+Both moved into fixed slots in an enlarged 160-byte entry frame
+([sp+128] state pointer, [sp+136] initial budget); helper and
+TLB-stub call sites reload kState from the slot after a C++ call,
+and the exit epilogue reloads it at its head. A first version of
+this relocation crashed every real guest (glibc TLS assertion)
+while passing all unit tests: the XMM-preserving trampoline
+(`jit_preserve_call`) addressed GuestState through the caller-saved
+x8 across its `blr` into C++, so the post-call reload of q16..q23
+read through a destroyed pointer - the pinned callee-saved x27 had
+been load-bearing there, and only there. The trampoline now
+reloads the pointer from the frame slot on both sides of the call
+(its own push shifts the slot by 16). Lesson recorded: any pointer
+used after a generated-code C++ call must be callee-saved or
+reloaded from the frame; unit tests missed it because their guests
+never take a SoftTlb slow path with live resident XMMs. Benchmark
+vs `5fd980c` (72 interleaved pairs/guest): sieve 0.984–0.987,
+nqueens 0.971, quicksort_c 0.979–0.983, qsort_glibc 0.982–0.987,
+sha256 0.958–0.963; generated code +~6 % (wider exit spills);
+pinned bound 105 -> 107 words; guest output byte-identical;
+native 370/0/62, AArch64 432/0/5 (new
+`extended_canonical_values_cross_boundaries`), differential
+11/11, ctest 19/19.
+
 ## 30. Status after items 6–14
 
 | item | outcome | where |
@@ -3192,6 +3223,7 @@ and leave CF stale in tier 1.
 | 16 cross-block register allocation | **implemented** — canonical `{rax,rcx,rdx,rsp,rsi}` in `x19..x23` shipped in production form (shared `kCanonicalGprs` mapping; spills only at C++ funnels, dispatcher miss and the budget-exhaustion stub; pinned code-size bound deliberately 88 → 89 words; two new regression tests). Re-measured at ship time: 36 pooled pairs/guest 0.970 (sieve) / 0.989 (nqueens) / 0.951 (quicksort_c) / 1.002 (qsort_glibc), guest output byte-identical, suites green | §29.27, §29.29 |
 | 17 flag-state optimisation | **micro-hypotheses rejected, stage-2 class deferred** — redundant PF/AF pending-store measures at exactly 0 (upper bound 9–11 stores/run; ≈1 live producer per block execution), consumer guards 0 in hot blocks, descriptor packing saves nothing; remaining cost is P9 stage 2's representation change (≈4 % ceiling, §29.14), still unmeasurable on this rig | §29.28 |
 | 18 XMM state residency (issue #17) | **implemented** — canonical `xmm0..7` in `q16..q23` under the GPR contract (entry load, exit-epilogue store, helper spill/reload, shared SoftTlb preserve trampoline); census showed 8.17M state accesses in `sha256`, ~99% removed; A/B `sha256` 0.832 [0.818, 0.841], integer guests flat except `quicksort_c` 1.017 (TCG layout, hot code identical); code +~2%, bound 89 -> 105 | §29.30 |
+| 19 extended canonical GPR residency | **implemented** — `rbx`/`r14` in `x25`/`x27` after relocating the initial budget and saved state pointer to entry-frame slots; the XMM preserve trampoline reloads the pointer from its slot across C++ calls (caller-saved base was the one load-bearing pin); A/B vs `5fd980c`: all five guests 0.96–0.99, code +~6 %, bound 105 -> 107 | §29.32 |
 
 Verification for the batch, at `24f6477` (P14 stage 1): native (x86-64, clang-19) 370 passed / 0
 failed / 47 skipped of 417, `ctest` 19/19; AArch64 under `qemu-aarch64-static` 417 passed / 0
