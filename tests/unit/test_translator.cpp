@@ -550,6 +550,30 @@ HYPERION_TEST("translator", "canonical_values_cross_block_boundaries") {
     check_program_matches(program, initial);
 }
 
+HYPERION_TEST("translator", "extended_canonical_values_cross_boundaries") {
+    // Extended canonical set (audit §29.32): rbx (x25) and r14 (x27) joined
+    // the canonical homes after the initial-budget and saved-state
+    // bookkeeping moved to entry-frame slots. Their values must flow
+    // across a block boundary and a Tier-B helper call (div) exactly like
+    // the original five, and the final state must match tier 0.
+    const std::vector<std::uint8_t> program = {
+        0x48, 0xBB, 0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, // mov rbx, imm64
+        0x49, 0xC7, 0xC6, 0x03, 0x00, 0x00, 0x00,                   // mov r14, 3
+        0xEB, 0x07,                                                 // jmp +7 -> [26]
+        0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,                   // never executed
+        0x48, 0x89, 0xD8,                                           // mov rax, rbx
+        0x31, 0xD2,                                                 // xor edx, edx
+        0xB9, 0x00, 0x01, 0x00, 0x00,                               // mov ecx, 0x100
+        0xF7, 0xF1,                                                 // div rcx (helper)
+        0x49, 0x0F, 0xAF, 0xC6,                                     // imul rax, r14
+        0xF4,                                                       // hlt
+    };
+    GuestState initial;
+    initial.rip = kBase;
+    initial.reg(Gpr::kRsp) = kBase + 2048;
+    check_program_matches(program, initial);
+}
+
 HYPERION_TEST("translator", "canonical_state_synced_on_budget_exit") {
     // When the step budget runs out at a block boundary, the JIT returns
     // through the budget-exhaustion stub; the canonical registers (dirty
@@ -626,7 +650,7 @@ HYPERION_TEST("translator", "translated_code_size_is_bounded") {
     // lies inside the entry block's byte range.
     HYPERION_CHECK_EQ(cache.block_count(), std::size_t{3});
     const std::size_t words = cache.total_code_bytes() / 4;
-    // Exact count at the time of writing is 105 words (420 bytes): canonical
+    // Exact count at the time of writing is 107 words (428 bytes): canonical
     // XMM residency adds the 8 entry-trampoline loads and 8 dispatcher-miss
     // stores for xmm0..7 (this program has no memory operands, so its SoftTlb
     // stubs are absent; SSE-using blocks additionally carry the stubs'
@@ -635,7 +659,7 @@ HYPERION_TEST("translator", "translated_code_size_is_bounded") {
     // halt rip-write fix (4.2.7) added 3 back. Canonical cross-block
     // allocation (audit §29.27) lands at 89: it removes every per-block
     // entry load and JIT-internal exit store, paying the entry-trampoline
-    // loads, the dispatcher-miss stores, and a 5-word canonical spill in
+    // loads, the dispatcher-miss stores, and a 7-word canonical spill in
     // each block's budget-exhaustion stub instead. Whole programs grow
     // ~8–9 % in static size (see BENCHMARKS.md); the win is dynamic.
     // The guard is an upper bound so a *reduction* is allowed but any growth
@@ -643,7 +667,7 @@ HYPERION_TEST("translator", "translated_code_size_is_bounded") {
     // timing noise. Update the bound deliberately when the count legitimately
     // changes, and record the exact figure in BENCHMARKS.md.
     HYPERION_CHECK_EQ(cache.total_code_bytes() % 4, std::size_t{0});
-    HYPERION_CHECK(words > 0 && words <= 105);
+    HYPERION_CHECK(words > 0 && words <= 107);
 }
 
 HYPERION_TEST("translator", "alu_immediate_is_folded") {
@@ -1162,6 +1186,10 @@ HYPERION_TEST("translator", "dispatcher_step_limit") {
 }
 
 HYPERION_TEST("translator", "canonical_values_cross_block_boundaries") {
+    HYPERION_SKIP("generated code is AArch64; requires an AArch64 host to run");
+}
+
+HYPERION_TEST("translator", "extended_canonical_values_cross_boundaries") {
     HYPERION_SKIP("generated code is AArch64; requires an AArch64 host to run");
 }
 

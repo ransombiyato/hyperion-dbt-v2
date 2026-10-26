@@ -41,10 +41,14 @@ constexpr a64::Reg kT3 = 15;   // scratch
 // Callee-saved registers held across every cached block (the cached-block
 // compiler section at the bottom of this file relies on the same values).
 constexpr a64::Reg kDispatchReg = 24; // void* jit_dispatch
-constexpr a64::Reg kInitBudget = 25;  // initial step budget
 constexpr a64::Reg kRemBudget = 26;   // remaining step budget
-constexpr a64::Reg kSavedState = 27;  // GuestState* (mirror of x8)
 constexpr a64::Reg kCtxReg = 28;      // ExecContext*
+// Entry-frame slots for the values that used to pin x25/x27: [sp + 128] =
+// GuestState* mirror of kState for C++-call boundaries, [sp + 136] =
+// initial step budget (read once, by the exit epilogue). The frame is 160
+// bytes; slots 96..127 stay the SoftTlb/SSE scratch area below them.
+constexpr unsigned kSavedStateSlot = 128;
+constexpr unsigned kInitBudgetSlot = 136;
 
 // Guest-register allocation (Phase 5, BENCHMARKS.md §4.2.6).
 //
@@ -798,7 +802,7 @@ void emit_cc_materialise(a64::Encoder& e, a64::Reg base, bool with_ret) {
 // Guard emitted before generated code observes flag bytes: materialise the
 // pending cc descriptor when one exists. The materialisation body is shared
 // (one copy in the exit-epilogue code, addressed by ctx->jit_cc_materialise,
-// on the kSavedState base that mirrors kState inside every block); the guard
+// on the kState base (the entry-frame slot mirrors it across C++ calls); the guard
 // reaches it with adr x30 + br, which costs five words and nothing when no
 // descriptor is pending beyond the ldrb/cbz pair. x30 is scratch inside a
 // block body.
@@ -2071,20 +2075,25 @@ BlockTranslation translate_block(const std::uint8_t* code, std::size_t size,
 
 namespace {
 
-constexpr std::size_t kCachedMaxAlloc = 5; // x19..x23
+constexpr std::size_t kCachedMaxAlloc = 7; // canonical host set below
 
 // Canonical guest-register allocation for cached blocks: every block uses
-// this fixed guest->host mapping (x19..x23, in order), so values in these
-// registers are already in place when control passes between blocks inside
-// the JIT - linked and dispatched exits neither spill nor reload them.
-// GuestState remains authoritative at every point C++ can observe: the
-// entry trampoline loads the set once per JIT entry, and every path back
-// to C++ (halt/syscall/fault spills, helper boundaries, the dispatcher-miss
-// path and the budget-exhaustion stub) stores it first. The set is the one
-// measured worth carrying in docs/translator-audit.md §29.27; it must
-// include RSP, without which stack-heavy hot code regresses.
-constexpr Gpr kCanonicalGprs[] = {Gpr::kRax, Gpr::kRcx, Gpr::kRdx, Gpr::kRsp, Gpr::kRsi};
+// this fixed guest->host mapping, so values in these registers are already
+// in place when control passes between blocks inside the JIT - linked and
+// dispatched exits neither spill nor reload them. GuestState remains
+// authoritative at every point C++ can observe: the entry trampoline
+// loads the set once per JIT entry, and every path back to C++
+// (halt/syscall/fault spills, helper boundaries, the dispatcher-miss path
+// and the budget-exhaustion stub) stores it first. The first five are the
+// set measured worth carrying in docs/translator-audit.md §29.27 (RSP is
+// required: stack-heavy hot code regresses without it). RBX and R14
+// joined later (audit §29.32) in x25/x27, freed by moving the initial
+// budget and the saved GuestState pointer into entry-frame slots.
+constexpr Gpr kCanonicalGprs[] = {Gpr::kRax, Gpr::kRcx, Gpr::kRdx, Gpr::kRsp,
+                                  Gpr::kRsi, Gpr::kRbx, Gpr::kR14};
+constexpr a64::Reg kCanonicalHosts[] = {19, 20, 21, 22, 23, 25, 27};
 constexpr std::size_t kCanonicalCount = sizeof(kCanonicalGprs) / sizeof(kCanonicalGprs[0]);
+static_assert(sizeof(kCanonicalHosts) / sizeof(kCanonicalHosts[0]) == kCanonicalCount);
 static_assert(kCanonicalCount <= kCachedMaxAlloc);
 
 // Canonical XMM residency, same contract as kCanonicalGprs: guest xmm0..7
@@ -2761,25 +2770,24 @@ JitTrampolines build_jit_trampolines() {
     //                              ExecContext* x2, void* block x3, void* dispatch x4)`
     {
         a64::Encoder e;
-        e.stp_pre(29, 30, a64::kSp, -128);
+        e.stp_pre(29, 30, a64::kSp, -160);
         e.stp_off(19, 20, a64::kSp, 16);
         e.stp_off(21, 22, a64::kSp, 32);
         e.stp_off(23, 24, a64::kSp, 48);
         e.stp_off(25, 26, a64::kSp, 64);
         e.stp_off(27, 28, a64::kSp, 80);
-        e.mov_reg(a64::Width::k64, kState, 0);      // x8 = GuestState*
-        e.mov_reg(a64::Width::k64, kSavedState, 0); // x27 = GuestState*
+        e.mov_reg(a64::Width::k64, kState, 0); // x8 = GuestState*
+        e.str(a64::Width::k64, 0, a64::kSp, kSavedStateSlot);
+        e.str(a64::Width::k64, 1, a64::kSp, kInitBudgetSlot);
         // Load the canonical guest registers (see kCanonicalGprs): from
-        // here until the exit epilogue they live in x19..x23, and
+        // here until the exit epilogue they live in their host homes, and
         // GuestState is only a backing store C++ funnels synchronise.
         for (std::size_t i = 0; i < kCanonicalCount; ++i) {
-            e.ldr(a64::Width::k64, static_cast<a64::Reg>(kAllocBase + i), kState,
-                  gpr_offset(kCanonicalGprs[i]));
+            e.ldr(a64::Width::k64, kCanonicalHosts[i], kState, gpr_offset(kCanonicalGprs[i]));
         }
         for (unsigned i = 0; i < kCanonicalXmmCount; ++i) {
             emit_ldr_q(e, kXmmHostBase + i, kState, xmm_offset(static_cast<std::uint8_t>(i)));
         }
-        e.mov_reg(a64::Width::k64, kInitBudget, 1);  // x25 = initial budget
         e.mov_reg(a64::Width::k64, kRemBudget, 1);   // x26 = remaining budget
         e.mov_reg(a64::Width::k64, kCtxReg, 2);      // x28 = ExecContext*
         e.mov_reg(a64::Width::k64, kDispatchReg, 4); // x24 = jit_dispatch
@@ -2808,8 +2816,7 @@ JitTrampolines build_jit_trampolines() {
         // GPRs must reach GuestState here (the epilogue stores the canonical
         // XMMs); on a hit both sets stay live across the transition.
         for (std::size_t i = 0; i < kCanonicalCount; ++i) {
-            e.str(a64::Width::k64, static_cast<a64::Reg>(kAllocBase + i), kState,
-                  gpr_offset(kCanonicalGprs[i]));
+            e.str(a64::Width::k64, kCanonicalHosts[i], kState, gpr_offset(kCanonicalGprs[i]));
         }
         e.movz(a64::Width::k64, 0, 0); // x0 = BlockResult::kOk
         e.ldr(a64::Width::k64, kA, kCtxReg, offsetof(ExecContext, jit_exit_epilogue));
@@ -2833,9 +2840,10 @@ JitTrampolines build_jit_trampolines() {
         // after the epilogue in this buffer (ctx->jit_cc_materialise points
         // at it, and the epilogue guard below branches forward to it) so the
         // epilogue entry stays at offset 0 for ctx->jit_exit_epilogue. It
-        // runs on the kSavedState base, which mirrors kState inside every
-        // block, and returns on x30.
+        // runs on the kState base (reloaded from the entry-frame slot at
+        // the head of the epilogue), and returns on x30.
         const a64::Label cc_materialise_sub = e.new_label();
+        e.ldr(a64::Width::k64, kState, a64::kSp, kSavedStateSlot);
         // Materialise any pending flags *before* control reaches C++: this is
         // the one funnel every block exit, budget exhaustion, dispatcher miss
         // and fault path goes through, so the interpreter, syscall layer and
@@ -2844,8 +2852,8 @@ JitTrampolines build_jit_trampolines() {
         // the dispatcher's jump-table hit path, which stays inside generated
         // code: a linked block that does not read PF/AF keeps the descriptor
         // alive.
-        emit_cc_guard_label(e, kSavedState, cc_materialise_sub);
-        emit_pf_af_guard(e, kFbPfAf, kSavedState);
+        emit_cc_guard_label(e, kState, cc_materialise_sub);
+        emit_pf_af_guard(e, kFbPfAf, kState);
         // Every C++-bound path funnels through here (block exits, budget
         // exhaustion via x29, dispatcher misses, faults), so this is where
         // the canonical XMMs (q16..q23) are stored back - the sites that
@@ -2854,55 +2862,61 @@ JitTrampolines build_jit_trampolines() {
             const unsigned off = xmm_offset(static_cast<std::uint8_t>(i));
             e.emit_raw_u32(0xAD000000u | ((off / 16u) << 15) |
                            (static_cast<std::uint32_t>(kXmmHostBase + i + 1) << 10) |
-                           (static_cast<std::uint32_t>(kSavedState) << 5) |
+                           (static_cast<std::uint32_t>(kState) << 5) |
                            static_cast<std::uint32_t>(kXmmHostBase + i));
         }
-        e.sub(a64::Width::k64, 1, kInitBudget, kRemBudget); // x1 = retired guest insns
+        e.ldr(a64::Width::k64, kT0, a64::kSp, kInitBudgetSlot);
+        e.sub(a64::Width::k64, 1, kT0, kRemBudget); // x1 = retired guest insns
         e.ldp_off(19, 20, a64::kSp, 16);
         e.ldp_off(21, 22, a64::kSp, 32);
         e.ldp_off(23, 24, a64::kSp, 48);
         e.ldp_off(25, 26, a64::kSp, 64);
         e.ldp_off(27, 28, a64::kSp, 80);
-        e.ldp_post(29, 30, a64::kSp, 128);
+        e.ldp_post(29, 30, a64::kSp, 160);
         e.ret();
         // Shared pending-cc materialisation stub (see the head of this
         // section); reached only via ctx->jit_cc_materialise or the guard at
         // the head of the epilogue, never by fall-through (the epilogue ends
         // in `ret` above).
         e.bind(cc_materialise_sub);
-        emit_cc_materialise(e, kSavedState, true);
+        emit_cc_materialise(e, kState, true);
         out.exit_code = e.bytes();
         // The stub's offset is the epilogue size; measure the stub with a
         // scratch encoder (bytes() cannot be called mid-stream: it requires
         // every label bound).
         a64::Encoder stub_probe;
-        emit_cc_materialise(stub_probe, kSavedState, true);
+        emit_cc_materialise(stub_probe, kState, true);
         out.cc_materialise_offset = out.exit_code.size() - stub_probe.bytes().size();
     }
 
     // 4. Canonical-XMM-preserving C++ call (`ctx->jit_preserve_call`):
-    //    expects `x9` (kA) = callee, `x0..x3` = its arguments, `x27`
-    //    (kSavedState) = GuestState*, `x30` = return address. The canonical
-    //    XMMs round-trip through GuestState because a C++ callee may
-    //    clobber caller-saved q16..q23; everything else follows the normal
-    //    AArch64 procedure-call contract the caller already relies on.
+    //    expects `x9` (kA) = callee, `x0..x3` = its arguments, `x30` =
+    //    return address, and the caller's block stack (entry frame live
+    //    below). The canonical XMMs round-trip through GuestState because
+    //    a C++ callee may clobber caller-saved q16..q23; the GuestState
+    //    pointer itself is reloaded from the entry-frame slot on both
+    //    sides of the call, because no caller-saved register survives the
+    //    callee (this is the one place the old pinned x27 mirror was
+    //    load-bearing - see audit §29.32).
     {
         a64::Encoder e;
         e.emit_raw_u32(0xF81F0FFEu); // str x30, [sp, #-16]! (push lr, own mini-frame)
+        e.ldr(a64::Width::k64, kState, a64::kSp, kSavedStateSlot + 16);
         // stp q16..q23 -> GuestState::xmm[0..7] (contiguous, 16B-aligned)
         for (unsigned i = 0; i < kCanonicalXmmCount; i += 2) {
             const unsigned off = xmm_offset(static_cast<std::uint8_t>(i));
             e.emit_raw_u32(0xAD000000u | ((off / 16u) << 15) |
                            (static_cast<std::uint32_t>(kXmmHostBase + i + 1) << 10) |
-                           (static_cast<std::uint32_t>(kSavedState) << 5) |
+                           (static_cast<std::uint32_t>(kState) << 5) |
                            static_cast<std::uint32_t>(kXmmHostBase + i));
         }
         e.blr(kA);
+        e.ldr(a64::Width::k64, kState, a64::kSp, kSavedStateSlot + 16);
         for (unsigned i = 0; i < kCanonicalXmmCount; i += 2) {
             const unsigned off = xmm_offset(static_cast<std::uint8_t>(i));
             e.emit_raw_u32(0xAD400000u | ((off / 16u) << 15) |
                            (static_cast<std::uint32_t>(kXmmHostBase + i + 1) << 10) |
-                           (static_cast<std::uint32_t>(kSavedState) << 5) |
+                           (static_cast<std::uint32_t>(kState) << 5) |
                            static_cast<std::uint32_t>(kXmmHostBase + i));
         }
         e.emit_raw_u32(0xF84107FEu); // ldr x30, [sp], #16 (pop lr)
@@ -2989,7 +3003,7 @@ BlockTranslation translate_cached_block(const std::uint8_t* code, std::size_t si
     // block exit - only the C++-funnel synchronisations described above.
     RegAlloc ra;
     for (std::size_t i = 0; i < kCanonicalCount; ++i) {
-        const auto h = static_cast<a64::Reg>(kAllocBase + i);
+        const auto h = kCanonicalHosts[i];
         ra.host_of_guest[static_cast<unsigned>(kCanonicalGprs[i])] = static_cast<std::int8_t>(h);
         ra.allocated.push_back(h);
     }
@@ -4064,11 +4078,11 @@ BlockTranslation translate_cached_block(const std::uint8_t* code, std::size_t si
         e.mov_imm64(kA, in.address);
         e.str(a64::Width::k64, kA, kState, kRipOffset);
         e.mov_reg(a64::Width::k64, 0, kCtxReg);
-        e.mov_reg(a64::Width::k64, 1, kSavedState);
+        e.ldr(a64::Width::k64, 1, a64::kSp, kSavedStateSlot);
         e.adr(2, lit_lbl);
         e.ldr(a64::Width::k64, kA, kCtxReg, offsetof(ExecContext, exec_complex));
         e.blr(kA);
-        e.mov_reg(a64::Width::k64, kState, kSavedState);
+        e.ldr(a64::Width::k64, kState, a64::kSp, kSavedStateSlot);
         reload_ra();
         emit_xmm_pairs(/*store=*/false);
         e.cbz(a64::Width::k32, 0, flbl);
@@ -4487,7 +4501,7 @@ BlockTranslation translate_cached_block(const std::uint8_t* code, std::size_t si
         e.ldr(a64::Width::k64, kA, kCtxReg, offsetof(ExecContext, mem_read_slow));
         e.ldr(a64::Width::k64, kT0, kCtxReg, offsetof(ExecContext, jit_preserve_call));
         e.blr(kT0);
-        e.mov_reg(a64::Width::k64, kState, kSavedState);
+        e.ldr(a64::Width::k64, kState, a64::kSp, kSavedStateSlot);
         e.ldr(a64::Width::k64, s.out_reg, a64::kSp, kScratchSlot0);
         e.cbz(a64::Width::k32, 0, s.fault_lbl);
         e.b(s.done_lbl);
@@ -4504,7 +4518,7 @@ BlockTranslation translate_cached_block(const std::uint8_t* code, std::size_t si
         e.ldr(a64::Width::k64, kA, kCtxReg, offsetof(ExecContext, mem_write_slow));
         e.ldr(a64::Width::k64, kT0, kCtxReg, offsetof(ExecContext, jit_preserve_call));
         e.blr(kT0);
-        e.mov_reg(a64::Width::k64, kState, kSavedState);
+        e.ldr(a64::Width::k64, kState, a64::kSp, kSavedStateSlot);
         e.cbz(a64::Width::k32, 0, s.fault_lbl);
         e.b(s.done_lbl);
     }
