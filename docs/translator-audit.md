@@ -1790,7 +1790,10 @@ guest memory. Two ways to use it, and neither survives contact with the requirem
    can be built and tested once for all three.
 
 Decision: implement the call side (measured, low risk, no new state), defer the verified
-return-target cache to P14, and record the rejection. Reopening it needs a measurement
+return-target cache to P14, and record the rejection. **That deferral has since been resolved in
+§29.21, which measures `ret` at ≤3.9 % of retired instructions on real workloads and therefore
+rejects the cache outright** — the 4–5 % figure above came from a synthetic guest where CALL/RET
+were 20.4 % of instructions, and is corrected there. Reopening it needs a measurement
 that shows the ret side is worth more than the ~4–5 % ceiling above.
 
 #### Tests
@@ -2257,6 +2260,42 @@ at the cost of one run per sample.
   performance item to attempt, on this rig.
 
 Nothing in this section changes generated code; it changes what can be claimed about it.
+
+### 29.21 P10b (the deferred ret-target cache) — measured upper bound, and rejected
+
+§29.13 measured the call side of the call/return path (worth implementing: direct calls are now
+linked) and deferred the `ret` side to "a verified return-target cache", estimating ~4–5 % of a
+call/return-heavy guest from a guest where CALL/RET were 20.4 % of retired instructions. That
+guest was synthetic. With the rig from §29.20 it is now cheap to ask how representative it was,
+by counting opcodes on the repository's own workloads (temporary tier-0 histogram build, never
+committed):
+
+| guest | total guest insns | `call` | `ret` | `jcc` | `jmp` | largest single opcode |
+| --- | --- | --- | --- | --- | --- | --- |
+| `nqueens` (recursive) | 34 235 010 | 2.51 % | 2.51 % | 7.54 % | 0.02 % | `mov` 27.4 % |
+| `quicksort_c` | 21 627 270 | 0.06 % | 0.06 % | 17.17 % | 0.80 % | `mov` 27.6 % |
+| `sieve` | 16 999 369 | 0.01 % | 0.01 % | 24.41 % | 0.04 % | `mov` 31.1 % |
+| `qsort_glibc` | 20 489 326 | 3.87 % | 3.87 % | 10.66 % | 0.98 % | `mov` 29.2 % |
+
+Even on the most call-heavy real guest, `ret` is 3.9 % of retired instructions. A cached
+return target would replace the shared dispatcher's 11 instructions with roughly 5 (index, compare,
+branch), i.e. save ~6 host instructions per ret — about **0.23 host instructions per guest
+instruction, or ~1–2 % of runtime** on that guest, and under 1 % everywhere else. That is at the
+edge of resolvability (§29.20's half-widths are 1–4 %) and, more importantly, it is *not* the
+4–5 % §29.13 extrapolated.
+
+Decision: **rejected**, with the numeric reason recorded rather than a hunch. The estimate in
+§29.13 is corrected here, and the design is still written down there in case a guest with a
+genuinely different call/ret profile appears (deeply recursive interpreters, for instance, where
+call/ret can exceed 15 % — that would move it back into range).
+
+The same histogram points somewhere else, and that is the more useful output of this measurement:
+**`mov` alone is 27–31 % of retired instructions** on every one of these guests, with
+`cmp`/`jcc`/`add` behind it, while `call`/`ret` never exceed 3.9 %. Any further work on this
+translator's per-instruction cost should start from the move path (a register-to-register move
+that materialises through `GuestState` where an allocated host register would do, or a block-level
+copy-propagation pass) rather than from the call/return path. That belongs to the P14 stages of
+§29.18, where an IR pass can see a whole block's moves at once.
 
 ### 29.9 Still open from §L
 
