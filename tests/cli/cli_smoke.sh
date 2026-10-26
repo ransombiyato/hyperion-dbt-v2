@@ -75,6 +75,33 @@ else
     echo "cli smoke ok: tier 1 fell back to the interpreter, steps=$steps0"
 fi
 
+# --timing must report the loop's own time on stderr and must not change the
+# guest's stdout, the step count or the exit status. This is the measurement
+# option every A/B in docs/translator-audit.md since §29.20 relies on, so it is
+# pinned here rather than trusted.
+# shellcheck disable=SC2086
+timed_out="$($EMULATOR "$BIN" run "$BLOB" --tier=0 --max-steps=100000 --timing 2>"$ERRFILE")"
+if ! grep -qE '^hyperion: run wall [0-9.]+ ms \([0-9.]+ ns/guest-instruction\) [0-9]+ steps$' "$ERRFILE"; then
+    echo "--timing did not report a run-wall line on stderr:" >&2
+    cat "$ERRFILE" >&2
+    exit 1
+fi
+if [[ "$(grep -c 'run wall' <<<"$timed_out")" != "0" ]]; then
+    echo "--timing leaked onto stdout" >&2
+    exit 1
+fi
+if [[ "$timed_out" != "$out0" ]]; then
+    echo "--timing changed the report: expected the same output as a plain tier 0 run" >&2
+    diff <(echo "$out0") <(echo "$timed_out") >&2 || true
+    exit 1
+fi
+timed_steps="$(grep -oE '[0-9]+ steps' "$ERRFILE" | grep -oE '^[0-9]+')"
+if [[ "$timed_steps" != "$steps0" ]]; then
+    echo "--timing reported $timed_steps steps, run reported $steps0" >&2
+    exit 1
+fi
+echo "--timing smoke ok: reports loop time on stderr, stdout unchanged"
+
 # Real static x86-64 glibc C binary verification (when static x86-64 gcc is present):
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 SHA_SRC="$REPO_ROOT/benchmarks/workloads/sha256.c"

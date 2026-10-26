@@ -8,6 +8,7 @@
 // ELF64 executables across both execution tiers:
 //   - Tier 0: Fast decoded-ICache + SoftTlb reference interpreter
 //   - Tier 1: Full-system AArch64 + 128-bit ARMv8 NEON + IBTC JIT
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -60,6 +61,7 @@ void print_usage(const char* argv0) {
         "  --max-steps=N    guest instruction limit\n"
         "  --sysroot=DIR    x86-64 rootfs prefix for PT_INTERP / shared libraries\n"
         "  --quiet          suppress translator banner/summary (pure guest stdout + exit code)\n"
+        "  --timing         report the execution loop's own wall time on stderr\n"
         "  --dump           print final guest register state\n"
         "  --no-syscall-registry  ignore the persistent syscall registry\n"
         "  --syscall-registry=FILE  use FILE instead of the default registry path\n"
@@ -200,8 +202,23 @@ void print_tier1_stats(const hyperion::TranslationCache& cache) {
     }
 }
 
+// Shared by both entry points so `--timing` means exactly one thing. Printed to
+// stderr, so a guest's stdout is byte-identical whether or not it is on.
+void report_run_timing(bool timing, std::chrono::steady_clock::time_point started,
+                       const hyperion::RunResult& result) {
+    if (!timing) {
+        return;
+    }
+    const double ns = static_cast<double>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                              std::chrono::steady_clock::now() - started)
+                                              .count());
+    std::fprintf(stderr, "hyperion: run wall %.3f ms (%.3f ns/guest-instruction) %llu steps\n",
+                 ns / 1e6, result.steps != 0 ? ns / static_cast<double>(result.steps) : 0.0,
+                 static_cast<unsigned long long>(result.steps));
+}
+
 int run_blob(const std::vector<std::uint8_t>& code, int tier, std::uint64_t max_steps, bool quiet,
-             bool dump) {
+             bool dump, bool timing = false) {
     if (code.size() > kMemSize) {
         std::fprintf(stderr, "hyperion: blob is larger than the %zu-byte load window\n", kMemSize);
         return 2;
@@ -218,6 +235,7 @@ int run_blob(const std::vector<std::uint8_t>& code, int tier, std::uint64_t max_
         tier = 0;
     }
 
+    const auto run_started = std::chrono::steady_clock::now();
     hyperion::RunResult result;
     if (tier == 0) {
         result = hyperion::run_program(memory, state, max_steps);
@@ -240,6 +258,7 @@ int run_blob(const std::vector<std::uint8_t>& code, int tier, std::uint64_t max_
     if (dump) {
         std::printf("%s", hyperion::to_string(result.state).c_str());
     }
+    report_run_timing(timing, run_started, result);
     return result.status == hyperion::RunStatus::kOk ? 0 : 1;
 }
 
@@ -257,7 +276,8 @@ bool env_flag_enabled(const char* name) {
 int run_elf(const std::vector<std::uint8_t>& file, const std::vector<std::string>& guest_argv,
             const std::string& guest_image_path, const std::string& sysroot, int tier,
             std::uint64_t max_steps, bool quiet, bool dump, const RegistryCli& registry,
-            std::uint16_t hot_threshold = hyperion::TranslationCache::kDefaultHotThreshold) {
+            std::uint16_t hot_threshold = hyperion::TranslationCache::kDefaultHotThreshold,
+            bool timing = false) {
     // Disjoint 256 MiB heap at 0x20000000 and 1 GiB per-mapping ceiling at 0x7f0000000000.
     hyperion::GuestAddressSpace space(0x7f0000000000ULL, 0x20000000ULL, 256ULL << 20);
     hyperion::GuestState state;
@@ -329,6 +349,12 @@ int run_elf(const std::vector<std::uint8_t>& file, const std::vector<std::string
         }
     }
 
+    // --timing: measure the execution loop itself, not process start, ELF loading
+    // or the syscall registry. A whole-process wall clock is dominated by startup
+    // (~45 ms of qemu load plus ELF relocation here), which buries any change worth
+    // less than ~10%; timing the loop alone is what makes single-digit changes
+    // measurable at all.
+    const auto run_started = std::chrono::steady_clock::now();
     hyperion::RunResult result;
     if (tier == 0) {
         result = hyperion::run_program(space, state, max_steps, &syscalls);
@@ -366,6 +392,9 @@ int run_elf(const std::vector<std::uint8_t>& file, const std::vector<std::string
     if (result.status != hyperion::RunStatus::kOk) {
         return 1;
     }
+    // The loop has finished; everything below is reporting. Printed to stderr so a
+    // guest's stdout stays byte-identical whether or not --timing is on.
+    report_run_timing(timing, run_started, result);
     // The guest's own exit status is the process status, whether or not the
     // banner was suppressed. This used to be honoured only under --quiet, which
     // made `hyperion run` exit 0 for a guest that had failed -- a CI gate built
@@ -384,6 +413,7 @@ int cmd_run(int argc, char** argv) {
     std::uint64_t max_steps = kDefaultBlobMaxSteps;
     bool quiet = false;
     bool dump = false;
+    bool timing = false; // --timing: report the execution loop's own wall time
     RegistryCli registry;
     if (env_flag_enabled("HYPERION_NO_SYSCALL_REGISTRY")) {
         registry.enabled = false;
@@ -414,7 +444,7 @@ int cmd_run(int argc, char** argv) {
             arg.rfind("--tier=", 0) == 0 || arg.rfind("--max-steps=", 0) == 0 ||
             arg.rfind("--sysroot=", 0) == 0 || arg == "--quiet" || arg == "-q" || arg == "--dump" ||
             arg == "--no-syscall-registry" || arg.rfind("--syscall-registry=", 0) == 0 ||
-            arg.rfind("--hot-threshold=", 0) == 0;
+            arg.rfind("--hot-threshold=", 0) == 0 || arg == "--timing";
 
         if (is_hyperion_option) {
             if (arg.rfind("--tier=", 0) == 0) {
@@ -426,6 +456,8 @@ int cmd_run(int argc, char** argv) {
                 sysroot = arg.substr(10);
             } else if (arg == "--quiet" || arg == "-q") {
                 quiet = true;
+            } else if (arg == "--timing") {
+                timing = true;
             } else if (arg == "--no-syscall-registry") {
                 registry.enabled = false;
             } else if (arg.rfind("--hot-threshold=", 0) == 0) {
@@ -471,9 +503,9 @@ int cmd_run(int argc, char** argv) {
         full_argv.insert(full_argv.end(), guest_argv.begin(), guest_argv.end());
         return run_elf(code, full_argv, path, sysroot, tier,
                        explicit_steps ? max_steps : kDefaultElfMaxSteps, quiet, dump, registry,
-                       hot_threshold);
+                       hot_threshold, timing);
     }
-    return run_blob(code, tier, max_steps, quiet, dump);
+    return run_blob(code, tier, max_steps, quiet, dump, timing);
 }
 
 // `hyperion syscall-registry` - inspect, validate and export the persistent

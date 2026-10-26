@@ -2181,13 +2181,13 @@ inside the 16-block / 3584-byte budget.
 | `qsort_glibc` | 492.7 / 467.3 / 477–505 ms | **441.9** / 425.6 / 431–455 ms | 0.897 | 0.895 |
 
 So the write window is worth **10–20 % of whole-process wall clock** on three of the four
-workloads, and `sieve` is ~3 % *slower* — with overlapping IQRs, so "no significant change" is
-defensible, but the median consistently leans the wrong way and that is reported rather than
-smoothed away. The likely cause is visible in the counters: sieve's blocks are few and long,
-so the 214 extra speculative blocks buy fewer protection changes per unit of useful code than on
-the branchy guests. A per-workload prefetch budget guess is exactly the kind of tuning that needs
-a measurement rig with better resolution than this one, so it is left alone deliberately rather
-than fitted to four data points.
+workloads, and `sieve` measured ~3 % *slower* (median), with overlapping IQRs.
+
+**That sweep was re-measured with a better rig in §29.20 and the sieve "regression" is not there:**
+timing only the execution loop, the paired ratio is 1.013 with a 95 % CI of [0.961, 1.055] — no
+significant change. The earlier 3 % was process-start noise (qemu load plus ELF relocation), which
+is exactly what §29.20 exists to remove. The number below is left in place, flagged, rather than
+deleted, because "a 3 % regression that was really 0 %" is the useful lesson about this host.
 
 #### Verification on current main
 
@@ -2202,6 +2202,61 @@ than fitted to four data points.
 
 W^X is unchanged: a page is never writable and executable at the same time, and no alias mapping
 exists (option C stays rejected).
+
+### 29.20 A measurement rig that can see single-digit changes (`--timing`)
+
+Everything deferred so far (P8's 6 %, P9 stage 2's ~4 %, P10's ret-target cache at ~4–5 %) was
+deferred because whole-process wall clock on this host has a spread of 12–30 %: qemu load alone is
+~45 ms and ELF relocation another ~10 ms, against run times of 0.3–1 s, and none of that has
+anything to do with the code being measured. A benchmark that cannot see a 4 % effect cannot
+justify — or refute — a 4 % change, so the measurement gap was the real blocker, not the ideas.
+
+`hyperion run --timing` now reports the **execution loop's own wall time** on stderr:
+
+```
+hyperion: run wall 343.873 ms (8.734 ns/guest-instruction) 39373499 steps
+```
+
+* measured with `steady_clock` around `run_program()` / `TranslationCache::run()` only — process
+  start, ELF load, relocation, the syscall registry and all reporting are outside it;
+* written to **stderr**, so a guest's stdout, its step count and its exit status are unchanged
+  (pinned by `tests/cli/cli_smoke.sh`, native and under qemu);
+* works for both entry points (ELF and raw blob), because a raw blob is a first-class workload.
+
+#### Resolution, measured rather than assumed
+
+Re-running the P5 A/B of §29.19 with this metric, 14 interleaved pairs per guest after discarding
+the first, bootstrap 95 % CI on the median ratio (`P5 on / P5 off`):
+
+| guest | P5 off | P5 on | ratio | 95 % CI | verdict |
+| --- | --- | --- | --- | --- | --- |
+| `sieve` | 229.3 ms | 231.9 ms | 1.013 | [0.961, 1.055] | **no significant change** |
+| `nqueens` | 461.6 ms | 338.6 ms | 0.739 | [0.698, 0.815] | P5 faster |
+| `quicksort_c` | 309.8 ms | 256.8 ms | 0.833 | [0.804, 0.862] | P5 faster |
+| `qsort_glibc` | 434.2 ms | 390.9 ms | 0.906 | [0.897, 0.915] | P5 faster |
+
+CI half-widths are 1–4 %, so a 4–6 % effect is now decidable, and the three "P5 faster" verdicts
+are correspondingly stronger than the whole-process numbers (26 %, 17 %, 9 % versus 20 %, 19 %,
+10 %): with startup removed, the write window's benefit is measured on the code it actually
+affects.
+
+The independent in-process harness (`benchmarks/hyperion_tier_bench`, which times repeated samples
+inside one process) reports an IQR fraction of 2.2 % for tier 1 and 1.2 % for tier 0, which is the
+floor available on this host; `--timing` sits close to it because it removes the same startup bias,
+at the cost of one run per sample.
+
+#### Consequences for the deferred items
+
+* **P8 (cross-block register allocation)** now has a rig that can resolve its ~3–4 % realistic
+  ceiling. It is still gated behind a design that touches the guest-state-visibility invariant, so
+  it stays deferred, but it is now testable rather than unfalsifiable.
+* **P9 stage 2 (CF/ZF/SF/OF)** likewise: 4 % is above this rig's half-width, so the item is no
+  longer *unmeasurable* — it remains unimplemented because the emitter surface (≈30 sites, §29.14)
+  is a rewrite that should follow the P14 flag-effect table rather than precede it.
+* **P10's ret-target cache** (~4–5 % on call-heavy code) is now decidable, and it is the next
+  performance item to attempt, on this rig.
+
+Nothing in this section changes generated code; it changes what can be claimed about it.
 
 ### 29.9 Still open from §L
 
@@ -2259,9 +2314,10 @@ skipped of 405; GCC and clang strict builds (`HYPERION_WARNINGS_AS_ERRORS=ON`) c
 runs on both tiers byte-identical (`acc=9000001 counter=0`, `acc=20475694797959 g=50991808`).
 
 Two measurements in this batch are negative results that matter for planning: the PF/AF deferral
-of §29.11 does not separate from noise on this setup (paired-ratio median 1.02, spread 0.89–1.21),
-and flag materialisation as a whole is ~10 % of generated code. Any further flag work should wait
-for a measurement rig that can see it.
+of §29.11 did not separate from noise on whole-process timing (paired-ratio median 1.02, spread
+0.89–1.21), and flag materialisation as a whole is ~10 % of generated code. §29.20 then built the
+rig that removes that excuse (`--timing`, 1–4 % CI half-widths), which is why the remaining items
+are now described as *sequenced* rather than *unmeasurable*.
 
 ---
 
