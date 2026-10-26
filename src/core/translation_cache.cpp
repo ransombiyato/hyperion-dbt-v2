@@ -92,6 +92,7 @@ void TranslationCache::ensure_trampolines() {
     jit_dispatch_ = arena_.allocate(tr.dispatch_code.data(), tr.dispatch_code.size());
     ctx_->jit_budget_epilogue = arena_.allocate(tr.budget_code.data(), tr.budget_code.size());
     ctx_->jit_exit_epilogue = arena_.allocate(tr.exit_code.data(), tr.exit_code.size());
+    ctx_->jit_preserve_call = arena_.allocate(tr.preserve_code.data(), tr.preserve_code.size());
 }
 
 bool TranslationCache::should_gate(std::uint64_t pc) {

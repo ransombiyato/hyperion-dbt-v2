@@ -203,7 +203,12 @@ struct alignas(64) ExecContext {
                          const Instruction* insn) noexcept = nullptr; // +24
     Memory* memory = nullptr;                                         // +32
     void* jit_budget_epilogue = nullptr;                              // +40
-    std::uint8_t header_pad_[0x1000 - 48]{};
+    // Generated stub that calls a C++ slow path with the canonical XMM
+    // registers (q16..q23) preserved through GuestState; used by the
+    // SoftTlb slow stubs so they stay one word longer than an unguarded
+    // call instead of carrying an 8-word spill/reload each.
+    void* jit_preserve_call = nullptr; // +48
+    std::uint8_t header_pad_[0x1000 - 56]{};
 
     SoftTlb tlb{};                                      // +0x1000 (read @ +0x1000, write @ +0x3000)
     std::uint8_t tlb_pad_[0x1000 - sizeof(uint64_t)]{}; // align jump_table to +0x6000
@@ -231,6 +236,7 @@ static_assert(offsetof(ExecContext, mem_write_slow) == 16);
 static_assert(offsetof(ExecContext, exec_complex) == 24);
 static_assert(offsetof(ExecContext, memory) == 32);
 static_assert(offsetof(ExecContext, jit_budget_epilogue) == 40);
+static_assert(offsetof(ExecContext, jit_preserve_call) == 48);
 static_assert(kSoftTlbBits == 9);
 static_assert(offsetof(ExecContext, tlb) + offsetof(SoftTlb, read_entries) == 0x1000);
 static_assert(offsetof(ExecContext, tlb) + offsetof(SoftTlb, write_entries) == 0x3000);
@@ -241,6 +247,7 @@ struct JitTrampolines {
     std::vector<std::uint8_t> dispatch_code;
     std::vector<std::uint8_t> budget_code;
     std::vector<std::uint8_t> exit_code;
+    std::vector<std::uint8_t> preserve_code;
 };
 
 // Build shared entry (`RawBlockReturn (*)(GuestState*, uint64_t budget, ExecContext*, void*

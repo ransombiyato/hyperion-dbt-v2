@@ -626,7 +626,11 @@ HYPERION_TEST("translator", "translated_code_size_is_bounded") {
     // lies inside the entry block's byte range.
     HYPERION_CHECK_EQ(cache.block_count(), std::size_t{3});
     const std::size_t words = cache.total_code_bytes() / 4;
-    // Exact count at the time of writing is 89 words (356 bytes). History:
+    // Exact count at the time of writing is 105 words (420 bytes): canonical
+    // XMM residency adds the 8 entry-trampoline loads and 8 dispatcher-miss
+    // stores for xmm0..7 (this program has no memory operands, so its SoftTlb
+    // stubs are absent; SSE-using blocks additionally carry the stubs'
+    // XMM preservation pairs). History:
     // 4.2.5 recorded 88; guest-register allocation (4.2.6) netted −3 and the
     // halt rip-write fix (4.2.7) added 3 back. Canonical cross-block
     // allocation (audit §29.27) lands at 89: it removes every per-block
@@ -639,7 +643,7 @@ HYPERION_TEST("translator", "translated_code_size_is_bounded") {
     // timing noise. Update the bound deliberately when the count legitimately
     // changes, and record the exact figure in BENCHMARKS.md.
     HYPERION_CHECK_EQ(cache.total_code_bytes() % 4, std::size_t{0});
-    HYPERION_CHECK(words > 0 && words <= 89);
+    HYPERION_CHECK(words > 0 && words <= 105);
 }
 
 HYPERION_TEST("translator", "alu_immediate_is_folded") {
@@ -855,6 +859,84 @@ HYPERION_TEST("translator", "cached_block_memory_stack_call_ret_and_sse2_match_i
     }
     HYPERION_CHECK(got.state.xmm[0] == ref.state.xmm[0]);
     HYPERION_CHECK(got.state.xmm[1] == ref.state.xmm[1]);
+}
+
+HYPERION_TEST("translator", "canonical_xmm_residency_matches_interpreter") {
+    // Canonical XMM residency: xmm0..7 live in host q16..q23 across block
+    // boundaries. Values loaded in one block, combined in a second, and
+    // stored to guest memory from a third must stay exact, and the final
+    // architectural XMM state must match the interpreter.
+    const std::vector<std::uint8_t> program = {
+        0xF3, 0x0F, 0x6F, 0x06,       // [0..3]   movdqu xmm0, [rsi]
+        0xF3, 0x0F, 0x6F, 0x4E, 0x10, // [4..8]   movdqu xmm1, [rsi+16]
+        0xEB, 0x03,                   // [9..10]  jmp +3 -> [14]
+        0x90, 0x90, 0x90,             // [11..13] never executed
+        0x66, 0x0F, 0xFE, 0xC1,       // [14..17] paddd xmm0, xmm1
+        0x66, 0x0F, 0x73, 0xD0, 0x04, // [18..22] psrld xmm0, 4
+        0x66, 0x0F, 0xEF, 0xD2,       // [23..26] pxor xmm2, xmm2
+        0x66, 0x0F, 0xFE, 0xDA,       // [27..30] paddd xmm3, xmm2
+        0xF3, 0x0F, 0x7F, 0x46, 0x20, // [31..35] movdqu [rsi+32], xmm0
+        0xF4,                         // [36]     hlt
+    };
+    FlatMemory mem1(kBase, 8192);
+    FlatMemory mem2(kBase, 8192);
+    std::memcpy(mem1.data(), program.data(), program.size());
+    for (std::size_t i = 0; i < 48; ++i) {
+        mem1.data()[0x400 + i] = static_cast<std::uint8_t>(0x3Cu ^ (i * 29u));
+    }
+    std::memcpy(mem2.data(), mem1.data(), 8192);
+
+    GuestState init;
+    init.rip = kBase;
+    init.reg(Gpr::kRsi) = kBase + 0x400;
+
+    const hyperion::RunResult ref = hyperion::run_program(mem1, init);
+    hyperion::TranslationCache cache;
+    const hyperion::RunResult got = cache.run(mem2, init);
+    HYPERION_CHECK(ref.status == hyperion::RunStatus::kOk);
+    HYPERION_CHECK(got.status == hyperion::RunStatus::kOk);
+    HYPERION_CHECK_EQ(got.steps, ref.steps);
+    for (std::size_t i = 0; i < hyperion::kXmmCount; ++i) {
+        HYPERION_CHECK(got.state.xmm[i] == ref.state.xmm[i]);
+    }
+    HYPERION_CHECK(std::memcmp(mem2.data() + 0x400, mem1.data() + 0x400, 48) == 0);
+}
+
+HYPERION_TEST("translator", "canonical_xmm_synced_on_budget_exit") {
+    // When the step budget expires at a block boundary, resident XMM values
+    // written by the block that just ran must already be in GuestState:
+    // the state C++ observes must equal the interpreter's after 3 steps.
+    const std::vector<std::uint8_t> program = {
+        0xF3, 0x0F, 0x6F, 0x06,       // [0..3]  movdqu xmm0, [rsi]
+        0xF3, 0x0F, 0x6F, 0x4E, 0x10, // [4..8]  movdqu xmm1, [rsi+16]
+        0xEB, 0x03,                   // [9..10] jmp +3 -> [14]
+        0x90, 0x90, 0x90,             // [11..13] never executed
+        0x66, 0x0F, 0xFE, 0xC1,       // [14..17] paddd xmm0, xmm1
+        0xF4,                         // [18]     hlt
+    };
+    GuestState init;
+    init.rip = kBase;
+    init.reg(Gpr::kRsi) = kBase + 0x400;
+
+    FlatMemory mem1(kBase, 8192);
+    FlatMemory mem2(kBase, 8192);
+    std::memcpy(mem1.data(), program.data(), program.size());
+    for (std::size_t i = 0; i < 32; ++i) {
+        mem1.data()[0x400 + i] = static_cast<std::uint8_t>(0x77u ^ (i * 11u));
+    }
+    std::memcpy(mem2.data(), mem1.data(), 8192);
+
+    const hyperion::RunResult ref = hyperion::run_program(mem1, init, 3);
+    hyperion::TranslationCache cache;
+    cache.set_hot_threshold(0);
+    const hyperion::RunResult got = cache.run(mem2, init, 3);
+    HYPERION_CHECK_EQ(static_cast<int>(got.status),
+                      static_cast<int>(hyperion::RunStatus::kStepLimit));
+    HYPERION_CHECK_EQ(got.steps, std::uint64_t{3});
+    for (std::size_t i = 0; i < hyperion::kXmmCount; ++i) {
+        HYPERION_CHECK(got.state.xmm[i] == ref.state.xmm[i]);
+    }
+    HYPERION_CHECK_EQ(got.state.rip, ref.state.rip);
 }
 
 HYPERION_TEST("translator", "differential_mov_imm32_operands") {
@@ -1111,6 +1193,14 @@ HYPERION_TEST("translator", "rmw_memory_alu_followed_by_jcc_preserves_flags") {
 }
 
 HYPERION_TEST("translator", "cached_block_memory_stack_call_ret_and_sse2_match_interpreter") {
+    HYPERION_SKIP("generated code is AArch64; requires an AArch64 host to run");
+}
+
+HYPERION_TEST("translator", "canonical_xmm_residency_matches_interpreter") {
+    HYPERION_SKIP("generated code is AArch64; requires an AArch64 host to run");
+}
+
+HYPERION_TEST("translator", "canonical_xmm_synced_on_budget_exit") {
     HYPERION_SKIP("generated code is AArch64; requires an AArch64 host to run");
 }
 

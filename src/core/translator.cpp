@@ -1700,6 +1700,25 @@ constexpr Gpr kCanonicalGprs[] = {Gpr::kRax, Gpr::kRcx, Gpr::kRdx, Gpr::kRsp, Gp
 constexpr std::size_t kCanonicalCount = sizeof(kCanonicalGprs) / sizeof(kCanonicalGprs[0]);
 static_assert(kCanonicalCount <= kCachedMaxAlloc);
 
+// Canonical XMM residency, same contract as kCanonicalGprs: guest xmm0..7
+// live in host q16..q23 across every JIT-internal boundary, loaded once by
+// the entry trampoline and stored wherever GuestState must be authoritative
+// (the same funnels that spill the canonical GPRs, plus the SoftTlb slow
+// stubs, whose C++ calls may clobber caller-saved vector registers).
+// xmm8..15 stay memory-resident; the hot set measured on the SSE-dense
+// workloads is xmm0..7 (see BENCHMARKS.md). q16..q23 are caller-saved, so
+// no C++ frame ever expects them preserved - but every C++ call inside the
+// JIT is preceded by a spill for exactly that reason.
+constexpr std::uint8_t kCanonicalXmmCount = 8; // guest xmm0..xmm7
+constexpr unsigned kXmmHostBase = 16;          // host q16..q23
+
+constexpr bool xmm_resident(std::uint8_t idx) {
+    return idx < kCanonicalXmmCount;
+}
+constexpr unsigned xmm_host_q(std::uint8_t idx) {
+    return kXmmHostBase + idx;
+}
+
 constexpr unsigned kFsBaseOffset = offsetof(GuestState, fs_base);
 static_assert(kFsBaseOffset % 8 == 0 && kFsBaseOffset < 4096);
 
@@ -2370,6 +2389,9 @@ JitTrampolines build_jit_trampolines() {
             e.ldr(a64::Width::k64, static_cast<a64::Reg>(kAllocBase + i), kState,
                   gpr_offset(kCanonicalGprs[i]));
         }
+        for (unsigned i = 0; i < kCanonicalXmmCount; ++i) {
+            emit_ldr_q(e, kXmmHostBase + i, kState, xmm_offset(static_cast<std::uint8_t>(i)));
+        }
         e.mov_reg(a64::Width::k64, kInitBudget, 1);  // x25 = initial budget
         e.mov_reg(a64::Width::k64, kRemBudget, 1);   // x26 = remaining budget
         e.mov_reg(a64::Width::k64, kCtxReg, 2);      // x28 = ExecContext*
@@ -2396,8 +2418,8 @@ JitTrampolines build_jit_trampolines() {
 
         e.bind(miss);
         // A miss returns to C++ through the exit epilogue, so the canonical
-        // registers must reach GuestState here; on a hit they stay live in
-        // x19..x23 across the transition (see kCanonicalGprs).
+        // GPRs must reach GuestState here (the epilogue stores the canonical
+        // XMMs); on a hit both sets stay live across the transition.
         for (std::size_t i = 0; i < kCanonicalCount; ++i) {
             e.str(a64::Width::k64, static_cast<a64::Reg>(kAllocBase + i), kState,
                   gpr_offset(kCanonicalGprs[i]));
@@ -2428,6 +2450,17 @@ JitTrampolines build_jit_trampolines() {
         // jump-table hit path, which stays inside generated code: a linked block
         // that does not read PF/AF keeps the descriptor alive.
         emit_pf_af_guard(e, kFbPfAf, kSavedState);
+        // Every C++-bound path funnels through here (block exits, budget
+        // exhaustion via x29, dispatcher misses, faults), so this is where
+        // the canonical XMMs (q16..q23) are stored back - the sites that
+        // branch here only spill the canonical GPRs.
+        for (unsigned i = 0; i < kCanonicalXmmCount; i += 2) {
+            const unsigned off = xmm_offset(static_cast<std::uint8_t>(i));
+            e.emit_raw_u32(0xAD000000u | ((off / 16u) << 15) |
+                           (static_cast<std::uint32_t>(kXmmHostBase + i + 1) << 10) |
+                           (static_cast<std::uint32_t>(kSavedState) << 5) |
+                           static_cast<std::uint32_t>(kXmmHostBase + i));
+        }
         e.sub(a64::Width::k64, 1, kInitBudget, kRemBudget); // x1 = retired guest insns
         e.ldp_off(19, 20, a64::kSp, 16);
         e.ldp_off(21, 22, a64::kSp, 32);
@@ -2437,6 +2470,36 @@ JitTrampolines build_jit_trampolines() {
         e.ldp_post(29, 30, a64::kSp, 128);
         e.ret();
         out.exit_code = e.bytes();
+    }
+
+    // 4. Canonical-XMM-preserving C++ call (`ctx->jit_preserve_call`):
+    //    expects `x9` (kA) = callee, `x0..x3` = its arguments, `x27`
+    //    (kSavedState) = GuestState*, `x30` = return address. The canonical
+    //    XMMs round-trip through GuestState because a C++ callee may
+    //    clobber caller-saved q16..q23; everything else follows the normal
+    //    AArch64 procedure-call contract the caller already relies on.
+    {
+        a64::Encoder e;
+        e.emit_raw_u32(0xF81F0FFEu); // str x30, [sp, #-16]! (push lr, own mini-frame)
+        // stp q16..q23 -> GuestState::xmm[0..7] (contiguous, 16B-aligned)
+        for (unsigned i = 0; i < kCanonicalXmmCount; i += 2) {
+            const unsigned off = xmm_offset(static_cast<std::uint8_t>(i));
+            e.emit_raw_u32(0xAD000000u | ((off / 16u) << 15) |
+                           (static_cast<std::uint32_t>(kXmmHostBase + i + 1) << 10) |
+                           (static_cast<std::uint32_t>(kSavedState) << 5) |
+                           static_cast<std::uint32_t>(kXmmHostBase + i));
+        }
+        e.blr(kA);
+        for (unsigned i = 0; i < kCanonicalXmmCount; i += 2) {
+            const unsigned off = xmm_offset(static_cast<std::uint8_t>(i));
+            e.emit_raw_u32(0xAD400000u | ((off / 16u) << 15) |
+                           (static_cast<std::uint32_t>(kXmmHostBase + i + 1) << 10) |
+                           (static_cast<std::uint32_t>(kSavedState) << 5) |
+                           static_cast<std::uint32_t>(kXmmHostBase + i));
+        }
+        e.emit_raw_u32(0xF84107FEu); // ldr x30, [sp], #16 (pop lr)
+        e.ret();
+        out.preserve_code = e.bytes();
     }
 
     return out;
@@ -2539,6 +2602,19 @@ BlockTranslation translate_cached_block(const std::uint8_t* code, std::size_t si
     const auto block_insns = static_cast<std::uint32_t>(steps.size());
     const a64::Label entry_budget_undo = e.new_label();
 
+    // Canonical XMM sync (see kCanonicalXmmCount): stp/ldp pairs over the
+    // contiguous, 16-byte-aligned GuestState::xmm array. Only the Tier-B
+    // helper boundary needs these inside a block; every C++-bound exit
+    // reaches the shared exit epilogue, which stores the XMMs itself.
+    auto emit_xmm_pairs = [&](bool store) {
+        for (unsigned i = 0; i < kCanonicalXmmCount; i += 2) {
+            const unsigned off = xmm_offset(static_cast<std::uint8_t>(i));
+            e.emit_raw_u32((store ? 0xAD000000u : 0xAD400000u) | ((off / 16u) << 15) |
+                           (static_cast<std::uint32_t>(kXmmHostBase + i + 1) << 10) |
+                           (static_cast<std::uint32_t>(kState) << 5) |
+                           static_cast<std::uint32_t>(kXmmHostBase + i));
+        }
+    };
     auto spill_ra = [&]() {
         for (a64::Reg h : ra.allocated) {
             store_gpr(e, h, guest_of_host(ra, h));
@@ -3082,6 +3158,20 @@ BlockTranslation translate_cached_block(const std::uint8_t* code, std::size_t si
         }
 
         case Opcode::kSse: {
+            // Re-field a raw NEON word whose register operands sit at the
+            // standard positions (Rd [4:0], Rn [9:5], Rm [20:16]); patch_v2
+            // keeps Rm (immediates and second-source fields live there).
+            auto patch_v = [](std::uint32_t word, unsigned rd, unsigned rn, unsigned rm) {
+                return static_cast<std::uint32_t>((word & ~0x1Fu & ~(0x1Fu << 5) & ~(0x1Fu << 16)) |
+                                                  (rd & 31u) | ((rn & 31u) << 5) |
+                                                  ((rm & 31u) << 16));
+            };
+            auto patch_v2 = [](std::uint32_t word, unsigned rd, unsigned rn) {
+                return static_cast<std::uint32_t>((word & ~0x1Fu & ~(0x1Fu << 5)) | (rd & 31u) |
+                                                  ((rn & 31u) << 5));
+            };
+            const unsigned dst_q = xmm_resident(in.dst.xmm) ? xmm_host_q(in.dst.xmm) : 0u;
+            const bool dst_res = xmm_resident(in.dst.xmm);
             auto load_xmm_src_to_q = [&](const Operand& op, unsigned vq, a64::Label flbl) {
                 if (op.kind == OperandKind::kXmm) {
                     emit_ldr_q(e, vq, kState, xmm_offset(op.xmm));
@@ -3103,20 +3193,42 @@ BlockTranslation translate_cached_block(const std::uint8_t* code, std::size_t si
             switch (in.sse_op) {
             case SseOp::kMovUps: {
                 if (in.dst.kind == OperandKind::kXmm && in.src.kind == OperandKind::kXmm) {
-                    emit_ldr_q(e, 0, kState, xmm_offset(in.src.xmm));
-                    emit_str_q(e, 0, kState, xmm_offset(in.dst.xmm));
+                    if (dst_res && xmm_resident(in.src.xmm)) {
+                        if (in.dst.xmm != in.src.xmm) {
+                            // mov vDst.16b, vSrc.16b (orr with itself)
+                            e.emit_raw_u32(patch_v(0x4EA11C00u, dst_q, xmm_host_q(in.src.xmm),
+                                                   xmm_host_q(in.src.xmm)));
+                        }
+                    } else if (dst_res) {
+                        emit_ldr_q(e, dst_q, kState, xmm_offset(in.src.xmm));
+                    } else if (xmm_resident(in.src.xmm)) {
+                        emit_str_q(e, xmm_host_q(in.src.xmm), kState, xmm_offset(in.dst.xmm));
+                    } else {
+                        emit_ldr_q(e, 0, kState, xmm_offset(in.src.xmm));
+                        emit_str_q(e, 0, kState, xmm_offset(in.dst.xmm));
+                    }
                     return TranslateError::kNone;
                 }
                 const a64::Label flbl = make_fault_label(idx);
                 if (in.dst.kind == OperandKind::kXmm) {
-                    load_xmm_src_to_q(in.src, 0, flbl);
-                    emit_str_q(e, 0, kState, xmm_offset(in.dst.xmm));
+                    load_xmm_src_to_q(in.src, dst_q, flbl);
+                    if (!dst_res) {
+                        emit_str_q(e, 0, kState, xmm_offset(in.dst.xmm));
+                    }
                     return TranslateError::kNone;
                 }
                 if (in.dst.kind == OperandKind::kMemory && in.src.kind == OperandKind::kXmm) {
                     emit_effective_address_jit(e, ra, in.dst.mem, next_rip, kB, kT0);
+                    if (xmm_resident(in.src.xmm)) {
+                        // Stage the resident value through the scratch pair:
+                        // value to slots first (the address save reuses slot2
+                        // only after both halves are in registers).
+                        emit_str_q(e, xmm_host_q(in.src.xmm), a64::kSp, kScratchSlot2);
+                        e.ldp_off(kA, kR, a64::kSp, static_cast<int>(kScratchSlot2));
+                    } else {
+                        e.ldp_off(kA, kR, kState, static_cast<int>(xmm_offset(in.src.xmm)));
+                    }
                     e.str(a64::Width::k64, kB, a64::kSp, kScratchSlot2);
-                    e.ldp_off(kA, kR, kState, static_cast<int>(xmm_offset(in.src.xmm)));
                     e.str(a64::Width::k64, kR, a64::kSp, kScratchSlot3);
                     emit_inline_tlb_write(e, kB, kA, 8, flbl, write_stubs);
                     e.ldr(a64::Width::k64, kB, a64::kSp, kScratchSlot2);
@@ -3134,15 +3246,36 @@ BlockTranslation translate_cached_block(const std::uint8_t* code, std::size_t si
                         ? make_fault_label(idx)
                         : a64::Label{0};
                 if (in.dst.kind == OperandKind::kXmm) {
+                    if (in.src.kind == OperandKind::kXmm && dst_res && xmm_resident(in.src.xmm)) {
+                        // fmov dDst, dSrc (zeroes the upper 64 bits, as MOVQ does)
+                        e.emit_raw_u32(0x1E604000u | (xmm_host_q(in.src.xmm) << 5) | dst_q);
+                        return TranslateError::kNone;
+                    }
                     if (in.src.kind == OperandKind::kXmm) {
-                        e.ldr(a64::Width::k64, kA, kState, xmm_offset(in.src.xmm));
+                        if (xmm_resident(in.src.xmm)) {
+                            // fmov kA, dSrc
+                            e.emit_raw_u32(0x9E660000u | (xmm_host_q(in.src.xmm) << 5) |
+                                           static_cast<std::uint32_t>(kA));
+                        } else {
+                            e.ldr(a64::Width::k64, kA, kState, xmm_offset(in.src.xmm));
+                        }
                     } else {
                         load_any_op(in.src, kA, flbl);
                     }
-                    e.stp_off(kA, a64::kXzr, kState, static_cast<int>(xmm_offset(in.dst.xmm)));
+                    if (dst_res) {
+                        // fmov dDst, kA (zeroes the upper 64 bits)
+                        e.emit_raw_u32(0x9E670000u | (static_cast<std::uint32_t>(kA) << 5) | dst_q);
+                    } else {
+                        e.stp_off(kA, a64::kXzr, kState, static_cast<int>(xmm_offset(in.dst.xmm)));
+                    }
                     return TranslateError::kNone;
                 }
-                e.ldr(a64::Width::k64, kA, kState, xmm_offset(in.src.xmm));
+                if (xmm_resident(in.src.xmm)) {
+                    e.emit_raw_u32(0x9E660000u | (xmm_host_q(in.src.xmm) << 5) |
+                                   static_cast<std::uint32_t>(kA)); // fmov kA, dSrc
+                } else {
+                    e.ldr(a64::Width::k64, kA, kState, xmm_offset(in.src.xmm));
+                }
                 if (in.dst.kind == OperandKind::kRegister) {
                     write_gpr_sized_jit(e, ra, in.dst.reg, in.dst.size, false, kA, kT0);
                 } else {
@@ -3159,14 +3292,25 @@ BlockTranslation translate_cached_block(const std::uint8_t* code, std::size_t si
                                                 : a64::Label{0};
                     load_any_op(in.src, kA, flbl);
                     e.mov_reg(a64::Width::k32, kA, kA);
-                    e.stp_off(kA, a64::kXzr, kState, static_cast<int>(xmm_offset(in.dst.xmm)));
+                    if (dst_res) {
+                        // fmov sDst, wA (zeroes bits [127:32], as MOVD does)
+                        e.emit_raw_u32(0x1E270000u | (static_cast<std::uint32_t>(kA) << 5) | dst_q);
+                    } else {
+                        e.stp_off(kA, a64::kXzr, kState, static_cast<int>(xmm_offset(in.dst.xmm)));
+                    }
                     return TranslateError::kNone;
                 }
                 if (in.dst.kind != OperandKind::kXmm && in.src.kind == OperandKind::kXmm) {
                     const a64::Label flbl = (in.dst.kind == OperandKind::kMemory)
                                                 ? make_fault_label(idx)
                                                 : a64::Label{0};
-                    e.ldr(a64::Width::k32, kA, kState, xmm_offset(in.src.xmm));
+                    if (xmm_resident(in.src.xmm)) {
+                        // fmov wA, sSrc
+                        e.emit_raw_u32(0x1E260000u | (xmm_host_q(in.src.xmm) << 5) |
+                                       static_cast<std::uint32_t>(kA));
+                    } else {
+                        e.ldr(a64::Width::k32, kA, kState, xmm_offset(in.src.xmm));
+                    }
                     if (in.dst.kind == OperandKind::kRegister) {
                         write_gpr_sized_jit(e, ra, in.dst.reg, OperandSize::k32, false, kA, kT0);
                     } else {
@@ -3194,54 +3338,63 @@ BlockTranslation translate_cached_block(const std::uint8_t* code, std::size_t si
             case SseOp::kPackuswb: {
                 const a64::Label flbl =
                     (in.src.kind == OperandKind::kMemory) ? make_fault_label(idx) : a64::Label{0};
-                load_xmm_src_to_q(in.src, 1, flbl);
-                emit_ldr_q(e, 0, kState, xmm_offset(in.dst.xmm));
+                unsigned src_q = 1;
+                if (in.src.kind == OperandKind::kXmm && xmm_resident(in.src.xmm)) {
+                    src_q = xmm_host_q(in.src.xmm);
+                } else {
+                    load_xmm_src_to_q(in.src, 1, flbl);
+                }
+                if (!dst_res) {
+                    emit_ldr_q(e, 0, kState, xmm_offset(in.dst.xmm));
+                }
                 switch (in.sse_op) {
                 case SseOp::kPand:
-                    e.emit_raw_u32(0x4E211C00u); // and v0.16b, v0.16b, v1.16b
+                    e.emit_raw_u32(patch_v(0x4E211C00u, dst_q, dst_q, src_q)); // and
                     break;
                 case SseOp::kPor:
-                    e.emit_raw_u32(0x4EA11C00u); // orr v0.16b, v0.16b, v1.16b
+                    e.emit_raw_u32(patch_v(0x4EA11C00u, dst_q, dst_q, src_q)); // orr
                     break;
                 case SseOp::kPxor:
-                    e.emit_raw_u32(0x6E211C00u); // eor v0.16b, v0.16b, v1.16b
+                    e.emit_raw_u32(patch_v(0x6E211C00u, dst_q, dst_q, src_q)); // eor
                     break;
-                case SseOp::kPandn:
-                    e.emit_raw_u32(0x4E601C20u); // bic v0.16b, v1.16b, v0.16b (~v0 & v1)
+                case SseOp::kPandn: // bic vDst, vSrc, vDst (~dst & src)
+                    e.emit_raw_u32(patch_v(0x4E601C20u, dst_q, src_q, dst_q));
                     break;
                 case SseOp::kPaddd:
-                    e.emit_raw_u32(0x4EA18400u); // add v0.4s, v0.4s, v1.4s
+                    e.emit_raw_u32(patch_v(0x4EA18400u, dst_q, dst_q, src_q)); // add .4s
                     break;
                 case SseOp::kPaddq:
-                    e.emit_raw_u32(0x4EE18400u); // add v0.2d, v0.2d, v1.2d
+                    e.emit_raw_u32(patch_v(0x4EE18400u, dst_q, dst_q, src_q)); // add .2d
                     break;
                 case SseOp::kPsubd:
-                    e.emit_raw_u32(0x6EA18400u); // sub v0.4s, v0.4s, v1.4s
+                    e.emit_raw_u32(patch_v(0x6EA18400u, dst_q, dst_q, src_q)); // sub .4s
                     break;
                 case SseOp::kPunpcklbw:
-                    e.emit_raw_u32(0x4E013800u); // zip1 v0.16b, v0.16b, v1.16b
+                    e.emit_raw_u32(patch_v(0x4E013800u, dst_q, dst_q, src_q)); // zip1 .16b
                     break;
                 case SseOp::kPunpckhbw:
-                    e.emit_raw_u32(0x4E017800u); // zip2 v0.16b, v0.16b, v1.16b
+                    e.emit_raw_u32(patch_v(0x4E017800u, dst_q, dst_q, src_q)); // zip2 .16b
                     break;
                 case SseOp::kPunpcklwd:
-                    e.emit_raw_u32(0x4E413800u); // zip1 v0.8h, v0.8h, v1.8h
+                    e.emit_raw_u32(patch_v(0x4E413800u, dst_q, dst_q, src_q)); // zip1 .8h
                     break;
                 case SseOp::kPunpckhwd:
-                    e.emit_raw_u32(0x4E417800u); // zip2 v0.8h, v0.8h, v1.8h
+                    e.emit_raw_u32(patch_v(0x4E417800u, dst_q, dst_q, src_q)); // zip2 .8h
                     break;
                 case SseOp::kPunpcklqdq:
-                    e.emit_raw_u32(0x4EC13800u); // zip1 v0.2d, v0.2d, v1.2d
+                    e.emit_raw_u32(patch_v(0x4EC13800u, dst_q, dst_q, src_q)); // zip1 .2d
                     break;
                 case SseOp::kPunpckhqdq:
-                    e.emit_raw_u32(0x4EC17800u); // zip2 v0.2d, v0.2d, v1.2d
+                    e.emit_raw_u32(patch_v(0x4EC17800u, dst_q, dst_q, src_q)); // zip2 .2d
                     break;
-                default:                         // kPackuswb
-                    e.emit_raw_u32(0x2E212800u); // sqxtun v0.8b, v0.8h
-                    e.emit_raw_u32(0x6E212820u); // sqxtun2 v0.16b, v1.8h
+                default: // kPackuswb (two-register forms: Rd/Rn only)
+                    e.emit_raw_u32(patch_v2(0x2E212800u, dst_q, dst_q)); // sqxtun
+                    e.emit_raw_u32(patch_v2(0x6E212820u, dst_q, src_q)); // sqxtun2
                     break;
                 }
-                emit_str_q(e, 0, kState, xmm_offset(in.dst.xmm));
+                if (!dst_res) {
+                    emit_str_q(e, 0, kState, xmm_offset(in.dst.xmm));
+                }
                 return TranslateError::kNone;
             }
 
@@ -3263,36 +3416,45 @@ BlockTranslation translate_cached_block(const std::uint8_t* code, std::size_t si
                         : ((in.sse_op == SseOp::kPslldImm || in.sse_op == SseOp::kPsrldImm) ? 32u
                                                                                             : 64u);
                 if (c >= max_c) {
-                    e.stp_off(a64::kXzr, a64::kXzr, kState,
-                              static_cast<int>(xmm_offset(in.dst.xmm)));
+                    if (dst_res) {
+                        e.emit_raw_u32(0x4F00E400u | dst_q); // movi vDst.16b, #0
+                    } else {
+                        e.stp_off(a64::kXzr, a64::kXzr, kState,
+                                  static_cast<int>(xmm_offset(in.dst.xmm)));
+                    }
                     return TranslateError::kNone;
                 }
-                emit_ldr_q(e, 0, kState, xmm_offset(in.dst.xmm));
+                if (!dst_res) {
+                    emit_ldr_q(e, 0, kState, xmm_offset(in.dst.xmm));
+                }
                 switch (in.sse_op) {
                 case SseOp::kPsllwImm:
-                    e.emit_raw_u32(0x4F105400u | (c << 16));
+                    e.emit_raw_u32(patch_v2(0x4F105400u | (c << 16), dst_q, dst_q));
                     break;
                 case SseOp::kPsrlwImm:
-                    e.emit_raw_u32(0x6F100400u | ((16u - c) << 16));
+                    e.emit_raw_u32(patch_v2(0x6F100400u | ((16u - c) << 16), dst_q, dst_q));
                     break;
                 case SseOp::kPslldImm:
-                    e.emit_raw_u32(0x4F205400u | (c << 16));
+                    e.emit_raw_u32(patch_v2(0x4F205400u | (c << 16), dst_q, dst_q));
                     break;
                 case SseOp::kPsrldImm:
-                    e.emit_raw_u32(0x6F200400u | ((32u - c) << 16));
+                    e.emit_raw_u32(patch_v2(0x6F200400u | ((32u - c) << 16), dst_q, dst_q));
                     break;
                 case SseOp::kPsllqImm:
-                    e.emit_raw_u32(0x4F405400u | (c << 16));
+                    e.emit_raw_u32(patch_v2(0x4F405400u | (c << 16), dst_q, dst_q));
                     break;
                 case SseOp::kPsrlqImm:
-                    e.emit_raw_u32(0x6F400400u | ((64u - c) << 16));
+                    e.emit_raw_u32(patch_v2(0x6F400400u | ((64u - c) << 16), dst_q, dst_q));
                     break;
-                default:                                     // kPsrldqImm (1..15)
-                    e.emit_raw_u32(0x4F00E402u);             // movi v2.16b, #0
-                    e.emit_raw_u32(0x6E020000u | (c << 11)); // ext v0.16b, v0.16b, v2.16b, #c
+                default:                         // kPsrldqImm (1..15)
+                    e.emit_raw_u32(0x4F00E402u); // movi v2.16b, #0
+                    e.emit_raw_u32(
+                        patch_v2(0x6E020000u | (c << 11), dst_q, dst_q)); // ext vDst, vDst, v2, #c
                     break;
                 }
-                emit_str_q(e, 0, kState, xmm_offset(in.dst.xmm));
+                if (!dst_res) {
+                    emit_str_q(e, 0, kState, xmm_offset(in.dst.xmm));
+                }
                 return TranslateError::kNone;
             }
 
@@ -3317,75 +3479,85 @@ BlockTranslation translate_cached_block(const std::uint8_t* code, std::size_t si
                 if (in.src.kind != OperandKind::kXmm) {
                     break;
                 }
-                emit_ldr_q(e, 0, kState, xmm_offset(in.dst.xmm));
-                emit_ldr_q(e, 1, kState, xmm_offset(in.src.xmm));
+                const unsigned fsrc_q = xmm_resident(in.src.xmm) ? xmm_host_q(in.src.xmm) : 1u;
+                if (!dst_res) {
+                    emit_ldr_q(e, 0, kState, xmm_offset(in.dst.xmm));
+                }
+                if (!xmm_resident(in.src.xmm)) {
+                    emit_ldr_q(e, 1, kState, xmm_offset(in.src.xmm));
+                }
+                // Scalar forms compute into scratch v2 and insert lane 0, so
+                // the destination's upper lanes survive (x86 semantics); the
+                // insert also keeps a memory-resident dst exact in q0.
                 switch (in.sse_op) {
                 case SseOp::kAddSs:
-                    e.emit_raw_u32(0x1E212802u); // fadds s2, s0, s1
-                    e.emit_raw_u32(0x6E040440u); // ins v0.s[0], v2.s[0]
+                    e.emit_raw_u32(patch_v(0x1E212802u, 2, dst_q, fsrc_q)); // fadd s2
+                    e.emit_raw_u32(patch_v2(0x6E040440u, dst_q, 2));        // ins s[0]
                     break;
                 case SseOp::kSubSs:
-                    e.emit_raw_u32(0x1E213802u); // fsubs s2, s0, s1
-                    e.emit_raw_u32(0x6E040440u);
+                    e.emit_raw_u32(patch_v(0x1E213802u, 2, dst_q, fsrc_q));
+                    e.emit_raw_u32(patch_v2(0x6E040440u, dst_q, 2));
                     break;
                 case SseOp::kMulSs:
-                    e.emit_raw_u32(0x1E210802u); // fmuls s2, s0, s1
-                    e.emit_raw_u32(0x6E040440u);
+                    e.emit_raw_u32(patch_v(0x1E210802u, 2, dst_q, fsrc_q));
+                    e.emit_raw_u32(patch_v2(0x6E040440u, dst_q, 2));
                     break;
                 case SseOp::kDivSs:
-                    e.emit_raw_u32(0x1E211802u); // fdivs s2, s0, s1
-                    e.emit_raw_u32(0x6E040440u);
+                    e.emit_raw_u32(patch_v(0x1E211802u, 2, dst_q, fsrc_q));
+                    e.emit_raw_u32(patch_v2(0x6E040440u, dst_q, 2));
                     break;
                 case SseOp::kSqrtSs:
-                    e.emit_raw_u32(0x1E21C022u); // fsqrts s2, s1
-                    e.emit_raw_u32(0x6E040440u);
+                    e.emit_raw_u32(patch_v2(0x1E21C022u, 2, fsrc_q)); // fsqrt s2, sSrc
+                    e.emit_raw_u32(patch_v2(0x6E040440u, dst_q, 2));
                     break;
                 case SseOp::kAddSd:
-                    e.emit_raw_u32(0x1E612802u); // faddd d2, d0, d1
-                    e.emit_raw_u32(0x6E080440u); // ins v0.d[0], v2.d[0]
+                    e.emit_raw_u32(patch_v(0x1E612802u, 2, dst_q, fsrc_q)); // fadd d2
+                    e.emit_raw_u32(patch_v2(0x6E080440u, dst_q, 2));        // ins d[0]
                     break;
                 case SseOp::kSubSd:
-                    e.emit_raw_u32(0x1E613802u); // fsubd d2, d0, d1
-                    e.emit_raw_u32(0x6E080440u);
+                    e.emit_raw_u32(patch_v(0x1E613802u, 2, dst_q, fsrc_q));
+                    e.emit_raw_u32(patch_v2(0x6E080440u, dst_q, 2));
                     break;
                 case SseOp::kMulSd:
-                    e.emit_raw_u32(0x1E610802u); // fmuld d2, d0, d1
-                    e.emit_raw_u32(0x6E080440u);
+                    e.emit_raw_u32(patch_v(0x1E610802u, 2, dst_q, fsrc_q));
+                    e.emit_raw_u32(patch_v2(0x6E080440u, dst_q, 2));
                     break;
                 case SseOp::kDivSd:
-                    e.emit_raw_u32(0x1E611802u); // fdivd d2, d0, d1
-                    e.emit_raw_u32(0x6E080440u);
+                    e.emit_raw_u32(patch_v(0x1E611802u, 2, dst_q, fsrc_q));
+                    e.emit_raw_u32(patch_v2(0x6E080440u, dst_q, 2));
                     break;
                 case SseOp::kSqrtSd:
-                    e.emit_raw_u32(0x1E61C022u); // fsqrtd d2, d1
-                    e.emit_raw_u32(0x6E080440u);
+                    e.emit_raw_u32(patch_v2(0x1E61C022u, 2, fsrc_q)); // fsqrt d2, dSrc
+                    e.emit_raw_u32(patch_v2(0x6E080440u, dst_q, 2));
                     break;
                 case SseOp::kAddPs:
-                    e.emit_raw_u32(0x4E21D400u); // fadd v0.4s, v0.4s, v1.4s
+                    e.emit_raw_u32(patch_v(0x4E21D400u, dst_q, dst_q, fsrc_q));
                     break;
                 case SseOp::kSubPs:
-                    e.emit_raw_u32(0x4EA1D400u); // fsub v0.4s, v0.4s, v1.4s
+                    e.emit_raw_u32(patch_v(0x4EA1D400u, dst_q, dst_q, fsrc_q));
                     break;
                 case SseOp::kMulPs:
-                    e.emit_raw_u32(0x6E21DC00u); // fmul v0.4s, v0.4s, v1.4s
+                    e.emit_raw_u32(patch_v(0x6E21DC00u, dst_q, dst_q, fsrc_q));
                     break;
                 case SseOp::kDivPs:
-                    e.emit_raw_u32(0x6E21FC00u); // fdiv v0.4s, v0.4s, v1.4s
+                    e.emit_raw_u32(patch_v(0x6E21FC00u, dst_q, dst_q, fsrc_q));
                     break;
                 case SseOp::kAddPd:
-                    e.emit_raw_u32(0x4E61D400u); // fadd v0.2d, v0.2d, v1.2d
+                    e.emit_raw_u32(patch_v(0x4E61D400u, dst_q, dst_q, fsrc_q));
                     break;
                 case SseOp::kSubPd:
-                    e.emit_raw_u32(0x4EE1D400u); // fsub v0.2d, v0.2d, v1.2d
+                    e.emit_raw_u32(patch_v(0x4EE1D400u, dst_q, dst_q, fsrc_q));
                     break;
                 case SseOp::kMulPd:
-                    e.emit_raw_u32(0x6E61DC00u); // fmul v0.2d, v0.2d, v1.2d
+                    e.emit_raw_u32(patch_v(0x6E61DC00u, dst_q, dst_q, fsrc_q));
                     break;
                 default:
-                    e.emit_raw_u32(0x6E61FC00u); // fdiv v0.2d, v0.2d, v1.2d
+                    e.emit_raw_u32(patch_v(0x6E61FC00u, dst_q, dst_q, fsrc_q));
                     break;
                 }
-                emit_str_q(e, 0, kState, xmm_offset(in.dst.xmm));
+                if (!dst_res) {
+                    emit_str_q(e, 0, kState, xmm_offset(in.dst.xmm));
+                }
                 return TranslateError::kNone;
             }
 
@@ -3406,6 +3578,7 @@ BlockTranslation translate_cached_block(const std::uint8_t* code, std::size_t si
         const a64::Label lit_lbl = e.new_label();
         embedded_insns.push_back({lit_lbl, in});
         spill_ra();
+        emit_xmm_pairs(/*store=*/true); // helper reads/writes GuestState::xmm
         e.mov_imm64(kA, in.address);
         e.str(a64::Width::k64, kA, kState, kRipOffset);
         e.mov_reg(a64::Width::k64, 0, kCtxReg);
@@ -3415,6 +3588,7 @@ BlockTranslation translate_cached_block(const std::uint8_t* code, std::size_t si
         e.blr(kA);
         e.mov_reg(a64::Width::k64, kState, kSavedState);
         reload_ra();
+        emit_xmm_pairs(/*store=*/false);
         e.cbz(a64::Width::k32, 0, flbl);
         return TranslateError::kNone;
     };
@@ -3812,7 +3986,10 @@ BlockTranslation translate_cached_block(const std::uint8_t* code, std::size_t si
     spill_ra();
     e.br(29);
 
-    // 2. Out-of-line SoftTlb read misses
+    // 2. Out-of-line SoftTlb read misses. The C++ slow path may clobber
+    // caller-saved q16..q23, so the call goes through the shared
+    // XMM-preserving trampoline (ctx->jit_preserve_call) - one extra word
+    // here instead of an 8-word spill/reload in every stub.
     for (const SlowReadStub& s : read_stubs) {
         e.bind(s.slow_lbl);
         e.str(a64::Width::k64, a64::kXzr, a64::kSp, kScratchSlot0);
@@ -3821,14 +3998,15 @@ BlockTranslation translate_cached_block(const std::uint8_t* code, std::size_t si
         e.add_imm(a64::Width::k64, 2, a64::kSp, kScratchSlot0);
         e.movz(a64::Width::k64, 3, static_cast<std::uint16_t>(s.bytes));
         e.ldr(a64::Width::k64, kA, kCtxReg, offsetof(ExecContext, mem_read_slow));
-        e.blr(kA);
+        e.ldr(a64::Width::k64, kT0, kCtxReg, offsetof(ExecContext, jit_preserve_call));
+        e.blr(kT0);
         e.mov_reg(a64::Width::k64, kState, kSavedState);
         e.ldr(a64::Width::k64, s.out_reg, a64::kSp, kScratchSlot0);
         e.cbz(a64::Width::k32, 0, s.fault_lbl);
         e.b(s.done_lbl);
     }
 
-    // 3. Out-of-line SoftTlb write misses
+    // 3. Out-of-line SoftTlb write misses (same XMM preservation as above)
     for (const SlowWriteStub& s : write_stubs) {
         e.bind(s.slow_lbl);
         e.str(a64::Width::k64, s.val_reg, a64::kSp, kScratchSlot0);
@@ -3837,7 +4015,8 @@ BlockTranslation translate_cached_block(const std::uint8_t* code, std::size_t si
         e.add_imm(a64::Width::k64, 2, a64::kSp, kScratchSlot0);
         e.movz(a64::Width::k64, 3, static_cast<std::uint16_t>(s.bytes));
         e.ldr(a64::Width::k64, kA, kCtxReg, offsetof(ExecContext, mem_write_slow));
-        e.blr(kA);
+        e.ldr(a64::Width::k64, kT0, kCtxReg, offsetof(ExecContext, jit_preserve_call));
+        e.blr(kT0);
         e.mov_reg(a64::Width::k64, kState, kSavedState);
         e.cbz(a64::Width::k32, 0, s.fault_lbl);
         e.b(s.done_lbl);
