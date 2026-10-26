@@ -2857,6 +2857,124 @@ together address both the 6 % boundary share and the in-block state traffic; (c)
 with long, hot, acyclic paths (the four benchmark guests have none: their hot cycles are
 ≤3 blocks or cross a call) becomes a stated target.
 
+### 29.27 P16 — cross-block register allocation: the opportunity is real, the prototype works, and this rig cannot certify it — deferred
+
+§29.15 deferred cross-block register allocation after measuring only the *boundary* traffic
+(6.1–6.6 % of generated words). P15 (§29.26) closed by noting the remaining cost is in-block
+guest-state traffic and that a trace would be the natural unit for a canonical assignment. P16
+reopened the question with a sharper instrument and a pre-registered decision rule. Outcome:
+**defer** — a working prototype shows a real but small effect that the available hardware cannot
+separate from its own bias, at +9 % code size. The prototype was removed; production code is
+unchanged.
+
+#### Baseline and integrity
+
+The stale-snapshot state was inspected before any resync (44 modified / 11 deleted / 0
+untracked; every modified blob except the known `sigsys_diagnostics.cpp` variant exists in
+committed history; full backup in `/home/user/pre-p16-resync-backup/`). Tree synchronised to
+`HEAD == origin/main == ef24432d75f6c8e8b8c58470d5bd03ab34481776`, P14 stage 1 confirmed
+(`compute_ir_facts`, `translator.cpp:2332`). Baseline, recorded before any change: native
+(clang 19.1.7, RelWithDebInfo, tests+benchmarks) **370 passed / 0 failed / 47 skipped of 417**,
+`ctest` **19/19**; AArch64 cross (aarch64-linux-gnu-g++ 14, static) under
+`qemu-aarch64-static`: **417 passed / 0 failed / 5 skipped of 422**; `cli_smoke` green on both.
+The same numbers were re-verified on the final tree after the prototype was removed.
+
+#### What "0.7 state accesses per instruction" actually is — definition first
+
+A temporary census in `translate_cached_block` (uncommitted, removed) classified every emitted
+main-body load/store with base `x8`/`x27` by `GuestState` offset (unsigned-immediate forms;
+out-of-line slow/fault stubs excluded), and a tier-0 probe supplied dynamic block executions.
+The often-quoted ~0.7 figure is only the **guest-GPR load** column. The full picture
+(translated blocks, static / dynamically weighted):
+
+| guest | static total | dyn. total | dyn. GPR | dyn. flags | dyn. PF/AF | dyn. rip |
+| --- | --- | --- | --- | --- | --- | --- |
+| sieve | 2.886 | 3.329 | 1.320 | 1.037 | 0.733 | 0.239 |
+| nqueens | 2.905 | 2.242 | 1.303 | 0.437 | 0.327 | 0.175 |
+| quicksort_c | 2.866 | 2.774 | 1.299 | 0.698 | 0.523 | 0.254 |
+| qsort_glibc | 2.802 | 2.941 | 1.347 | 0.913 | 0.410 | 0.271 |
+
+So GPR traffic — the only part a register allocator can touch — is ~1.30 accesses per guest
+instruction dynamically; flags+PF/AF are of the same order (and belong to P9's problem, not this
+one). State accesses are 26–33 % of dynamically executed main-body words. Architecture, for the
+record: `GuestState` is authoritative at every block entry/exit; cached blocks pin ≤5 guest
+registers in `x19..x23` chosen per block (`refs > 2`), `x24..x28` hold dispatch/budgets/state/
+context; synchronisation happens at helper calls (spill+reload), halt/syscall (spill), fault
+stubs (spill), and every dispatch-bound exit (spill). A facts-based access model
+(unpinned touch = 1 access; pinned = load+store) reproduces the census for the current policy
+within 0–15 % per guest.
+
+#### Opportunity, modelled before any code
+
+Values actually live across edges are few (0.78–2.43 predecessor-produced values per transition;
+successors read 2.64–4.98 values at entry), but a *canonical* assignment — the same five guest
+registers in `x19..x23` in every block, never synced on JIT-internal transitions — also removes
+the in-block touches of those registers in blocks that pin nothing today. Modelled upper bounds
+(canonical sync charged only at C++ funnels), by guest-chosen set: −51 to −99 % of GPR accesses.
+A single global set must include `rsp` (`{rax, rdx, rsp, rsi, rcx}`): without it nqueens
+*regresses* +3.0 % of executed words (its hot code touches `rsp` 31 % and `r14`/`r15`); with it
+all four guests improve on paper by **−4.1 to −8.5 % of executed words**. A canonical-3
+(`{rax, rdx, rsp}`) plus two per-block flex pins models slightly worse (−3.5 to −7.2 %) with
+less code growth and more boundary complexity. Designs A (within-block caching) is the status
+quo, already threshold-swept flat in §29.22; C (trace-local) couples this to the rejected P15;
+B (pure canonical) and D (hybrid) are the candidates, B being the smallest change that tests
+the hypothesis.
+
+#### Pre-registered acceptance criteria (fixed before candidate measurement)
+
+Interleaved A/B on the §29.20 rig (`--timing`, `env -i`, ≥12 pairs × 2 sessions per guest,
+bootstrap 95 % CI on the paired median ratio, candidate/baseline): production implementation
+requires median ratio ≤ 0.98 on at least two guests with CIs supporting a genuine improvement,
+no guest regressing >1 % (median), no correctness regressions or new skips, code-size growth
+≤10 %, translation overhead acceptable. If the rig cannot resolve ~2 %, the result is reported
+as inconclusive, not successful.
+
+#### Prototype (temporary, uncommitted, removed after measurement)
+
+The smallest change that carries values across boundaries: pass 1.5 always maps
+`{rax, rcx, rdx, rsp, rsi}` → `x19..x23`; per-block entry reloads deleted; spills deleted at
+dispatch-bound exits only (`jmp`/`call`/`ret`/`jcc`/fall-through/self-loop); spills *kept* at
+helper calls, halt, syscall, and fault stubs; the entry trampoline loads the canonical set
+once; the dispatcher-miss path and the budget-exhaustion stub (`entry_budget_undo`, which
+reaches the C++ epilogue without passing a spill today) gained the 5 stores that keep
+`GuestState` authoritative at every C++-visible point. The dispatcher trampoline itself never
+touches `x19..x23` (verified by reading `build_jit_trampolines`).
+
+Correctness: AArch64 suite **416 passed / 1 failed / 5 skipped** — the single failure is
+`translator.translated_code_size_is_bounded`, the deliberate small-block code-size guard
+(canonical charges 5-word syncs in every block's cold stubs); no correctness test failed.
+Guest stdout identical to baseline and to native for all four guests. Code size grew
+**+8.9 % / +8.2 % / +9.2 % / +8.6 %** (sieve/nqueens/quicksort_c/qsort_glibc); translation time
+unchanged (sieve medians 45.4 ms vs 46.0 ms, interleaved).
+
+#### Candidate measurements (qemu-mediated, paired `--timing` run wall)
+
+| guest | session 1 | session 2 | pooled (24 pairs) | A/A control (identical binaries) |
+| --- | --- | --- | --- | --- |
+| sieve | 0.957 [0.913, 0.984] | 0.970 [0.954, 0.999] | **0.963 [0.945, 0.988]** | 0.994 [0.975, 1.027] |
+| nqueens | 0.970 [0.959, 0.989] | 0.986 [0.950, 1.011] | **0.978 [0.963, 0.995]** | 0.984 [0.967, 1.017] |
+| quicksort_c | 0.992 [0.972, 1.025] | 0.997 [0.971, 1.020] | 0.994 [0.974, 1.011] | 1.014 [0.996, 1.079] |
+| qsort_glibc | 0.994 [0.970, 1.018] | 0.999 [0.967, 1.037] | 0.999 [0.980, 1.016] | 1.010 [0.999, 1.024] |
+
+#### Decision: defer (prototype only, removed)
+
+The direction is consistent (7 of 8 guest-sessions below 1.0; pooled sieve and nqueens CIs
+exclude 1.0), so this is not a rejection — the effect is very likely real and worth ~2–4 % on
+sieve, ~2 % on nqueens, ~0 % on the quicksorts. But the A/A controls show this rig manufactures
+apparent effects of up to 1.6 % (nqueens A/A median 0.984) with *identical* binaries: the
+claimed nqueens effect is within 2× of the rig's demonstrated bias, session 2 does not
+reproduce session 1's CI, and the price is +9 % code size, a broken code-size guard, and a
+permanent relaxation of the §29.3 write-back discipline at every JIT-internal boundary — the
+invariant two earlier items called non-negotiable. Under the pre-registered criteria that is
+"inconclusive on this hardware", and an inconclusive 2 % does not buy that risk.
+
+**Reversal conditions.** Revisit when (a) a native-AArch64 rig with ≤1 % noise exists — the
+pooled CIs say the effect would very likely certify there; (b) someone first reduces the
+static cost (canonical-3 + flex pins, or canonical sync only where stubs exist), bringing
+code growth well under the current +9 %; or (c) a workload appears whose hot code is
+GPR-touch-dominated like sieve's but larger, where the modelled −8 % of executed words has
+room to show. Until then the per-block allocator (§29.22: threshold swept, flat) stays.
+
 ### 29.9 Still open from §L
 
 Items 1-5 of §L are all resolved (1 justified and pinned, 2 and 5 implemented, 3 retracted as wrong,
@@ -2908,6 +3026,7 @@ in §L items 6–14 is left unaddressed; §30 is the summary.
 | 13 threads | **audited and pinned** — "many processes, no threads"; every shared-state clone flag refused, the six pieces a thread implementation needs written down | §29.17 |
 | 14 IR | **stage 1 shipped, stage 2 rejected on measurement** — facts pass with byte-identical output (2 047 blocks, 4 guests); block-local copy propagation can remove 0.04–0.08 % of instructions and saves 0 emitted words | §29.23, §29.24 |
 | 15 trace/superblock formation | **investigated, designed, not implemented** — dynamic traces are 2–3 blocks; removing 22–32 % of transitions has a ≈1.3–2.1 % generated-code ceiling (≤1–2 % runtime), under the rig's noise floor; hottest edge already a self-loop superblock, call/ret break traces in two guests | §29.26 |
+| 16 cross-block register allocation | **prototyped, measured, deferred** — canonical `{rax,rdx,rsp,rsi,rcx}` in `x19..x23`: guest outputs identical, pooled A/B 0.963 (sieve) / 0.978 (nqueens) with CIs below 1, but A/A controls show ≤1.6 % rig bias, quicksorts flat, code size +8.2–9.2 %; needs a native-AArch64 rig to certify | §29.27 |
 
 Verification for the batch, at `24f6477` (P14 stage 1): native (x86-64, clang-19) 370 passed / 0
 failed / 47 skipped of 417, `ctest` 19/19; AArch64 under `qemu-aarch64-static` 417 passed / 0
