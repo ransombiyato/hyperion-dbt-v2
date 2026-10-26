@@ -2297,6 +2297,45 @@ that materialises through `GuestState` where an allocated host register would do
 copy-propagation pass) rather than from the call/return path. That belongs to the P14 stages of
 §29.18, where an IR pass can see a whole block's moves at once.
 
+### 29.22 Sweeping the register-allocation threshold — flat, so the heuristic stays
+
+§29.15 measured cross-block register traffic (6.1–6.6 % of generated code) and §29.21 pointed at
+`mov` as the single largest opcode class (27–31 % of retired instructions). The cheapest hypothesis
+that connects the two is that the allocator's entry condition is mistuned: it pins a guest register
+only when a block references it more than twice (`refs[i] > 2`, justified as "strictly saves ≥ 1
+word over 1 load + 1 store"), and at ~4.7 guest instructions per block that fires for 0.65–0.75
+registers per block. If `mov` dominates, a looser condition would keep more operands in host
+registers and remove GuestState traffic.
+
+So it was swept, with a temporary `HYPERION_RA_MIN_REFS` hook in the allocator (never committed),
+on the §29.20 rig: 11 interleaved samples per configuration, bootstrap 95 % CI on the median ratio
+against today's `> 2`:
+
+| threshold | `nqueens` | `quicksort_c` | `sieve` | `qsort_glibc` |
+| --- | --- | --- | --- | --- |
+| `> 1` (pin at 2 refs) | 0.994 [0.938, 1.012] | 1.003 [0.926, 1.045] | 1.005 [0.927, 1.067] | 1.003 [0.982, 1.019] |
+| `> 2` (current) | — | — | — | — |
+| `> 3` | 1.016 [0.955, 1.064] | 0.984 [0.967, 1.055] | 1.020 [0.944, 1.085] | 0.993 [0.942, 1.016] |
+| `> 4` | 1.038 [0.913, 1.129] | 1.012 [0.935, 1.035] | 1.006 [0.904, 1.036] | 1.025 [0.978, 1.129] |
+
+**Every configuration is inside the noise: no threshold is measurably better or worse than the
+current one**, on any of the four workloads. The generated-code sizes do move as expected
+(pinning at 2 refs costs 2.3 % more code, 240 804 B vs 235 388 B for `quicksort_c`), so the
+experiment really did change the allocation — the *runtime* simply does not care, which says the
+GuestState round-trip for a twice-referenced register is already about as cheap as the two
+instructions it would replace.
+
+Consequences, recorded rather than acted on:
+
+* the current heuristic stays, now with a measurement behind the constant instead of only an
+  instruction-count argument;
+* it corroborates §29.15's conclusion that a cross-block allocator (P8) has little to win: if
+  moving *within* a block between "in a host register" and "in GuestState" is worth ~0, moving
+  *across* blocks is worth less than the 6 % of code those transitions occupy;
+* and it means `mov`'s 27–31 % share cannot be attacked by allocation policy at all. It needs a
+  pass that sees a block as a whole and rewrites the moves away — block-level copy propagation,
+  which is a P14 stage-2 pass (§29.18), not a tuning constant.
+
 ### 29.9 Still open from §L
 
 Items 1-5 of §L are all resolved (1 justified and pinned, 2 and 5 implemented, 3 retracted as wrong,
