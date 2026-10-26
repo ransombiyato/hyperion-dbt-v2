@@ -2975,6 +2975,93 @@ code growth well under the current +9 %; or (c) a workload appears whose hot cod
 GPR-touch-dominated like sieve's but larger, where the modelled −8 % of executed words has
 room to show. Until then the per-block allocator (§29.22: threshold swept, flat) stays.
 
+### 29.28 P17 — flag-state optimisation: the cheap hypotheses measure at zero, and what remains is P9 stage 2's representation cost — deferred
+
+§29.27's census put flag-state accesses at 0.44–1.04 (flags) plus 0.33–0.73 (PF/AF descriptor)
+per guest instruction. P17 traced the full flag lifecycle looking for redundancy *inside* the
+existing representation — explicitly not a second one — before touching the deferred P9 stage-2
+question. Three concrete micro-hypotheses were measurable; all three measured at or near zero.
+No prototype was built, because the Phase-4 gate (a measurable opportunity) was not met.
+Production code is unchanged.
+
+#### The lifecycle as it stands
+
+`GuestState::flags` holds six bytes. CF/ZF/SF/OF are materialised eagerly at each producer but
+only for flags the pass-2 liveness (over P14's `IrFacts`) proves live — each live flag is a
+`cset`+`strb` pair (logical ops store `xzr` for CF/OF). PF/AF go through the §29.11 pending
+descriptor: 4 words per producer (`strb` result byte, `strb` xor byte, `movz`, `strb` pending
+mask), materialised at the exit epilogue, the helper boundary (`jit_exec_complex`), and inline
+guards before PF/AF consumers (`JP/JNP`, `SETP`). NZCV fusion already covers the hot
+`cmp`/`jcc` and ALU/`jcc` consumers without touching memory. Synchronisation points are
+therefore: every live-flag producer (memory is always current), helper calls, and the single
+C++ funnel. That tightness is what the measurements below keep running into.
+
+#### Hypothesis 1: the pending-mask store is redundant after the first producer in a block
+
+`emit_pf_af_store` re-emits `movz`+`strb` of the pending mask at every producer, even when the
+previous producer in the same block already set it and nothing cleared it in between. A
+temporary counting instrument (removed) simulated exactly that static state machine
+(unknown/clear/set; reset at block entry, at the self-loop backedge join, and at helper
+boundaries; cleared by guards/materialisation) over every translated block of the four guests:
+
+| guest | producers (static) | skippable pending stores | PF/AF guards | guard-skippable |
+| --- | --- | --- | --- | --- |
+| sieve | 411 | **0** | 0 | 0 |
+| nqueens | 344 | **0** | 0 | 0 |
+| quicksort_c | 444 | **0** | 0 | 0 |
+| qsort_glibc | 461 | **0** | 0 | 0 |
+
+This is not a simulation artefact: at most 2 blocks per guest contain two PF/AF-live producers
+at all, and weighting by dynamic executions, the *absolute upper bound* (counting every
+non-first producer as skippable, ignoring intervening consumers/helpers) is **9–11 stores per
+entire run** against 3.0–4.3 M producer executions. The reason is structural: hot blocks contain
+≈1 PF/AF-live producer per execution (sieve: 4.15 M producers / 4.16 M block executions),
+because liveness already suppresses every producer whose PF/AF nobody reads, and between any
+two live producers sits a consumer or a helper by construction. **Rejected: measured zero.**
+
+#### Hypothesis 2: PF/AF consumer guards fire when nothing is pending
+
+The same census counts guards: **zero** in the translated blocks of all four guests (no
+`JP/JNP`/`SETP` in the hot code; the epilogue guard is once per C++ funnel exit, not per
+block). There is nothing to skip. **Rejected: nothing to remove.**
+
+#### Hypothesis 3: pack the descriptor's three byte stores
+
+`pf_af_pending`/`res`/`xor` sit at `GuestState` offsets 162/163/164 (verified by `offsetof`
+probe), so packing looks tempting and fails on AArch64 facts: there is no store-immediate, the
+pending byte is at offset ≡2 (mod 4) so a word store would have to preserve two neighbouring
+state bytes (load+merge — strictly worse), and every 16-bit packing (`bfi`+`strh` for one pair,
+plus the remaining byte store and `movz`) costs the same 4 words as today. **Rejected: no
+saving exists.**
+
+#### What remains, and why it is still deferred
+
+What is left is the representation cost itself: ~4 words per PF/AF producer and up to 8 per
+CF/ZF/SF/OF producer, ≈1 producer per block execution — dynamically 0.76–1.77 flag-state
+accesses per guest instruction (9–16 % of executed words). The only design that reduces it is
+P9 stage 2's `cc_op`/`cc_src`/`cc_dst` descriptor, whose ceiling §29.14 already measured at
+≈4 % of executed code and whose revisit trigger was "a native-AArch64 rig with ≤1 % noise, or
+P14 landing with a flag-effect table". P14 stage 1 has landed, but `IrFacts` carries flag
+*masks* (read/written/killed), not the operand values a descriptor must store; the ~30-site
+emitter surface §29.14 catalogued is unchanged. And the rig has not improved: §29.27's A/A
+controls on this identical production code show apparent effects up to 1.6 % with identical
+binaries, against a stage-2 runtime expectation of at most ~2 %. Building the descriptor now
+would repeat P16's shape (real-but-uncertifiable effect) with a much larger correctness
+surface — every partially-defined-flag producer in §29.14's list — for a smaller prize.
+
+**Decision: defer** (the three micro-hypotheses are rejected outright). Baseline for this item
+was `8c617e1` (CI 7/7 verified); final tree re-verified after instrument removal: native
+370/0/47, `ctest` 19/19, AArch64 under qemu 417/0/5, `cli_smoke` green on both tiers, guest
+outputs unchanged throughout (md5-verified against native execution during data collection).
+
+**Reversal conditions.** (a) A native-AArch64 measurement rig with ≤1 % noise — the same
+condition as §29.14/§29.27, still the binding constraint for three items now; (b) an IR change
+that makes `cc_src`/`cc_dst` available from one table (P14 stage ≥3 territory), collapsing the
+~30-site surface into one place where a descriptor can be generated and differentially tested;
+(c) a workload with materially higher PF/AF-consumer density than these four guests, which
+would change both the guard economics and the descriptor's payoff. Until one holds, the flag
+machinery as stage 1 left it is the right stopping point.
+
 ### 29.9 Still open from §L
 
 Items 1-5 of §L are all resolved (1 justified and pinned, 2 and 5 implemented, 3 retracted as wrong,
@@ -3027,6 +3114,7 @@ in §L items 6–14 is left unaddressed; §30 is the summary.
 | 14 IR | **stage 1 shipped, stage 2 rejected on measurement** — facts pass with byte-identical output (2 047 blocks, 4 guests); block-local copy propagation can remove 0.04–0.08 % of instructions and saves 0 emitted words | §29.23, §29.24 |
 | 15 trace/superblock formation | **investigated, designed, not implemented** — dynamic traces are 2–3 blocks; removing 22–32 % of transitions has a ≈1.3–2.1 % generated-code ceiling (≤1–2 % runtime), under the rig's noise floor; hottest edge already a self-loop superblock, call/ret break traces in two guests | §29.26 |
 | 16 cross-block register allocation | **prototyped, measured, deferred** — canonical `{rax,rdx,rsp,rsi,rcx}` in `x19..x23`: guest outputs identical, pooled A/B 0.963 (sieve) / 0.978 (nqueens) with CIs below 1, but A/A controls show ≤1.6 % rig bias, quicksorts flat, code size +8.2–9.2 %; needs a native-AArch64 rig to certify | §29.27 |
+| 17 flag-state optimisation | **micro-hypotheses rejected, stage-2 class deferred** — redundant PF/AF pending-store measures at exactly 0 (upper bound 9–11 stores/run; ≈1 live producer per block execution), consumer guards 0 in hot blocks, descriptor packing saves nothing; remaining cost is P9 stage 2's representation change (≈4 % ceiling, §29.14), still unmeasurable on this rig | §29.28 |
 
 Verification for the batch, at `24f6477` (P14 stage 1): native (x86-64, clang-19) 370 passed / 0
 failed / 47 skipped of 417, `ctest` 19/19; AArch64 under `qemu-aarch64-static` 417 passed / 0
