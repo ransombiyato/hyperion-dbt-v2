@@ -3106,15 +3106,13 @@ RunResult run_program(Memory& memory, GuestState state, std::uint64_t max_steps,
         }
 
         // If rip holds kSigReturnMagic, the signal handler just executed `ret`
-        // and popped our sentinel. rsp now points past the magic, at the
-        // ucontext start. Intercept this and invoke rt_sigreturn to restore the
-        // interrupted guest context.
+        // and popped our sentinel. rsp now points past the magic (at the second
+        // magic slot, offset 8). Intercept this and invoke rt_sigreturn to
+        // restore the interrupted guest context. rt_sigreturn probes [rsp] to
+        // find the magic sentinel and computes the frame start as rsp - 8.
         if (syscalls != nullptr &&
             out.state.rip == hyperion::sigframe::kSigReturnMagic) {
             out.state.reg(Gpr::kRax) = static_cast<std::uint64_t>(sysno::kRtSigreturn);
-            // Undo the `ret` pop of the magic return address so rsp points at
-            // the frame start (magic at offset 0, ucontext at offset 16).
-            out.state.reg(Gpr::kRsp) -= 8;
             const SyscallResult sr = syscalls->handle(out.state, memory);
             if (sr.status == SyscallStatus::kExit) {
                 out.steps = i + 1;

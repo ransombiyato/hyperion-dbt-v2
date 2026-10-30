@@ -56,11 +56,16 @@ inline constexpr std::size_t kSiginfoOffset = 256;  // siginfo starts after ucon
 inline constexpr std::size_t kFrameSize = 384;      // 16 + 64 + 176 + 128
 
 // uc fields (relative to ucontext start at kUcontextOffset)
+//   uc_flags at +0 (8 bytes)
+//   uc_link at +8 (8 bytes)
+//   uc_stack at +16 (24 bytes: ss_sp=16, ss_flags=24, ss_size=32) → ends at +40
+//   uc_sigmask at +40 (16 bytes) → ends at +56
+//   padding +56... no, mcontext starts at +56
 inline constexpr std::size_t kUcFlags = 0;
 inline constexpr std::size_t kUcLink = 8;
-inline constexpr std::size_t kUcStack = 16;   // stack_t: ss_sp(8), ss_flags(4), ss_size(8)
-inline constexpr std::size_t kUcSigmask = 48; // sigset_t: 16 bytes
-inline constexpr std::size_t kUcMcontext = 56; // struct sigcontext at uc+56 (= frame+72)
+inline constexpr std::size_t kUcStack = 16;   // stack_t: ss_sp(8), ss_flags(4), ss_size(8) → 24 bytes
+inline constexpr std::size_t kUcSigmask = 40; // sigset_t: 16 bytes → ends at +56
+inline constexpr std::size_t kUcMcontext = 56; // struct sigcontext starts at uc+56 (= frame+72)
 
 // siginfo_t fields (within kSiginfoOffset)
 inline constexpr std::size_t kSiSigno = 0;

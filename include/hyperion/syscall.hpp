@@ -576,12 +576,6 @@ private:
     // Bit (sig - 1) is set for a pending signal, matching the guest's own
     // sigset_t layout.
     std::uint64_t signal_pending_ = 0;
-    // What the recorded disposition and the default table say a signal does,
-    // ignoring the mask: 0 = the guest must not notice it, otherwise 128 + sig is
-    // the status the guest run ends with. Never builds or calls a guest handler -
-    // that needs an x86-64 signal frame and rt_sigreturn, which this layer does
-    // not implement (COMPATIBILITY.md states the gap).
-    std::int64_t signal_disposition(int sig) const;
     // Mask-aware: queues a blocked signal, returns 0 when the guest keeps
     // running, else 128 + sig.
     std::int64_t raise_signal(int sig);
