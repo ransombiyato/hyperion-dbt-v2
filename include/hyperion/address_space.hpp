@@ -141,7 +141,10 @@ public:
     bool map_fixed(std::uint64_t addr, std::size_t size, MemPerm perm,
                    const void* init_data = nullptr, std::size_t init_len = 0);
 
-    // Unmap `size` bytes starting at `addr`. Returns false if the range is
+    // Map an alias of `orig_page` at `alias_page` sharing the same backing
+    // storage. Used for signal delivery: 32-bit register operations zero-extend
+    // `esp` to the low 4GB range, which needs to map to the same stack memory.
+    bool map_page_alias(std::uint64_t orig_page, std::uint64_t alias_page) override;
     // misaligned, empty, or not fully mapped.
     bool unmap(std::uint64_t addr, std::size_t size);
 

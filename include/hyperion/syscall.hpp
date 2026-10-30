@@ -60,9 +60,10 @@ namespace hyperion {
 // handler does not depend on the documentation.
 namespace sysno {
 inline constexpr std::uint64_t kRead = 0;
+inline constexpr std::uint64_t kWrite = 1;
 inline constexpr std::uint64_t kRtSigaction = 13;
 inline constexpr std::uint64_t kRtSigprocmask = 14;
-inline constexpr std::uint64_t kWrite = 1;
+inline constexpr std::uint64_t kRtSigreturn = 15;
 inline constexpr std::uint64_t kClose = 3;
 inline constexpr std::uint64_t kFstat = 5;
 inline constexpr std::uint64_t kLseek = 8;
@@ -326,6 +327,15 @@ struct SyscallResult {
     std::int64_t exit_code = 0; // valid when status == kExit
 };
 
+// A recorded guest signal disposition (from rt_sigaction(13)).
+struct GuestSignalAction {
+    std::uint64_t handler = 0; // SIG_DFL (0), SIG_IGN (1), or a guest address
+    std::uint64_t flags = 0;
+    std::uint64_t restorer = 0;
+    std::uint64_t mask = 0;
+    bool installed = false;
+};
+
 // The guest system-call interface. An implementation receives the guest state
 // with rax = number and rdi/rsi/rdx/r10/r8/r9 = arguments, and must write the
 // result into rax.
@@ -333,6 +343,19 @@ class SyscallHandler {
 public:
     virtual ~SyscallHandler() = default;
     virtual SyscallResult handle(GuestState& state, Memory& memory) = 0;
+
+    // Guest signal-delivery interface. Default implementations mean "no signals
+    // are ever pending and nothing is masked", which is correct for handlers
+    // that do not implement signal support. MinimalSyscallHandler overrides
+    // these to provide real guest signal delivery.
+    virtual std::uint64_t guest_sigmask() const noexcept { return 0; }
+    virtual void clear_pending_signal(int sig) noexcept {}
+    virtual std::size_t sigaction_count() const noexcept { return 0; }
+    virtual const GuestSignalAction& sigaction_at(std::size_t index) const noexcept {
+        static const GuestSignalAction kDefault{}; // SIG_DFL, no handler
+        return kDefault;
+    }
+    virtual std::uint64_t signal_pending_for_delivery() const noexcept { return 0; }
 };
 
 // Shared POSIX open file description (shared across dup/dup2/dup3/fcntl F_DUPFD).
@@ -490,6 +513,25 @@ public:
     void set_guest_image_path(std::string path) { guest_image_path_ = std::move(path); }
     const std::string& guest_image_path() const noexcept { return guest_image_path_; }
 
+    // --- signal-state accessors for signal_handling.cpp ---------------------
+    // The guest signal mask (bit sig-1 set = blocked). Managed by rt_sigprocmask
+    // (14) in src/core/syscall.cpp. Named guest_sigmask to avoid clashing with
+    // the deprecated ::sigmask() C library function.
+    std::uint64_t guest_sigmask() const noexcept { return sigmask_; }
+    // Clear the pending bit for `sig` after it has been dequeued for delivery.
+    void clear_pending_signal(int sig) noexcept;
+    // Number of guest signal-action slots (kMaxSignal + 1).
+    std::size_t sigaction_count() const noexcept { return kMaxSignal + 1; }
+    // Read-only access to a recorded signal disposition. Bounds-checked by the
+    // caller (index < sigaction_count()).
+    const GuestSignalAction& sigaction_at(std::size_t index) const noexcept {
+        return sigactions_[index];
+    }
+    // Signals raised synchronously (kill/tgkill) and awaiting delivery.
+    std::uint64_t signal_pending_for_delivery() const noexcept {
+        return signal_pending_;
+    }
+
 private:
     // process.cpp implements fork/vfork/clone/execve/wait4 against this state.
     friend struct ProcessAccess;
@@ -519,13 +561,6 @@ private:
     // of the zeroed block this layer used to hand back. Delivery is a separate
     // mechanism and is not implemented - see COMPATIBILITY.md.
     static constexpr std::size_t kMaxSignal = 64;
-    struct GuestSignalAction {
-        std::uint64_t handler = 0; // SIG_DFL (0), SIG_IGN (1), or a guest address
-        std::uint64_t flags = 0;
-        std::uint64_t restorer = 0;
-        std::uint64_t mask = 0;
-        bool installed = false;
-    };
     std::array<GuestSignalAction, kMaxSignal + 1> sigactions_{};
     // sigaltstack(2): the guest's alternate signal stack, as it wrote it
     // (24-byte stack_t: ss_sp, ss_flags, ss_size).

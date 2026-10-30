@@ -6,6 +6,8 @@
 #include "hyperion/address_space.hpp"
 
 #include <algorithm>
+#include <array>
+#include <cstdint>
 #include <cstring>
 #include <exception>
 #include <limits>
@@ -423,6 +425,21 @@ bool GuestAddressSpace::map_fixed(std::uint64_t addr, std::size_t size, MemPerm 
         ++code_epoch_;
     }
     return true;
+}
+
+bool GuestAddressSpace::map_page_alias(std::uint64_t orig_page, std::uint64_t alias_page) {
+    // Both must be page-aligned and distinct.
+    if ((orig_page & kPageMask) != 0 || (alias_page & kPageMask) != 0 ||
+        orig_page == alias_page) {
+        return false;
+    }
+    // Read the original page's content.
+    std::array<std::uint8_t, kPageSize> data{};
+    if (!read(orig_page, data.data(), kPageSize)) {
+        return false;
+    }
+    // Map the alias with read+write permissions, copying the original content.
+    return map_fixed(alias_page, kPageSize, MemPerm::kReadWrite, data.data(), kPageSize);
 }
 
 bool GuestAddressSpace::unmap(std::uint64_t addr, std::size_t size) {

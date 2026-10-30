@@ -7,6 +7,7 @@
 #include "hyperion/translation_cache.hpp"
 
 #include "hyperion/aarch64_encoder.hpp"
+#include "hyperion/signal_handling.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -316,6 +317,30 @@ RunResult TranslationCache::run(Memory& memory, GuestState state, std::uint64_t 
     std::uint64_t steps = 0;
     while (true) {
         const std::uint64_t pc = out.state.rip;
+        // Deliver any pending unblocked guest signal at each block boundary.
+        // A delivered signal diverts rip to a guest handler (or terminates the
+        // run); either way we re-enter the loop with the updated state. This
+        // makes Ctrl-C, SIGTERM, etc. reach the guest instead of killing the
+        // host runtime, and makes a blocked syscall return -EINTR so the
+        // signal can be observed.
+        if (syscalls != nullptr) {
+            bool should_exit = false;
+            std::int64_t exit_code = 0;
+            if (check_and_deliver_signals(*syscalls, out.state, memory, should_exit,
+                                          exit_code)) {
+                out.steps = steps;
+                if (should_exit) {
+                    out.status = RunStatus::kOk;
+                    out.exited_via_syscall = true;
+                    out.exit_code = static_cast<std::uint64_t>(exit_code & 0xFF);
+                    out.message = "guest terminated by signal";
+                    return out;
+                }
+                // Signal delivered: guest state now points at the handler;
+                // re-enter the loop to execute it.
+                continue;
+            }
+        }
         TranslateFailure failure = TranslateFailure::kNone;
         const CachedBlock* block = translate_at(memory, pc, failure);
         if (block == nullptr && failure == TranslateFailure::kCold) {
@@ -445,6 +470,25 @@ RunResult TranslationCache::run(Memory& memory, GuestState state, std::uint64_t 
             }
             if (sr.status == SyscallStatus::kUnimplemented) {
                 ++out.unimplemented_syscalls;
+            }
+            // After any guest syscall, check for pending signals. A syscall may
+            // have been interrupted by a host signal (EINTR), and the guest
+            // may have installed a handler that should run before the next
+            // guest instruction.
+            if (syscalls != nullptr) {
+                bool should_exit = false;
+                std::int64_t exit_code = 0;
+                if (check_and_deliver_signals(*syscalls, out.state, memory, should_exit,
+                                              exit_code)) {
+                    out.steps = steps;
+                    if (should_exit) {
+                        out.status = RunStatus::kOk;
+                        out.exited_via_syscall = true;
+                        out.exit_code = static_cast<std::uint64_t>(exit_code & 0xFF);
+                        out.message = "guest terminated by signal";
+                        return out;
+                    }
+                }
             }
         }
     }

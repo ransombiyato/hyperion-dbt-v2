@@ -95,6 +95,16 @@ public:
         (void)page_addr;
         return {};
     }
+
+    // Map an alias of `orig_page` at `alias_page` sharing the same backing
+    // storage. Used for signal delivery: 32-bit register operations zero-extend
+    // `esp` to the low 4GB range, which needs to map to the same stack memory.
+    // Returns false if aliasing is not supported or the pages are invalid.
+    virtual bool map_page_alias(std::uint64_t orig_page, std::uint64_t alias_page) {
+        (void)orig_page;
+        (void)alias_page;
+        return false;
+    }
 };
 
 // A flat, byte-addressable region [base, base + size).

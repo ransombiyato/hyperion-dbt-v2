@@ -2,6 +2,7 @@
 // Copyright (c) 2026 Project HYPERION contributors
 #include "hyperion/interpreter.hpp"
 
+#include "hyperion/signal_handling.hpp"
 #include "hyperion/syscall.hpp"
 
 #include <algorithm>
@@ -3081,6 +3082,50 @@ RunResult run_program(Memory& memory, GuestState state, std::uint64_t max_steps,
         const std::uint64_t map_epoch = memory.mapping_epoch();
         if (map_epoch != tlb.epoch) {
             tlb.flush(map_epoch);
+        }
+        // Deliver any pending unblocked guest signal before executing the next
+        // guest instruction. A delivered signal diverts rip to a guest handler
+        // (or terminates the run); either way we re-enter the loop with the
+        // updated state. This makes Ctrl-C, SIGTERM, etc. reach the guest
+        // instead of killing the host runtime.
+        bool should_exit = false;
+        std::int64_t exit_code = 0;
+        if (syscalls != nullptr &&
+            check_and_deliver_signals(*syscalls, out.state, memory, should_exit,
+                                      exit_code)) {
+            out.steps = i;
+            if (should_exit) {
+                out.status = RunStatus::kOk;
+                out.exited_via_syscall = true;
+                out.exit_code = static_cast<std::uint64_t>(exit_code & 0xFF);
+                out.message = "guest terminated by signal";
+                return out;
+            }
+            // Signal delivered: the guest state now points at the handler.
+            // Fall through and execute it.
+        }
+
+        // If rip holds kSigReturnMagic, the signal handler just executed `ret`
+        // and popped our sentinel. rsp now points past the magic, at the
+        // ucontext start. Intercept this and invoke rt_sigreturn to restore the
+        // interrupted guest context.
+        if (syscalls != nullptr &&
+            out.state.rip == hyperion::sigframe::kSigReturnMagic) {
+            out.state.reg(Gpr::kRax) = static_cast<std::uint64_t>(sysno::kRtSigreturn);
+            // Undo the `ret` pop of the magic return address so rsp points at
+            // the frame start (magic at offset 0, ucontext at offset 16).
+            out.state.reg(Gpr::kRsp) -= 8;
+            const SyscallResult sr = syscalls->handle(out.state, memory);
+            if (sr.status == SyscallStatus::kExit) {
+                out.steps = i + 1;
+                out.status = RunStatus::kOk;
+                out.exited_via_syscall = true;
+                out.exit_code = sr.exit_code;
+                out.message = "guest terminated via rt_sigreturn";
+                return out;
+            }
+            ++out.steps;
+            continue;
         }
         const std::uint64_t epoch = memory.code_epoch();
         DecodedSlot& slot = icache[pc & kDecodeCacheMask];

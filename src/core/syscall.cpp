@@ -3,6 +3,7 @@
 //
 // Minimal guest syscall handler (Phase 6). See syscall.hpp for the scope and
 // the error convention.
+#include "hyperion/signal_handling.hpp"
 #include "hyperion/syscall.hpp"
 
 #include "hyperion/host_syscalls.hpp"
@@ -1669,6 +1670,15 @@ void restore_args(const std::uint64_t (&saved)[6], GuestState& state) {
 SyscallResult MinimalSyscallHandler::handle(GuestState& state, Memory& memory) {
     SyscallResult result;
     result.number = state.reg(Gpr::kRax);
+    // If a guest signal is pending, fail this syscall with -EINTR so the
+    // signal is delivered at the next instruction boundary. This mirrors
+    // Linux: a signal interrupting a blocking syscall causes it to return
+    // -EINTR, and the signal handler runs before the user continues.
+    if (signal_pending(*this)) {
+        state.reg(Gpr::kRax) = static_cast<std::uint64_t>(-static_cast<std::int64_t>(kEintr));
+        result.status = SyscallStatus::kHandled;
+        return result;
+    }
     const bool tracing = syscall_trace_enabled();
 
     if (dispatcher_ != nullptr) {
@@ -2194,6 +2204,90 @@ SyscallResult MinimalSyscallHandler::handle_unguarded(GuestState& state, Memory&
                     }
                     r = 0;
                 }
+                break;
+            }
+            case 15: { // rt_sigreturn(ucontext *): restore the interrupted guest
+                // context from the rt_sigframe that check_and_deliver_signals()
+                // built on the guest stack. After `ret` pops kSigReturnMagic into
+                // rip, rsp points past the popped value:
+                //   simple `ret`: rsp = frame_addr + 8, [rsp] = kSigReturnMagic (offset 8)
+                //   leave; ret:   rsp = alias + (frame_addr & 0xFFF) + 16, [rsp] = uc_flags = 0
+                // Probe [rsp] to distinguish and compute the true frame start.
+                std::uint64_t probe_addr = state.reg(Gpr::kRsp);
+                std::uint8_t probe[8];
+                std::uint64_t frame_addr;
+                if (memory.read(probe_addr, probe, 8)) {
+                    std::uint64_t probe_val = 0;
+                    for (int i = 0; i < 8; ++i)
+                        probe_val |= (std::uint64_t)probe[i] << (8 * i);
+                    if (probe_val == hyperion::sigframe::kSigReturnMagic) {
+                        // Simple `ret`: frame starts at rsp - 8.
+                        frame_addr = probe_addr - 8;
+                    } else {
+                        // `leave; ret`: frame starts at rsp - 16 (via alias page).
+                        frame_addr = probe_addr - 16;
+                    }
+                } else {
+                    r = -kEfault;
+                    break;
+                }
+                const std::size_t uc = hyperion::sigframe::kUcontextOffset;
+                const std::size_t mc = uc + hyperion::sigframe::kUcMcontext;
+
+                std::uint8_t raw[hyperion::sigframe::kFrameSize];
+                if (!memory.read(frame_addr, raw, sizeof(raw))) {
+                    r = -kEfault;
+                    break;
+                }
+
+                auto get64 = [&raw](std::size_t off) -> std::uint64_t {
+                    std::uint64_t v = 0;
+                    for (int i = 0; i < 8; ++i) {
+                        v |= static_cast<std::uint64_t>(raw[off + i]) << (8 * i);
+                    }
+                    return v;
+                };
+
+                // Restore all general-purpose registers.
+                state.reg(Gpr::kR8)  = get64(mc + 0);
+                state.reg(Gpr::kR9)  = get64(mc + 8);
+                state.reg(Gpr::kR10) = get64(mc + 16);
+                state.reg(Gpr::kR11) = get64(mc + 24);
+                state.reg(Gpr::kR12) = get64(mc + 32);
+                state.reg(Gpr::kR13) = get64(mc + 40);
+                state.reg(Gpr::kR14) = get64(mc + 48);
+                state.reg(Gpr::kR15) = get64(mc + 56);
+                state.reg(Gpr::kRdi) = get64(mc + 64);
+                state.reg(Gpr::kRsi) = get64(mc + 72);
+                state.reg(Gpr::kRbp) = get64(mc + 80);
+                state.reg(Gpr::kRbx) = get64(mc + 88);
+                state.reg(Gpr::kRdx) = get64(mc + 96);
+                state.reg(Gpr::kRax) = get64(mc + 104);
+                state.reg(Gpr::kRcx) = get64(mc + 112);
+                state.reg(Gpr::kRsp) = get64(mc + 120); // pre-signal stack pointer
+
+                state.rip = get64(mc + 128);
+                // eflags at mc + 136: restore only the modelled bits.
+                {
+                    const std::uint64_t eflags = get64(mc + 136);
+                    state.flags.cf = (eflags & (1ULL << 0)) != 0;
+                    state.flags.pf = (eflags & (1ULL << 2)) != 0;
+                    state.flags.af = (eflags & (1ULL << 4)) != 0;
+                    state.flags.zf = (eflags & (1ULL << 6)) != 0;
+                    state.flags.sf = (eflags & (1ULL << 7)) != 0;
+                    state.flags.of = (eflags & (1ULL << 11)) != 0;
+                }
+                state.fs_base = get64(mc + 160);
+
+                // Restore the guest signal mask from uc_sigmask.
+                const std::uint64_t saved_mask = get64(uc + hyperion::sigframe::kUcSigmask + 0);
+                sigmask_ = saved_mask;
+
+                // Re-evaluate now-unblocked pending signals: a signal that was
+                // held while masked can now be delivered at the next boundary.
+                (void)deliver_pending_signals();
+
+                r = 0;
                 break;
             }
             case 16: { // ioctl(fd, req, argp)
@@ -3042,11 +3136,45 @@ std::int64_t MinimalSyscallHandler::raise_signal(int sig) {
     // SIGKILL and SIGSTOP are the two signals a mask cannot hold back.
     const bool maskable = (sig != 9 && sig != 19);
     const std::uint64_t bit = (sig >= 1 && sig <= 64) ? (1ULL << (sig - 1)) : 0;
+
+    // If the signal is masked, hold it for later delivery.
     if (maskable && bit != 0 && (sigmask_ & bit) != 0) {
         signal_pending_ |= bit;
         return 0;
     }
-    return signal_disposition(sig);
+
+    const auto index = static_cast<std::size_t>(sig);
+
+    // SIG_IGN or an ignore-class default: the signal is dropped.
+    if (index < sigactions_.size() && sigactions_[index].installed &&
+        sigactions_[index].handler == 1) {
+        return 0;
+    }
+    // Ignore-class defaults (SIGCHLD, SIGCONT, SIGURG, SIGWINCH, etc.):
+    // nothing to do, the guest never notices.
+    switch (sig) {
+    case 17: // SIGCHLD
+    case 18: // SIGCONT
+    case 19: // SIGSTOP
+    case 20: // SIGTSTP
+    case 21: // SIGTTIN
+    case 22: // SIGTTOU
+    case 23: // SIGURG
+    case 28: // SIGWINCH
+        return 0;
+    default:
+        break;
+    }
+
+    // A real handler is installed: queue the signal so check_and_deliver_signals()
+    // can build an rt_sigframe and divert to the handler at the next boundary.
+    if (index < sigactions_.size() && sigactions_[index].installed) {
+        signal_pending_ |= bit;
+        return 0;
+    }
+
+    // Terminate-class default with no handler: end the run.
+    return 128 + sig;
 }
 
 std::int64_t MinimalSyscallHandler::deliver_pending_signals() {
@@ -3059,13 +3187,48 @@ std::int64_t MinimalSyscallHandler::deliver_pending_signals() {
         if (maskable && (sigmask_ & bit) != 0) {
             continue; // still blocked
         }
-        signal_pending_ &= ~bit;
-        const std::int64_t outcome = signal_disposition(sig);
-        if (outcome != 0) {
-            return outcome;
+
+        const auto index = static_cast<std::size_t>(sig);
+
+        // SIG_IGN: drop the signal.
+        if (index < sigactions_.size() && sigactions_[index].installed &&
+            sigactions_[index].handler == 1) {
+            signal_pending_ &= ~bit;
+            continue;
         }
+        // Ignore-class defaults: nothing to do, drop the signal.
+        switch (sig) {
+        case 17: // SIGCHLD
+        case 18: // SIGCONT
+        case 19: // SIGSTOP
+        case 20: // SIGTSTP
+        case 21: // SIGTTIN
+        case 22: // SIGTTOU
+        case 23: // SIGURG
+        case 28: // SIGWINCH
+            signal_pending_ &= ~bit;
+            continue;
+        default:
+            break;
+        }
+
+        // A real handler is installed: leave it pending for
+        // check_and_deliver_signals() to deliver at the next boundary.
+        if (index < sigactions_.size() && sigactions_[index].installed) {
+            continue; // leave signal_pending_ set
+        }
+
+        // Terminate-class default with no handler: end the run.
+        signal_pending_ &= ~bit;
+        return 128 + sig;
     }
     return 0;
+}
+
+void MinimalSyscallHandler::clear_pending_signal(int sig) noexcept {
+    if (sig >= 1 && sig <= static_cast<int>(kMaxSignal)) {
+        signal_pending_ &= ~(1ULL << (sig - 1));
+    }
 }
 
 // The syscall numbers handled by the nested `if (linux_compat_)` switch inside

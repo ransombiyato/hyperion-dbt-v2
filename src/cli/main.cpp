@@ -26,6 +26,7 @@
 #include "hyperion/host_probe.hpp"
 #include "hyperion/host_syscalls.hpp"
 #include "hyperion/interpreter.hpp"
+#include "hyperion/signal_handling.hpp"
 #include "hyperion/sigsys_diagnostics.hpp"
 #include "hyperion/syscall.hpp"
 #include "hyperion/syscall_dispatch.hpp"
@@ -333,6 +334,10 @@ int run_elf(const std::vector<std::uint8_t>& file, const std::vector<std::string
     // itself; without this, a guest that re-executes through that path (BusyBox
     // does, to run an applet) would exec the translator instead of itself.
     syscalls.set_guest_image_path(absolute_image);
+
+    // Trap host signals (SIGINT, SIGTERM, etc.) and queue them as guest
+    // signals so they reach the guest at the next instruction boundary.
+    hyperion::install_host_signal_handlers(syscalls);
 
     // The persistent registry is loaded exactly once, here, before the guest
     // starts. Nothing is read from the filesystem once execution begins.
